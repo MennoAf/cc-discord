@@ -106,9 +106,7 @@ class Bot:
         # discord.py registers event handlers by method name.
         self._client.event(self.on_ready)
         if on_message is not None:
-            # Register on_message handler via direct _listeners manipulation
-            # (discord.Client doesn't have add_listener like discord.ext.commands.Bot)
-            self._client.event(self._on_message_dispatch)
+            self._client.event(self.on_message)
 
     @property
     def channel_id(self) -> int:
@@ -128,8 +126,8 @@ class Bot:
         self._ready.set()
         logger.info("Bot ready as %s, watching #%s", self._client.user, ch.name)
 
-    async def _on_message_dispatch(self, msg: discord.Message) -> None:
-        """Internal: dispatch incoming messages to the registered callback.
+    async def on_message(self, msg: discord.Message) -> None:
+        """Dispatch incoming messages to the registered callback.
 
         Filters out the bot's own messages (AC3.6).
         """

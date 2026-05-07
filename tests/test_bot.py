@@ -188,8 +188,8 @@ class TestBot:
         assert bot._on_message_cb is dummy_callback
 
     @pytest.mark.asyncio
-    async def test_bot_on_message_dispatch_filters_own_messages(self):
-        """_on_message_dispatch ignores messages from the bot itself."""
+    async def test_bot_on_message_filters_own_messages(self):
+        """on_message ignores messages from the bot itself."""
         call_count = 0
 
         async def dummy_callback(msg):
@@ -202,14 +202,14 @@ class TestBot:
         mock_msg = mock.MagicMock()
         mock_msg.author = bot._client.user
 
-        await bot._on_message_dispatch(mock_msg)
+        await bot.on_message(mock_msg)
 
         # Callback should NOT have been called
         assert call_count == 0
 
     @pytest.mark.asyncio
-    async def test_bot_on_message_dispatch_invokes_callback_for_other_messages(self):
-        """_on_message_dispatch invokes callback for non-bot messages."""
+    async def test_bot_on_message_invokes_callback_for_other_messages(self):
+        """on_message invokes callback for non-bot messages."""
         call_count = 0
         received_msg = None
 
@@ -228,8 +228,59 @@ class TestBot:
         mock_msg = mock.MagicMock()
         mock_msg.author = mock_author
 
-        await bot._on_message_dispatch(mock_msg)
+        await bot.on_message(mock_msg)
 
         # Callback should have been called
         assert call_count == 1
         assert received_msg is mock_msg
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_dispatch_wiring(self):
+        """on_message is registered with discord.py's dispatcher."""
+        call_count = 0
+
+        async def dummy_callback(msg):
+            nonlocal call_count
+            call_count += 1
+
+        bot = Bot("test_token", 12345, on_message=dummy_callback)
+
+        # Create a mock message from a non-bot author
+        mock_author = mock.MagicMock()
+        mock_author.id = 999
+        mock_author.bot = False
+
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        # Simulate discord.py dispatcher calling by event name
+        # The dispatcher looks up getattr(client, "on_message") after an event fires
+        handler = getattr(bot._client, "on_message", None)
+        assert handler is not None, "on_message should be registered"
+        assert callable(handler)
+
+        # Calling it should invoke the callback
+        await handler(mock_msg)
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_dispatch_filters_own_messages_via_dispatch(self):
+        """Dispatcher filters bot's own messages."""
+        call_count = 0
+
+        async def dummy_callback(msg):
+            nonlocal call_count
+            call_count += 1
+
+        bot = Bot("test_token", 12345, on_message=dummy_callback)
+
+        # Create a mock message where author == client.user
+        mock_msg = mock.MagicMock()
+        mock_msg.author = bot._client.user
+
+        # Call via the registered dispatcher
+        handler = getattr(bot._client, "on_message", None)
+        await handler(mock_msg)
+
+        # Callback should NOT have been called
+        assert call_count == 0
