@@ -10,6 +10,8 @@ from aiohttp import web
 
 from bridge.bot import Bot, BotNotReady
 from bridge.secrets import Secrets
+from bridge.threads import ThreadRegistry
+from bridge import state
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +41,10 @@ async def _handle_notify(request: web.Request) -> web.Response:
         )
 
     bot: Bot = request.app["bot"]
+    registry: ThreadRegistry = request.app["threads"]
     message = body["message"]
 
-    # Check if bot is ready before calling post
+    # Check if bot is ready before routing to thread
     if not bot.is_ready:
         return web.Response(
             status=503,
@@ -50,12 +53,12 @@ async def _handle_notify(request: web.Request) -> web.Response:
         )
 
     try:
-        message_ids = await bot.post(message)
-        # Return the first message ID; thread_id is always None in Phase 1
+        thread_id = await registry.get_or_create_thread(body["session_id"], body["cwd"])
+        message_ids = await bot.post(message, thread_id=thread_id)
         return web.Response(
             status=200,
             text=json.dumps(
-                {"thread_id": None, "message_id": message_ids[0] if message_ids else None}
+                {"thread_id": thread_id, "message_id": message_ids[0] if message_ids else None}
             ),
             content_type="application/json",
         )
@@ -66,7 +69,7 @@ async def _handle_notify(request: web.Request) -> web.Response:
             content_type="application/json",
         )
     except Exception:
-        logger.exception("Error handling notify request")
+        logger.exception("notify failed")
         return web.Response(
             status=500,
             text=json.dumps({"error": "internal"}),
@@ -106,9 +109,13 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     """Run the bridge server with bot integration and signal handling.
 
     Binds to host:port, starts the Discord bot, and runs until SIGTERM/SIGINT.
+    Opens the database for session persistence and instantiates ThreadRegistry.
     """
     bot = Bot(secrets.bot_token, secrets.channel_id)
+    conn = await state.open_db()
+    registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
+    app["threads"] = registry
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
@@ -126,3 +133,4 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     finally:
         await bot.close()
         await runner.cleanup()
+        await state.close_db(conn)
