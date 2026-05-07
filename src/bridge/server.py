@@ -39,12 +39,14 @@ def _format_question(question: str, cwd: str) -> str:
 
     Args:
         question: the user's question text
-        cwd: the working directory
+        cwd: the working directory (can be empty)
 
     Returns:
         formatted question string
     """
-    return f"❓ asks\n{question}\n\n(cwd: {cwd})"
+    if cwd:
+        return f"❓ asks\n{question}\n\n(cwd: {cwd})"
+    return f"❓ asks\n{question}"
 
 
 class AskLockMap:
@@ -71,6 +73,15 @@ class AskLockMap:
             return lock
 
 
+# Typed AppKey definitions to avoid NotAppKeyWarning
+BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
+THREADS_KEY: web.AppKey[ThreadRegistry] = web.AppKey("threads", ThreadRegistry)
+LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
+ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
+
+STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
+
+
 async def _handle_notify(request: web.Request) -> web.Response:
     """Handle POST /v1/notify.
 
@@ -95,8 +106,8 @@ async def _handle_notify(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
-    bot: Bot = request.app["bot"]
-    registry: ThreadRegistry = request.app["threads"]
+    bot: Bot = request.app[BOT_KEY]
+    registry: ThreadRegistry = request.app[THREADS_KEY]
     message = body["message"]
 
     # Check if bot is ready before routing to thread
@@ -170,10 +181,10 @@ async def _handle_ask(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
-    bot: Bot = request.app["bot"]
-    registry: ThreadRegistry = request.app["threads"]
-    listener: Listener = request.app["listener"]
-    locks: AskLockMap = request.app["ask_locks"]
+    bot: Bot = request.app[BOT_KEY]
+    registry: ThreadRegistry = request.app[THREADS_KEY]
+    listener: Listener = request.app[LISTENER_KEY]
+    locks: AskLockMap = request.app[ASK_LOCKS_KEY]
 
     # Check if bot is ready
     if not bot.is_ready:
@@ -234,8 +245,8 @@ async def _handle_ask(request: web.Request) -> web.Response:
 
 async def _handle_health(request: web.Request) -> web.Response:
     """Handle GET /v1/health."""
-    bot: Bot = request.app["bot"]
-    started_at: float = request.app["started_at"]
+    bot: Bot = request.app[BOT_KEY]
+    started_at: float = request.app[STARTED_AT_KEY]
     uptime_secs = int(time.monotonic() - started_at)
 
     response = {
@@ -253,8 +264,8 @@ async def _handle_health(request: web.Request) -> web.Response:
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
-    app["bot"] = bot
-    app["started_at"] = started_at if started_at is not None else time.monotonic()
+    app[BOT_KEY] = bot
+    app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
     app.router.add_post("/v1/notify", _handle_notify)
     app.router.add_post("/v1/ask", _handle_ask)
     app.router.add_get("/v1/health", _handle_health)
@@ -272,9 +283,9 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     conn = await state.open_db()
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
-    app["threads"] = registry
-    app["listener"] = listener
-    app["ask_locks"] = AskLockMap()
+    app[THREADS_KEY] = registry
+    app[LISTENER_KEY] = listener
+    app[ASK_LOCKS_KEY] = AskLockMap()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
