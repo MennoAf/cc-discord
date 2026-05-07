@@ -97,7 +97,7 @@ class Test_chunk:
         assert not result[1].startswith("\n")
 
         # All chunks except the final should be at or under the limit
-        for i, chunk in enumerate(result[:-1]):
+        for chunk in result[:-1]:
             assert len(chunk) <= MAX_CHUNK
 
         # Final chunk should be under the limit
