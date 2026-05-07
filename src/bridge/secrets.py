@@ -69,11 +69,11 @@ def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
 
     try:
         channel_id = int(channel_id_val)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
         raise SecretsError(
             f"DISCORD_CHANNEL_ID must be a number; got {channel_id_val!r} in {path}. "
             f"Run 'claude-discord-bridge init' to fix it."
-        )
+        ) from e
 
     logger.info("loaded secrets from %s", path)
     return Secrets(bot_token=bot_token, channel_id=channel_id)

@@ -5,7 +5,6 @@ import json
 import logging
 import signal
 import time
-from typing import Any
 
 from aiohttp import web
 
@@ -41,7 +40,6 @@ async def _handle_notify(request: web.Request) -> web.Response:
 
     bot: Bot = request.app["bot"]
     message = body["message"]
-    thread_id = body.get("thread_id")
 
     # Check if bot is ready before calling post
     if not bot.is_ready:
@@ -52,7 +50,7 @@ async def _handle_notify(request: web.Request) -> web.Response:
         )
 
     try:
-        message_ids = await bot.post(message, thread_id=thread_id)
+        message_ids = await bot.post(message)
         # Return the first message ID; thread_id is always None in Phase 1
         return web.Response(
             status=200,
@@ -67,7 +65,7 @@ async def _handle_notify(request: web.Request) -> web.Response:
             text=json.dumps({"error": "bot_not_connected"}),
             content_type="application/json",
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error handling notify request")
         return web.Response(
             status=500,
