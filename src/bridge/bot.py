@@ -147,3 +147,24 @@ class Bot:
             msg = await target.send(chunk)
             ids.append(msg.id)
         return ids
+
+    async def create_thread(self, name: str) -> int:
+        """Create a public thread off the configured channel. Returns its ID."""
+        if not self.is_ready or self._channel is None:
+            raise BotNotReady("bot not connected to Discord")
+        thread = await self._channel.create_thread(
+            name=name,
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=10080,  # 7 days — max for non-boosted servers
+        )
+        return thread.id
+
+    async def thread_alive(self, thread_id: int) -> bool:
+        """Probe whether a thread still exists (returns False on 404)."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        try:
+            await self._client.fetch_channel(thread_id)
+            return True
+        except discord.NotFound:
+            return False

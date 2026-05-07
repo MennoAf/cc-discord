@@ -156,3 +156,10 @@ class TestBot:
         bot = Bot("test_token", 12345)
         # Should not raise
         await bot.close()
+
+    @pytest.mark.asyncio
+    async def test_bot_create_thread_not_ready_raises(self):
+        """Bot.create_thread() raises BotNotReady if bot is not connected."""
+        bot = Bot("test_token", 12345)
+        with pytest.raises(BotNotReady, match="not connected"):
+            await bot.create_thread("test thread")
