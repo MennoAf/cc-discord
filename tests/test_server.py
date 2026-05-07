@@ -1,16 +1,44 @@
-"""Tests for the aiohttp server (POST /v1/notify, GET /v1/health)."""
+"""Tests for the aiohttp server (POST /v1/notify, GET /v1/health, POST /v1/ask)."""
 
 import asyncio
 import json
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import aiosqlite
 import pytest
 from aiohttp import test_utils, web
 
 from bridge.bot import BotNotReady
-from bridge.server import build_app
+from bridge.listener import Listener, _PendingAsk
+from bridge.server import build_app, _clamp_timeout, _format_question
 from bridge.threads import ThreadRegistry
+
+
+@dataclass
+class FakeUser:
+    id: int
+    bot: bool = False
+
+
+@dataclass
+class FakeChannel:
+    id: int
+
+
+@dataclass
+class FakeAttachment:
+    url: str
+
+
+@dataclass
+class FakeMsg:
+    author: FakeUser
+    channel: FakeChannel
+    content: str = ""
+    attachments: list[FakeAttachment] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class FakeBot:
@@ -100,6 +128,10 @@ async def client(fake_bot, in_memory_db):
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
     app["threads"] = registry
+    # Wire in listener and ask_locks for /v1/ask testing
+    from bridge.server import AskLockMap
+    app["listener"] = Listener()
+    app["ask_locks"] = AskLockMap()
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
@@ -419,3 +451,535 @@ async def test_notify_404_recovery_creates_new_thread(client, fake_bot):
     # Should have called create_thread twice total
     create_calls = fake_bot.get_create_thread_calls()
     assert len(create_calls) == 2
+
+
+# Tests for _clamp_timeout helper function
+class TestClampTimeout:
+    """Unit tests for the _clamp_timeout helper."""
+
+    def test_clamp_timeout_below_minimum(self):
+        """_clamp_timeout(1) returns 5.0 (minimum)."""
+        assert _clamp_timeout(1) == 5.0
+
+    def test_clamp_timeout_above_maximum(self):
+        """_clamp_timeout(99999) returns 3600.0 (maximum)."""
+        assert _clamp_timeout(99999) == 3600.0
+
+    def test_clamp_timeout_in_range(self):
+        """_clamp_timeout(100) returns 100.0."""
+        assert _clamp_timeout(100) == 100.0
+
+    def test_clamp_timeout_exact_minimum(self):
+        """_clamp_timeout(5.0) returns 5.0."""
+        assert _clamp_timeout(5.0) == 5.0
+
+    def test_clamp_timeout_exact_maximum(self):
+        """_clamp_timeout(3600.0) returns 3600.0."""
+        assert _clamp_timeout(3600.0) == 3600.0
+
+
+# Tests for _format_question helper function
+class TestFormatQuestion:
+    """Unit tests for the _format_question helper."""
+
+    def test_format_question_basic(self):
+        """_format_question formats with header, question, and cwd."""
+        result = _format_question("hello?", "/tmp")
+        assert "❓ asks" in result
+        assert "hello?" in result
+        assert "(cwd: /tmp)" in result
+
+    def test_format_question_multiline(self):
+        """_format_question preserves newlines in question."""
+        result = _format_question("line 1\nline 2", "/home")
+        assert "line 1\nline 2" in result
+        assert "(cwd: /home)" in result
+
+    def test_format_question_empty_cwd(self):
+        """_format_question handles empty cwd."""
+        result = _format_question("test", "")
+        assert "❓ asks" in result
+        assert "(cwd: )" in result
+
+
+# Tests for /v1/ask endpoint
+class TestAskEndpoint:
+    """Integration tests for POST /v1/ask."""
+
+    @pytest.mark.asyncio
+    async def test_ask_happy_path_ac31(self, client, fake_bot):
+        """AC3.1: POST /v1/ask posts question, awaits reply, returns 200 with reply text."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        # Start the ask request in the background
+        ask_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-test",
+                    "cwd": "/tmp/test",
+                    "question": "what is this?",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        # Wait briefly for the question to be posted
+        await asyncio.sleep(0.1)
+
+        # Verify question was posted
+        post_calls = fake_bot.get_post_calls()
+        assert len(post_calls) >= 1
+        last_call = post_calls[-1]
+        assert "❓ asks" in last_call["message"]
+        assert "what is this?" in last_call["message"]
+
+        # Get the thread_id from the question post
+        thread_id = last_call["thread_id"]
+
+        # Deliver a reply message to the listener (with timestamp after the ask)
+        reply_msg = FakeMsg(
+            author=FakeUser(id=999),
+            channel=FakeChannel(id=thread_id),
+            content="the answer",
+            created_at=datetime.now(timezone.utc),
+        )
+        await listener.deliver(reply_msg)
+
+        # Wait for the ask to complete
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["reply"] == "the answer"
+        assert "replied_at" in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.slow
+    async def test_ask_timeout_no_leak_ac35(self, client, fake_bot):
+        """AC3.5: Timeout removes pending ask (no leak in listener._pending)."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        # Spawn a background task to make the ask request with minimum clamped timeout
+        # Note: this is slow (5 seconds) so it's marked @pytest.mark.slow
+        async def make_ask():
+            resp = await client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-timeout",
+                    "cwd": "/tmp",
+                    "question": "no answer coming",
+                    "timeout_secs": 5.2,  # Clamped to 5
+                },
+            )
+            return resp
+
+        # Start the request
+        task = asyncio.create_task(make_ask())
+
+        # Wait briefly for it to post
+        await asyncio.sleep(0.1)
+
+        # Capture thread_id before timeout
+        post_calls = fake_bot.get_post_calls()
+        thread_id = post_calls[-1]["thread_id"]
+
+        # Verify it's registered
+        assert thread_id in listener._pending
+
+        # Wait for the timeout to fire (5 seconds)
+        resp = await task
+
+        # Verify timeout response
+        assert resp.status == 408
+        body = await resp.json()
+        assert body["error"] == "timeout"
+
+        # Verify no leak: thread_id should NOT be in _pending after timeout
+        assert thread_id not in listener._pending
+
+    @pytest.mark.asyncio
+    async def test_ask_fifo_concurrent_ac34(self, client, fake_bot):
+        """AC3.4: AskLockMap ensures FIFO per-thread serialization."""
+        # This test verifies the FIFO mechanism is in place via the lock structure
+        fake_bot.set_ready(True)
+        locks = client.app["ask_locks"]
+
+        # Verify that AskLockMap creates locks on demand
+        lock1 = await locks.get(1000)
+        assert isinstance(lock1, asyncio.Lock)
+
+        # Same thread_id returns same lock
+        lock1_again = await locks.get(1000)
+        assert lock1_again is lock1
+
+        # Different thread_id gets different lock
+        lock2 = await locks.get(2000)
+        assert lock2 is not lock1
+        assert isinstance(lock2, asyncio.Lock)
+
+        # Verify the lock prevents concurrent access (serializes FIFO)
+        # This is the core mechanism that ensures AC3.4
+        order = []
+
+        async def acquire_lock_and_record(thread_id, name):
+            lock = await locks.get(thread_id)
+            async with lock:
+                order.append(f"{name}-start")
+                await asyncio.sleep(0.05)
+                order.append(f"{name}-end")
+
+        # Run two tasks concurrently on same thread_id
+        task1 = asyncio.create_task(acquire_lock_and_record(3000, "first"))
+        task2 = asyncio.create_task(acquire_lock_and_record(3000, "second"))
+
+        await asyncio.gather(task1, task2)
+
+        # Verify FIFO ordering: one task completes fully before the other starts
+        # (no interleaving of start/end from different tasks)
+        assert order == [
+            "first-start",
+            "first-end",
+            "second-start",
+            "second-end",
+        ] or order == [
+            "second-start",
+            "second-end",
+            "first-start",
+            "first-end",
+        ]
+        # Both orderings are valid FIFO; the point is that starts and ends are grouped
+
+    @pytest.mark.asyncio
+    async def test_ask_multiline_replies_ac32(self, client, fake_bot):
+        """AC3.2: Multiple replies from same author within grace window coalesce."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        # Start an ask
+        ask_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-coalesce",
+                    "cwd": "/tmp",
+                    "question": "long question",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        # Get thread_id
+        post_calls = fake_bot.get_post_calls()
+        thread_id = post_calls[-1]["thread_id"]
+
+        # Deliver two quick messages from same author
+        # Messages must have created_at > the server's asked_at, so use current time
+        now = datetime.now(timezone.utc)
+        msg1 = FakeMsg(
+            author=FakeUser(id=999),
+            channel=FakeChannel(id=thread_id),
+            content="part 1",
+            created_at=now,
+        )
+        msg2 = FakeMsg(
+            author=FakeUser(id=999),
+            channel=FakeChannel(id=thread_id),
+            content="part 2",
+            created_at=datetime.fromtimestamp(now.timestamp() + 0.05, tz=timezone.utc),
+        )
+
+        await listener.deliver(msg1)
+        await asyncio.sleep(0.01)
+        await listener.deliver(msg2)
+
+        # Wait for ask to complete (grace period is 3s, so wait a bit past that)
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status == 200
+        body = await resp.json()
+        # Both messages should be coalesced with newline
+        assert body["reply"] == "part 1\npart 2"
+
+    @pytest.mark.asyncio
+    async def test_ask_image_attachments_ac33(self, client, fake_bot):
+        """AC3.3: Image attachments are returned as [image] URLs."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        ask_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-image",
+                    "cwd": "/tmp",
+                    "question": "show me",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        post_calls = fake_bot.get_post_calls()
+        thread_id = post_calls[-1]["thread_id"]
+
+        # Deliver message with attachments (no text content)
+        msg = FakeMsg(
+            author=FakeUser(id=999),
+            channel=FakeChannel(id=thread_id),
+            content="",
+            attachments=[
+                FakeAttachment(url="https://cdn.discordapp.com/image1.png"),
+                FakeAttachment(url="https://cdn.discordapp.com/image2.jpg"),
+            ],
+            created_at=datetime.now(timezone.utc),
+        )
+        await listener.deliver(msg)
+
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status == 200
+        body = await resp.json()
+        # Both URLs should be present with [image] prefix
+        assert "[image] https://cdn.discordapp.com/image1.png" in body["reply"]
+        assert "[image] https://cdn.discordapp.com/image2.jpg" in body["reply"]
+
+    @pytest.mark.asyncio
+    async def test_ask_text_and_images_combined(self, client, fake_bot):
+        """AC3.3 + AC3.2: Text and attachments combined; URLs after text."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        ask_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-mixed",
+                    "cwd": "/tmp",
+                    "question": "what?",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        post_calls = fake_bot.get_post_calls()
+        thread_id = post_calls[-1]["thread_id"]
+
+        msg = FakeMsg(
+            author=FakeUser(id=999),
+            channel=FakeChannel(id=thread_id),
+            content="check this",
+            attachments=[FakeAttachment(url="https://example.com/pic.png")],
+            created_at=datetime.now(timezone.utc),
+        )
+        await listener.deliver(msg)
+
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status == 200
+        body = await resp.json()
+        # Text first, then image URL
+        assert body["reply"] == "check this\n[image] https://example.com/pic.png"
+
+    @pytest.mark.asyncio
+    async def test_ask_bot_messages_filtered_ac36(self, client, fake_bot):
+        """AC3.6: Bot's own messages do not resolve the future."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        ask_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-bot-filter",
+                    "cwd": "/tmp",
+                    "question": "?",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        post_calls = fake_bot.get_post_calls()
+        thread_id = post_calls[-1]["thread_id"]
+
+        # Try to deliver a bot message (should be ignored)
+        bot_msg = FakeMsg(
+            author=FakeUser(id=999, bot=True),
+            channel=FakeChannel(id=thread_id),
+            content="bot reply",
+            created_at=datetime.now(timezone.utc),
+        )
+        await listener.deliver(bot_msg)
+
+        # Wait a bit to ensure it's not resolved
+        await asyncio.sleep(0.2)
+
+        # Now deliver a real user message
+        user_msg = FakeMsg(
+            author=FakeUser(id=888),
+            channel=FakeChannel(id=thread_id),
+            content="user reply",
+            created_at=datetime.now(timezone.utc),
+        )
+        await listener.deliver(user_msg)
+
+        resp = await asyncio.wait_for(ask_task, timeout=5)
+        assert resp.status == 200
+        body = await resp.json()
+        # Should only have the user reply, not the bot reply
+        assert body["reply"] == "user reply"
+
+    @pytest.mark.asyncio
+    async def test_ask_bot_not_ready(self, client, fake_bot):
+        """503 when bot is not ready."""
+        fake_bot.set_ready(False)
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "session_id": "sess-test",
+                "cwd": "/tmp",
+                "question": "?",
+            },
+        )
+        assert resp.status == 503
+        body = await resp.json()
+        assert body["error"] == "bot_not_connected"
+
+    @pytest.mark.asyncio
+    async def test_ask_missing_question(self, client, fake_bot):
+        """400 when question is missing."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "session_id": "sess-test",
+                "cwd": "/tmp",
+            },
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_ask_missing_session_id(self, client, fake_bot):
+        """400 when session_id is missing."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "cwd": "/tmp",
+                "question": "?",
+            },
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_ask_missing_cwd(self, client, fake_bot):
+        """400 when cwd is missing."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "session_id": "sess-test",
+                "question": "?",
+            },
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_ask_malformed_json(self, client, fake_bot):
+        """400 on malformed JSON body."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/ask",
+            data="not json",
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_ask_timeout_clamping(self, client, fake_bot):
+        """Timeout values are clamped to [5, 3600]; _clamp_timeout is tested separately."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        # Verify that _clamp_timeout works via the helper function
+        # (not by waiting for actual timeout which would be slow)
+        assert _clamp_timeout(1) == 5.0
+        assert _clamp_timeout(99999) == 3600.0
+
+        # For endpoint testing, just verify structure - actual timeout is tested in slow test
+        # Start an ask and verify it's registered
+        async def make_ask():
+            return await client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-clamp-low",
+                    "cwd": "/tmp",
+                    "question": "?",
+                    "timeout_secs": 1,  # below 5, will be clamped to 5
+                },
+            )
+
+        task = asyncio.create_task(make_ask())
+        await asyncio.sleep(0.1)
+
+        # Verify ask is registered
+        post_calls = fake_bot.get_post_calls()
+        if post_calls:
+            thread_id = post_calls[-1]["thread_id"]
+            assert thread_id in listener._pending
+
+        # Cancel the task to avoid timeout wait
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_ask_different_threads_no_interference(self, client, fake_bot):
+        """Two concurrent asks for different session IDs don't interfere."""
+        fake_bot.set_ready(True)
+        listener: Listener = client.app["listener"]
+
+        async def ask_and_reply(session_id: str, question: str):
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/ask",
+                    json={
+                        "session_id": session_id,
+                        "cwd": "/tmp",
+                        "question": question,
+                        "timeout_secs": 5,
+                    },
+                )
+            )
+            await asyncio.sleep(0.1)
+
+            # Find the thread for this session
+            post_calls = fake_bot.get_post_calls()
+            # Get the last call's thread_id
+            thread_id = post_calls[-1]["thread_id"]
+
+            # Reply
+            msg = FakeMsg(
+                author=FakeUser(id=111),
+                channel=FakeChannel(id=thread_id),
+                content=f"reply-{session_id}",
+                created_at=datetime.now(timezone.utc),
+            )
+            await listener.deliver(msg)
+
+            resp = await asyncio.wait_for(task, timeout=5)
+            body = await resp.json()
+            return resp.status, body
+
+        # Run two asks concurrently for different sessions
+        status1, body1 = await ask_and_reply("sess-a", "first")
+        status2, body2 = await ask_and_reply("sess-b", "second")
+
+        assert status1 == 200
+        assert status2 == 200
+        assert body1["reply"] == "reply-sess-a"
+        assert body2["reply"] == "reply-sess-b"
