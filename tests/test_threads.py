@@ -1,12 +1,11 @@
 """Tests for ThreadRegistry."""
 
 import asyncio
-from pathlib import Path
 
 import aiosqlite
 import pytest
 
-from bridge.state import open_db, get_session
+from bridge.state import get_session
 from bridge.threads import ThreadRegistry
 
 
@@ -121,7 +120,6 @@ class TestThreadRegistry:
 
     async def test_ac22_same_session_bumps_last_activity(self, fake_bot, in_memory_db):
         """AC2.2: Re-using same session bumps last_activity."""
-        import time
         registry = ThreadRegistry(fake_bot, in_memory_db)
 
         await registry.get_or_create_thread("sess-aaa", "/tmp/aaa")

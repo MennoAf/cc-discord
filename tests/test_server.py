@@ -3,7 +3,6 @@
 import asyncio
 import json
 import time
-from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -12,7 +11,6 @@ from aiohttp import test_utils, web
 from bridge.bot import BotNotReady
 from bridge.server import build_app
 from bridge.threads import ThreadRegistry
-from bridge import state
 
 
 class FakeBot:
