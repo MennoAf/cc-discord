@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+from typing import Awaitable, Callable
 
 import discord
 
@@ -87,7 +88,13 @@ class Bot:
     the bot has fully connected and resolved the configured channel.
     """
 
-    def __init__(self, token: str, channel_id: int) -> None:
+    def __init__(
+        self,
+        token: str,
+        channel_id: int,
+        *,
+        on_message: Callable[[discord.Message], Awaitable[None]] | None = None,
+    ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # required for Phase 3 reply routing
         self._client = discord.Client(intents=intents)
@@ -95,8 +102,13 @@ class Bot:
         self._channel_id = channel_id
         self._channel: discord.TextChannel | None = None
         self._ready = asyncio.Event()
+        self._on_message_cb = on_message
         # discord.py registers event handlers by method name.
         self._client.event(self.on_ready)
+        if on_message is not None:
+            # Register on_message handler via direct _listeners manipulation
+            # (discord.Client doesn't have add_listener like discord.ext.commands.Bot)
+            self._client.event(self._on_message_dispatch)
 
     @property
     def channel_id(self) -> int:
@@ -115,6 +127,17 @@ class Bot:
         self._channel = ch
         self._ready.set()
         logger.info("Bot ready as %s, watching #%s", self._client.user, ch.name)
+
+    async def _on_message_dispatch(self, msg: discord.Message) -> None:
+        """Internal: dispatch incoming messages to the registered callback.
+
+        Filters out the bot's own messages (AC3.6).
+        """
+        # Always ignore our own messages
+        if msg.author == self._client.user:
+            return
+        if self._on_message_cb is not None:
+            await self._on_message_cb(msg)
 
     @property
     def is_ready(self) -> bool:

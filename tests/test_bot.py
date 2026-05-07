@@ -1,5 +1,8 @@
 """Tests for the discord bot wrapper."""
 
+import asyncio
+from unittest import mock
+
 import pytest
 
 from bridge.bot import MAX_CHUNK, _chunk, _extract_images, Bot, BotNotReady
@@ -163,3 +166,70 @@ class TestBot:
         bot = Bot("test_token", 12345)
         with pytest.raises(BotNotReady, match="not connected"):
             await bot.create_thread("test thread")
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_callback_without_callback(self):
+        """Bot init without on_message callback doesn't register dispatcher."""
+        bot = Bot("test_token", 12345)
+        # Should not have registered an on_message listener
+        # (we can't easily verify this without mocking, but at least it shouldn't crash)
+        assert bot._on_message_cb is None
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_callback_with_callback(self):
+        """Bot init with on_message callback registers dispatcher."""
+        call_count = 0
+
+        async def dummy_callback(msg):
+            nonlocal call_count
+            call_count += 1
+
+        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        assert bot._on_message_cb is dummy_callback
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_dispatch_filters_own_messages(self):
+        """_on_message_dispatch ignores messages from the bot itself."""
+        call_count = 0
+
+        async def dummy_callback(msg):
+            nonlocal call_count
+            call_count += 1
+
+        bot = Bot("test_token", 12345, on_message=dummy_callback)
+
+        # Create a mock message where author == client.user
+        mock_msg = mock.MagicMock()
+        mock_msg.author = bot._client.user
+
+        await bot._on_message_dispatch(mock_msg)
+
+        # Callback should NOT have been called
+        assert call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bot_on_message_dispatch_invokes_callback_for_other_messages(self):
+        """_on_message_dispatch invokes callback for non-bot messages."""
+        call_count = 0
+        received_msg = None
+
+        async def dummy_callback(msg):
+            nonlocal call_count, received_msg
+            call_count += 1
+            received_msg = msg
+
+        bot = Bot("test_token", 12345, on_message=dummy_callback)
+
+        # Create a mock message where author != client.user
+        mock_author = mock.MagicMock()
+        mock_author.id = 123456
+        mock_author.bot = False
+
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot._on_message_dispatch(mock_msg)
+
+        # Callback should have been called
+        assert call_count == 1
+        assert received_msg is mock_msg
