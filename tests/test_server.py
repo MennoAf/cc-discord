@@ -1,6 +1,7 @@
 """Tests for the aiohttp server (POST /v1/notify, GET /v1/health, POST /v1/ask)."""
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -12,7 +13,10 @@ from aiohttp import test_utils, web
 
 from bridge.bot import BotNotReady
 from bridge.listener import Listener, _PendingAsk
-from bridge.server import build_app, _clamp_timeout, _format_question
+from bridge.server import (
+    build_app, _clamp_timeout, _format_question,
+    LISTENER_KEY, ASK_LOCKS_KEY
+)
 from bridge.threads import ThreadRegistry
 
 
@@ -127,11 +131,11 @@ async def client(fake_bot, in_memory_db):
     started_at = time.monotonic()
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
-    app["threads"] = registry
     # Wire in listener and ask_locks for /v1/ask testing
-    from bridge.server import AskLockMap
-    app["listener"] = Listener()
-    app["ask_locks"] = AskLockMap()
+    from bridge.server import AskLockMap, THREADS_KEY, LISTENER_KEY, ASK_LOCKS_KEY
+    app[THREADS_KEY] = registry
+    app[LISTENER_KEY] = Listener()
+    app[ASK_LOCKS_KEY] = AskLockMap()
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
@@ -496,10 +500,11 @@ class TestFormatQuestion:
         assert "(cwd: /home)" in result
 
     def test_format_question_empty_cwd(self):
-        """_format_question handles empty cwd."""
+        """_format_question handles empty cwd without showing empty parens."""
         result = _format_question("test", "")
         assert "❓ asks" in result
-        assert "(cwd: )" in result
+        assert "test" in result
+        assert "(cwd:" not in result
 
 
 # Tests for /v1/ask endpoint
@@ -510,7 +515,7 @@ class TestAskEndpoint:
     async def test_ask_happy_path_ac31(self, client, fake_bot):
         """AC3.1: POST /v1/ask posts question, awaits reply, returns 200 with reply text."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         # Start the ask request in the background
         ask_task = asyncio.create_task(
@@ -555,11 +560,10 @@ class TestAskEndpoint:
         assert "replied_at" in body
 
     @pytest.mark.asyncio
-    @pytest.mark.slow
     async def test_ask_timeout_no_leak_ac35(self, client, fake_bot):
         """AC3.5: Timeout removes pending ask (no leak in listener._pending)."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         # Spawn a background task to make the ask request with minimum clamped timeout
         # Note: this is slow (5 seconds) so it's marked @pytest.mark.slow
@@ -604,7 +608,7 @@ class TestAskEndpoint:
         """AC3.4: AskLockMap ensures FIFO per-thread serialization."""
         # This test verifies the FIFO mechanism is in place via the lock structure
         fake_bot.set_ready(True)
-        locks = client.app["ask_locks"]
+        locks = client.app[ASK_LOCKS_KEY]
 
         # Verify that AskLockMap creates locks on demand
         lock1 = await locks.get(1000)
@@ -655,7 +659,7 @@ class TestAskEndpoint:
     async def test_ask_multiline_replies_ac32(self, client, fake_bot):
         """AC3.2: Multiple replies from same author within grace window coalesce."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         # Start an ask
         ask_task = asyncio.create_task(
@@ -707,7 +711,7 @@ class TestAskEndpoint:
     async def test_ask_image_attachments_ac33(self, client, fake_bot):
         """AC3.3: Image attachments are returned as [image] URLs."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         ask_task = asyncio.create_task(
             client.post(
@@ -750,7 +754,7 @@ class TestAskEndpoint:
     async def test_ask_text_and_images_combined(self, client, fake_bot):
         """AC3.3 + AC3.2: Text and attachments combined; URLs after text."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         ask_task = asyncio.create_task(
             client.post(
@@ -788,7 +792,7 @@ class TestAskEndpoint:
     async def test_ask_bot_messages_filtered_ac36(self, client, fake_bot):
         """AC3.6: Bot's own messages do not resolve the future."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         ask_task = asyncio.create_task(
             client.post(
@@ -903,7 +907,7 @@ class TestAskEndpoint:
     async def test_ask_timeout_clamping(self, client, fake_bot):
         """Timeout values are clamped to [5, 3600]; _clamp_timeout is tested separately."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         # Verify that _clamp_timeout works via the helper function
         # (not by waiting for actual timeout which would be slow)
@@ -941,7 +945,7 @@ class TestAskEndpoint:
     async def test_ask_different_threads_no_interference(self, client, fake_bot):
         """Two concurrent asks for different session IDs don't interfere."""
         fake_bot.set_ready(True)
-        listener: Listener = client.app["listener"]
+        listener: Listener = client.app[LISTENER_KEY]
 
         async def ask_and_reply(session_id: str, question: str):
             task = asyncio.create_task(
@@ -983,3 +987,75 @@ class TestAskEndpoint:
         assert status2 == 200
         assert body1["reply"] == "reply-sess-a"
         assert body2["reply"] == "reply-sess-b"
+
+    @pytest.mark.asyncio
+    async def test_ask_concurrent_same_session_fifo_ordering_ac34(self, client, fake_bot):
+        """AC3.4: Two concurrent /v1/ask for same session via endpoint enforce FIFO ordering.
+
+        Tests that the AskLockMap serializes /v1/ask calls per-thread, with real HTTP calls.
+        The key assertion: the second ask's question is NOT posted until the first ask's
+        request has acquired and held the lock, proving FIFO serialization.
+        """
+        fake_bot.set_ready(True)
+
+        # Track posts at the start
+        initial_post_count = len(fake_bot.get_post_calls())
+
+        # Create one ask task, wait for it to post, then create a second concurrent ask
+        ask1_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-fifo-ordering",
+                    "cwd": "/tmp",
+                    "question": "first ask",
+                    "timeout_secs": 5,
+                },
+            )
+        )
+
+        # Wait for first question to be posted
+        await asyncio.sleep(0.2)
+
+        post_calls = fake_bot.get_post_calls()
+        first_q_calls = [
+            call for call in post_calls[initial_post_count:]
+            if "first ask" in call.get("message", "")
+        ]
+        assert len(first_q_calls) == 1
+        thread_id = first_q_calls[0]["thread_id"]
+
+        # Now create second concurrent ask for same session
+        ask2_task = asyncio.create_task(
+            client.post(
+                "/v1/ask",
+                json={
+                    "session_id": "sess-fifo-ordering",
+                    "cwd": "/tmp",
+                    "question": "second ask",
+                    "timeout_secs": 60,
+                },
+            )
+        )
+
+        # Give ask2 time to try to acquire the lock, but it should be blocked
+        await asyncio.sleep(0.2)
+
+        # Verify second question hasn't been posted yet
+        post_calls_mid = fake_bot.get_post_calls()
+        second_q_calls_mid = [
+            call for call in post_calls_mid[initial_post_count:]
+            if "second ask" in call.get("message", "")
+        ]
+        # FIFO guarantee: second question must not have been posted yet
+        assert len(second_q_calls_mid) == 0, "Second question should not be posted until first ask releases lock"
+
+        # Cancel both tasks (we only needed to verify the FIFO ordering of posts)
+        ask1_task.cancel()
+        ask2_task.cancel()
+
+        # Clean up
+        with contextlib.suppress(asyncio.CancelledError):
+            await ask1_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await ask2_task
