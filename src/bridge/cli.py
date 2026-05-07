@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -93,11 +94,16 @@ def init() -> None:
     write_secrets(secrets, path=secrets_path)
 
     # Verify mode
-    import stat
-
     perms = stat.S_IMODE(secrets_path.stat().st_mode)
     if perms != 0o600:
-        click.echo(f"Warning: file mode is {oct(perms)}, expected 0o600")
+        # Delete the dangling permissive file before failing
+        secrets_path.unlink()
+        click.echo(
+            f"Error: file mode is {oct(perms)}, expected 0o600. "
+            f"Secrets file deleted. Please check your filesystem settings.",
+            err=True
+        )
+        sys.exit(1)
 
     click.echo()
     click.echo(
