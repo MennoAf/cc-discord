@@ -93,13 +93,18 @@ class Test_chunk:
         # Should have 2 chunks
         assert len(result) == 2
 
-        # Second chunk should not have leading newlines
+        # Second chunk should not have leading newlines (key behavior of lstrip)
         assert not result[1].startswith("\n")
 
-        # Verify reconstruction
+        # All chunks except the final should be at or under the limit
+        for i, chunk in enumerate(result[:-1]):
+            assert len(chunk) <= MAX_CHUNK
+
+        # Final chunk should be under the limit
+        assert len(result[-1]) <= MAX_CHUNK
+
+        # Verify reconstruction preserves content
         reconstructed = "".join(result)
-        # After strip, reconstructed may differ if all content is gone
-        # But at minimum, the content should be in there
         assert "first part" in reconstructed
         assert "x" in reconstructed
 

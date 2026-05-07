@@ -13,6 +13,11 @@ from bridge.secrets import (
 )
 
 
+def test_secrets_error_is_runtime_error():
+    """SecretsError is a subclass of RuntimeError."""
+    assert issubclass(SecretsError, RuntimeError)
+
+
 class TestWriteAndRead:
     """Round-trip: write then read."""
 
