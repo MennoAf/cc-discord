@@ -165,6 +165,13 @@ class ZellijManager:
                 await self._action_write_bytes(27, 91, 50, 48, 48, 126)
                 for i, segment in enumerate(segments):
                     if segment:
+                        logger.info(
+                            "write-chars seg %d/%d (%d chars): %r",
+                            i + 1,
+                            len(segments),
+                            len(segment),
+                            segment[:120] + ("…" if len(segment) > 120 else ""),
+                        )
                         rc, _, stderr = await self._run_unlocked(
                             self._executable, "--session", SESSION_NAME,
                             "action", "write-chars", segment,
@@ -176,6 +183,11 @@ class ZellijManager:
                 # ESC [ 2 0 1 ~  — end bracketed paste
                 await self._action_write_bytes(27, 91, 50, 48, 49, 126)
             elif body:
+                logger.info(
+                    "write-chars single-line (%d chars): %r",
+                    len(body),
+                    body[:120] + ("…" if len(body) > 120 else ""),
+                )
                 rc, _, stderr = await self._run_unlocked(
                     self._executable, "--session", SESSION_NAME,
                     "action", "write-chars", body,

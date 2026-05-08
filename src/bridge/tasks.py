@@ -737,6 +737,13 @@ class TaskRegistry:
             )
         combined = "\n\n".join(parts)
 
+        logger.info(
+            "relay → pane (task=%s, %d chars, %d segments): %r",
+            task.task_id[:8],
+            len(combined),
+            combined.count("\n") + 1,
+            combined[:300] + ("…" if len(combined) > 300 else ""),
+        )
         await self._zellij.write_to_pane(task.zellij_pane_id, combined + "\n")
         task.last_activity = int(time.time())
         await self._persist(task)
