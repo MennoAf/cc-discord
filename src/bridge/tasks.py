@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 import bridge as _bridge_pkg
-from bridge import tool_summary, transcript, usage
+from bridge import tool_summary, transcript, usage, voice
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
@@ -682,16 +682,37 @@ class TaskRegistry:
         if msg.attachments:
             attachment_paths = await self._save_attachments(task.task_id, msg)
 
-        if not text and not attachment_paths:
+        # Split saved attachments into audio (transcribe via Wispr) vs other
+        # (relay path so claude can Read it).
+        voice_paths = [p for p in attachment_paths if voice.is_audio_path(p)]
+        other_paths = [p for p in attachment_paths if not voice.is_audio_path(p)]
+
+        voice_segments: list[str] = []
+        for p in voice_paths:
+            transcript_text = await voice.transcribe(p)
+            if transcript_text:
+                voice_segments.append(f"[voice memo] {transcript_text}")
+            else:
+                voice_segments.append(
+                    "[voice memo received — transcription unavailable; "
+                    f"raw file: {p}]"
+                )
+
+        if not text and not voice_segments and not other_paths:
             return True  # consumed silently — empty message
 
-        if attachment_paths:
-            attached_block = "attached files (use the Read tool to view):\n" + "\n".join(
-                f"- {p}" for p in attachment_paths
+        parts: list[str] = []
+        if text:
+            parts.append(text)
+        parts.extend(voice_segments)
+        if other_paths:
+            parts.append(
+                "attached files (use the Read tool to view):\n"
+                + "\n".join(f"- {p}" for p in other_paths)
             )
-            text = f"{text}\n\n{attached_block}" if text else attached_block
+        combined = "\n\n".join(parts)
 
-        await self._zellij.write_to_pane(task.zellij_pane_id, text + "\n")
+        await self._zellij.write_to_pane(task.zellij_pane_id, combined + "\n")
         task.last_activity = int(time.time())
         await self._persist(task)
         return True
