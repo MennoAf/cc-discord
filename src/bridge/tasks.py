@@ -1641,13 +1641,25 @@ class TaskRegistry:
 
         total = len(questions)
         any_answered = False
+        logger.info(
+            "ask_question: dispatching %d question(s) for task %s",
+            total, task.task_id[:8],
+        )
         for idx, q in enumerate(questions, start=1):
             options = [opt.get("label", "") for opt in (q.get("options") or [])]
             if not options:
+                logger.info(
+                    "ask_question: Q%d/%d has no options → free_text_stall",
+                    idx, total,
+                )
                 await self._handle_free_text_stall(task)
                 continue
 
             is_multi = bool(q.get("multiSelect"))
+            logger.info(
+                "ask_question: Q%d/%d multi=%s n_options=%d",
+                idx, total, is_multi, len(options),
+            )
             counter = f" ({idx}/{total})" if total > 1 else ""
             lines = [f"❓ **{q.get('question', '?')}**{counter}"]
             if is_multi:
@@ -1674,10 +1686,18 @@ class TaskRegistry:
                 prompt_body=body,
                 options=options,
             )
+            logger.info(
+                "ask_question: Q%d/%d answered source=%s answer=%r",
+                idx, total, source, answer,
+            )
             if source in ("cancelled", "timeout", "post_failed"):
                 # User answered in zellij or it failed; stop dispatching the
                 # remaining questions and don't send the final submit Enter
                 # (claude is already moving on or stalled).
+                logger.info(
+                    "ask_question: bailing out of loop after Q%d/%d (source=%s)",
+                    idx, total, source,
+                )
                 return
 
             if not task.zellij_pane_id:
@@ -1711,6 +1731,10 @@ class TaskRegistry:
         # After the last question, the TUI shows a "submit" screen — Enter
         # confirms and lets the AskUserQuestion tool return.
         if any_answered and task.zellij_pane_id:
+            logger.info(
+                "ask_question: sending final submit Enter for task %s",
+                task.task_id[:8],
+            )
             try:
                 await self._zellij.send_keys(task.zellij_pane_id, 13)
             except Exception:
