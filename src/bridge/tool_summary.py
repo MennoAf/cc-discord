@@ -108,3 +108,67 @@ def _diff_summary(tool_input: dict) -> str:
     plus = len(new.splitlines())
     minus = len(old.splitlines())
     return f"+{plus} -{minus}"
+
+
+# Discord's hard limit is 2000 chars per message; reserve headroom for the
+# fence + truncation marker.
+_DISCORD_LIMIT = 2000
+_DIFF_BUDGET = _DISCORD_LIMIT - 80
+
+
+def diff_block(tool_name: str, tool_input: dict) -> str | None:
+    """Return a fenced Discord-renderable diff/content block for Edit / MultiEdit
+    / Write, or None for tools that don't have a block to emit.
+
+    Truncates at ~_DISCORD_LIMIT to fit a single Discord message.
+    """
+    if tool_name == "Edit":
+        return _format_edit_diff(
+            tool_input.get("file_path") or "?",
+            tool_input.get("old_string") or "",
+            tool_input.get("new_string") or "",
+        )
+    if tool_name == "MultiEdit":
+        path = tool_input.get("file_path") or "?"
+        edits = tool_input.get("edits") or []
+        chunks: list[str] = []
+        for ed in edits:
+            if not isinstance(ed, dict):
+                continue
+            chunks.append(
+                _diff_body(ed.get("old_string") or "", ed.get("new_string") or "")
+            )
+        if not chunks:
+            return None
+        return _wrap_diff(f"--- {path}\n+++ {path}\n" + "\n".join(chunks))
+    if tool_name == "Write":
+        path = tool_input.get("file_path") or "?"
+        content = tool_input.get("content") or ""
+        return _wrap_code(content, path)
+    return None
+
+
+def _format_edit_diff(path: str, old: str, new: str) -> str:
+    body = f"--- {path}\n+++ {path}\n" + _diff_body(old, new)
+    return _wrap_diff(body)
+
+
+def _diff_body(old: str, new: str) -> str:
+    return "\n".join(
+        [f"-{line}" for line in old.splitlines()]
+        + [f"+{line}" for line in new.splitlines()]
+    )
+
+
+def _wrap_diff(body: str) -> str:
+    if len(body) > _DIFF_BUDGET:
+        body = body[:_DIFF_BUDGET] + "\n…"
+    return f"```diff\n{body}\n```"
+
+
+def _wrap_code(content: str, path: str) -> str:
+    header = f"_(wrote: {path})_\n"
+    budget = _DIFF_BUDGET - len(header)
+    if len(content) > budget:
+        content = content[:budget] + "\n…"
+    return f"{header}```\n{content}\n```"

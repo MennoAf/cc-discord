@@ -2549,24 +2549,27 @@ class TestTaskRegistryPhase3:
             pass
 
     async def test_on_stop_posts_final_assistant_turn(self, in_memory_db, tmp_path) -> None:
-        """_on_stop extracts and posts the final assistant turn from the transcript."""
+        """_on_stop streams every assistant text block from the current turn."""
         import json
 
         fake_bot = FakeBot()
         fake_zellij = FakeZellij()
         now = 1000
 
-        # Create a temporary transcript file
+        # Create a temporary transcript file. Each assistant entry needs a
+        # uuid because the streamer dedupes on it.
         transcript_path = tmp_path / "transcript.jsonl"
         entries = [
             {
                 "type": "user",
+                "uuid": "u-prompt",
                 "message": {"role": "user", "content": "hi"},
                 "isSidechain": False,
                 "isMeta": False,
             },
             {
                 "type": "assistant",
+                "uuid": "a-1",
                 "message": {
                     "role": "assistant",
                     "content": [
@@ -2579,6 +2582,7 @@ class TestTaskRegistryPhase3:
             },
             {
                 "type": "assistant",
+                "uuid": "a-2",
                 "message": {
                     "role": "assistant",
                     "content": [{"type": "text", "text": "All done"}],
@@ -2603,6 +2607,8 @@ class TestTaskRegistryPhase3:
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        # Skip the file-stabilization wait for the test's static transcript.
+        registry._STOP_TRANSCRIPT_RETRY_SECS = 0.0
         await registry.load_from_db()
 
         # Call Stop with transcript_path in body
@@ -2611,12 +2617,10 @@ class TestTaskRegistryPhase3:
             "transcript_path": str(transcript_path),
         })
 
-        # Verify the final assistant turn was posted
+        # Each text block becomes its own Discord post (live-streaming
+        # behavior); tool_use blocks are not posted here.
         posts = fake_bot.get_post_calls()
-        assert len(posts) == 1
-        content = posts[0]["content"]
-        assert "Hello there" in content
-        assert "All done" in content
+        assert [p["content"] for p in posts] == ["Hello there", "All done"]
 
     async def test_on_stop_does_not_post_empty_transcript(self, in_memory_db, tmp_path) -> None:
         """_on_stop does not post when transcript has no assistant text."""
@@ -2674,17 +2678,20 @@ class TestTaskRegistryPhase3:
         fake_zellij = FakeZellij()
         now = 1000
 
-        # Create a transcript with final assistant text
+        # Create a transcript with final assistant text. uuid is required so
+        # the streamer dedupes properly.
         transcript_path = tmp_path / "transcript.jsonl"
         entries = [
             {
                 "type": "user",
+                "uuid": "u-prompt",
                 "message": {"role": "user", "content": "run test"},
                 "isSidechain": False,
                 "isMeta": False,
             },
             {
                 "type": "assistant",
+                "uuid": "a-1",
                 "message": {
                     "role": "assistant",
                     "content": [{"type": "text", "text": "Final response"}],
@@ -2709,10 +2716,12 @@ class TestTaskRegistryPhase3:
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        registry._STOP_TRANSCRIPT_RETRY_SECS = 0.0
         monkeypatch.setattr(_ToolSummaryAggregator, "FLUSH_WINDOW", 10.0)  # Very long window
         await registry.load_from_db()
 
-        # Add a tool summary (with a long flush window, it won't auto-flush)
+        # Add a tool summary (with a long flush window, it won't auto-flush).
+        # PostToolUse will also stream the assistant text written so far.
         await registry._on_post_tool_use({
             "session_id": "sess-abc",
             "tool_name": "Bash",
@@ -2723,19 +2732,21 @@ class TestTaskRegistryPhase3:
         agg = registry._aggregators["task-123"]
         assert len(agg._lines) == 1  # Pending
 
-        # Call Stop
+        # PostToolUse already streamed "Final response"; the aggregator hasn't
+        # flushed yet (long window).
+        assert [p["content"] for p in fake_bot.get_post_calls()] == ["Final response"]
+
+        # Call Stop — flushes the aggregated tool summary; the assistant
+        # entry is already posted, so streaming is a no-op.
         await registry._on_stop({
             "session_id": "sess-abc",
             "transcript_path": str(transcript_path),
         })
 
-        # Verify both posts happened: tool summary first, then final turn
         posts = fake_bot.get_post_calls()
         assert len(posts) == 2
-        # First post should be the tool summary
-        assert "pytest" in posts[0]["content"]
-        # Second post should be the final assistant turn
-        assert "Final response" in posts[1]["content"]
+        assert posts[0]["content"] == "Final response"
+        assert "pytest" in posts[1]["content"]
 
     async def test_on_stop_handles_missing_transcript_path(self, in_memory_db) -> None:
         """_on_stop does not crash if transcript_path is missing."""

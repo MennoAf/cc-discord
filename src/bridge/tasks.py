@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -188,6 +188,10 @@ class Task:
     current_transcript_path: str | None
     created_at: int
     last_activity: int
+    # Assistant-entry uuids whose content has already been streamed to Discord
+    # within the current turn. Cleared on UserPromptSubmit / SessionStart so a
+    # new turn starts fresh; not persisted across bridge restarts.
+    posted_assistant_uuids: set[str] = field(default_factory=set)
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -685,6 +689,8 @@ class TaskRegistry:
         task.current_transcript_path = transcript_path
         task.status = "running"
         task.last_activity = int(time.time())
+        # New session = new turn boundary; drop any prior streaming state.
+        task.posted_assistant_uuids.clear()
         if old_session_id and old_session_id in self._by_session_id:
             del self._by_session_id[old_session_id]
         if session_id:
@@ -732,11 +738,15 @@ class TaskRegistry:
             if cancelled > 0:
                 logger.info("cancelled %d pending TUI prompts for task %s (answered in zellij)", cancelled, task.task_id)
         task.last_activity = int(time.time())
+        # New turn — start fresh streaming.
+        task.posted_assistant_uuids.clear()
         await self._persist(task)
         await self._start_typing(task)
 
     async def _on_post_tool_use(self, body: dict) -> None:
-        """Handle PostToolUse event. Append tool summary to aggregator."""
+        """Handle PostToolUse event. Stream pending assistant prose, append
+        tool summary, and post a diff/content block for Edit/MultiEdit/Write.
+        """
         session_id = body.get("session_id")
         if not session_id:
             return
@@ -746,12 +756,16 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
 
-        line = tool_summary.summarize(
-            body.get("tool_name", "?"),
-            body.get("tool_input", {}) or {},
-            body.get("tool_response", {}) or {},
-        )
+        # Stream any prose Claude wrote between the previous boundary and now.
+        await self._stream_assistant_progress(task)
+
+        tool_name = body.get("tool_name", "?")
+        tool_input = body.get("tool_input", {}) or {}
+        tool_response = body.get("tool_response", {}) or {}
+
+        line = tool_summary.summarize(tool_name, tool_input, tool_response)
         self._agg_for(task).append(line)
+        await self._post_tool_diff(task, tool_name, tool_input)
 
     async def _on_post_tool_use_failure(self, body: dict) -> None:
         """Handle PostToolUseFailure event. Force-failure summary."""
@@ -763,6 +777,8 @@ class TaskRegistry:
             return
         task.last_activity = int(time.time())
         await self._persist(task)
+        # Stream any prose written before the failure too.
+        await self._stream_assistant_progress(task)
         # Force-failure: synthesize a tool_response.is_error=True if missing.
         tool_response = (body.get("tool_response") or {}).copy()
         tool_response["is_error"] = True
@@ -772,6 +788,22 @@ class TaskRegistry:
             tool_response,
         )
         self._agg_for(task).append(line)
+
+    async def _post_tool_diff(
+        self, task: Task, tool_name: str, tool_input: dict
+    ) -> None:
+        """For Edit/MultiEdit/Write: post the actual change as a fenced block.
+
+        Posted separately from the one-liner summary so the aggregator can
+        keep coalescing summaries while diffs surface as their own messages.
+        """
+        block = tool_summary.diff_block(tool_name, tool_input)
+        if not block:
+            return
+        try:
+            await self._bot.post(block, thread_id=task.thread_id)
+        except Exception:
+            logger.exception("failed to post diff block for task %s", task.task_id)
 
     async def _on_stop(self, body: dict) -> None:
         """Handle Stop event. Cancel pending TUI, stop typing, flush summaries, and post final turn."""
@@ -793,46 +825,137 @@ class TaskRegistry:
         if agg is not None:
             await agg.flush_now()
 
-        # Read transcript and post the final assistant turn. The Stop hook
-        # fires before Claude's transcript writer flushes the final assistant
-        # entry — retry briefly to absorb that race.
+        # Stream any remaining assistant content for the turn. Stop fires
+        # before Claude's transcript writer flushes the final entry, so wait
+        # for the file to settle, then stream once more.
         transcript_path = body.get("transcript_path") or task.current_transcript_path
         if transcript_path:
-            text = await self._read_final_assistant_text_with_retry(Path(transcript_path))
-            if text:
-                try:
-                    await self._bot.post(text, thread_id=task.thread_id)
-                except Exception:
-                    logger.exception("failed to post final assistant turn for task %s", task.task_id)
-            else:
-                logger.info("Stop: no assistant text within retry deadline for task %s", task.task_id)
+            tp = Path(transcript_path)
+            await self._wait_for_transcript_stable(tp)
+            await self._stream_assistant_progress(task, tp)
         else:
-            logger.info("Stop: no transcript_path in body or task; skipping post")
+            logger.info("Stop: no transcript_path in body or task; skipping final stream")
 
-    # Retry budget for the Stop transcript-flush race. Tests override to 0 to
-    # skip the retry loop when they're verifying the empty-text branches.
-    _STOP_TRANSCRIPT_RETRY_SECS: float = 2.0
+    # Max time to wait at Stop for the transcript file to stop growing
+    # (i.e., the writer to flush). Tests override to 0 to skip the wait.
+    _STOP_TRANSCRIPT_RETRY_SECS: float = 10.0
 
-    async def _read_final_assistant_text_with_retry(self, path: Path) -> str:
-        """Extract final assistant text with bounded retry for the post-Stop write race.
+    async def _wait_for_transcript_stable(
+        self, path: Path, *, stable_secs: float = 0.25
+    ) -> None:
+        """Wait until path's size hasn't changed for `stable_secs`, or budget elapses.
 
-        Claude flushes the final assistant entry around Stop time, sometimes
-        slightly after the hook fires. Retry with exponential backoff until we
-        get non-empty text or hit the deadline. Returns immediately if the
-        transcript file doesn't exist — no point waiting on a write that will
-        never come.
+        Bounded by `_STOP_TRANSCRIPT_RETRY_SECS`. No-op if file doesn't exist.
         """
         if not path.is_file():
-            return ""
+            return
+        if self._STOP_TRANSCRIPT_RETRY_SECS <= 0:
+            return
         loop = asyncio.get_event_loop()
         deadline = loop.time() + self._STOP_TRANSCRIPT_RETRY_SECS
-        delay = 0.05
+        last_size = -1
+        stable_since: float | None = None
         while True:
-            text = transcript.extract_final_assistant_text(path)
-            if text or loop.time() >= deadline:
-                return text
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 0.4)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return
+            now = loop.time()
+            if size == last_size:
+                if stable_since is None:
+                    stable_since = now
+                elif now - stable_since >= stable_secs:
+                    return
+            else:
+                last_size = size
+                stable_since = None
+            if now >= deadline:
+                return
+            await asyncio.sleep(0.05)
+
+    async def _stream_assistant_progress(
+        self, task: Task, path: Path | None = None
+    ) -> None:
+        """Post any assistant content (text/thinking blocks) for the current
+        turn that hasn't been streamed yet. Idempotent — entries already in
+        `task.posted_assistant_uuids` are skipped.
+
+        Walks from the last real-user prompt forward; only emits text and
+        thinking blocks (tool_use blocks are handled by PostToolUse). Marks
+        each visited assistant entry as posted regardless of whether it had
+        any postable content, so we don't reconsider it on the next call.
+        """
+        if path is None:
+            if not task.current_transcript_path:
+                return
+            path = Path(task.current_transcript_path)
+        if not path.is_file():
+            return
+
+        entries = list(transcript.read_entries(path))
+        if not entries:
+            return
+
+        last_user_idx = -1
+        for i in range(len(entries) - 1, -1, -1):
+            e = entries[i]
+            if e.get("type") != "user":
+                continue
+            if e.get("isSidechain") is True or e.get("isMeta") is True:
+                continue
+            msg = e.get("message")
+            if not isinstance(msg, dict):
+                continue
+            if isinstance(msg.get("content"), str):
+                last_user_idx = i
+                break
+
+        for e in entries[last_user_idx + 1:]:
+            if e.get("type") != "assistant":
+                continue
+            if e.get("isSidechain") is True or e.get("isMeta") is True:
+                continue
+            uid = e.get("uuid")
+            if not isinstance(uid, str) or uid in task.posted_assistant_uuids:
+                continue
+
+            msg = e.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            try:
+                                await self._bot.post(text, thread_id=task.thread_id)
+                            except Exception:
+                                logger.exception(
+                                    "failed to stream text for task %s", task.task_id
+                                )
+                    elif btype == "thinking":
+                        # Extended-thinking blocks are encrypted by default
+                        # (`thinking` is empty). Only post when content is
+                        # visible.
+                        thought = block.get("thinking") or ""
+                        if isinstance(thought, str) and thought.strip():
+                            try:
+                                await self._bot.post(
+                                    self._format_thinking(thought),
+                                    thread_id=task.thread_id,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "failed to stream thinking for task %s", task.task_id
+                                )
+            task.posted_assistant_uuids.add(uid)
+
+    @staticmethod
+    def _format_thinking(text: str) -> str:
+        """Discord-render a thinking block: 🤔 + multi-line italics."""
+        return f"🤔 *{text.strip()}*"
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes."""
