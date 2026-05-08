@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import time
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
+import bridge as _bridge_pkg
 from bridge import tool_summary, transcript
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
@@ -24,6 +26,74 @@ if TYPE_CHECKING:
     from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
+
+# Task-scoped settings directory
+TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+
+# Hook scripts directory — resolved at import time for test monkeypatch support
+HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
+
+
+def _write_task_settings(
+    task_id: str, *, settings_dir: Path = TASK_SETTINGS_DIR, hooks_dir: Path = HOOKS_DIR
+) -> Path:
+    """Generate the task-scoped settings JSON. Returns the absolute path written.
+
+    The file registers `event.py` for the read-only event types and
+    `pretooluse-approve.py` for `PreToolUse`. All paths are absolute.
+    """
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    out_path = settings_dir / f"{task_id}.json"
+    event_script = str(hooks_dir / "event.py")
+    pretooluse_script = str(hooks_dir / "pretooluse-approve.py")
+
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": pretooluse_script},
+                    ],
+                },
+            ],
+            "SessionStart": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "UserPromptSubmit": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "PostToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "PostToolUseFailure": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "Stop": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "Notification": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+            "SessionEnd": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
+            ],
+        }
+    }
+
+    out_path.write_text(json.dumps(settings, indent=2))
+    return out_path
+
+
+def _cleanup_task_settings(task_id: str, *, settings_dir: Path = TASK_SETTINGS_DIR) -> None:
+    """Remove the task-scoped settings file. Idempotent — silent on missing file."""
+    p = settings_dir / f"{task_id}.json"
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.exception("failed to remove task settings file %s", p)
 
 
 class TaskSpawnError(Exception):
@@ -259,6 +329,8 @@ class TaskRegistry:
             handler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
+        # Clean up the task-scoped settings file
+        _cleanup_task_settings(task.task_id)
 
     async def _archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
@@ -348,6 +420,9 @@ class TaskRegistry:
             now=now,
         )
 
+        # Write task-scoped settings file with bridge hooks
+        settings_path = _write_task_settings(task_id)
+
         # Build env for spawned claude
         env = self._build_spawn_env(task_id)
 
@@ -357,6 +432,7 @@ class TaskRegistry:
                 cwd=cwd,
                 env=env,
                 pane_name=f"cc-{task_id[:8]}",
+                extra_argv=["--settings", str(settings_path)],
             )
         except ZellijError:
             logger.exception(f"spawn_task failed for task_id {task_id}")
@@ -644,6 +720,7 @@ class TaskRegistry:
         """Handle SessionEnd event.
 
         Stops typing indicator, resolves any pending stop_future for the task so stop_task can proceed.
+        Cleans up the task-scoped settings file.
         """
         session_id = body.get("session_id")
         if not session_id:
@@ -655,6 +732,10 @@ class TaskRegistry:
         fut = self._stop_futures.get(task.task_id)
         if fut is not None and not fut.done():
             fut.set_result(None)
+        # Always clean up the settings file when the claude process ends, regardless of
+        # whether the status was already stopped/crashed or is about to be flipped by Phase 8's
+        # logic. Idempotent — missing-file is silent.
+        _cleanup_task_settings(task.task_id)
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event (no-op in Phase 1)."""
@@ -851,6 +932,8 @@ class TaskRegistry:
             handler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
+        # Clean up the task-scoped settings file
+        _cleanup_task_settings(task_id)
 
     async def restart_task(self, task_id: str) -> Task:
         """Resume a task by spawning a new claude with --resume <session_id>.
@@ -881,12 +964,13 @@ class TaskRegistry:
             return task
 
         # Spawn a fresh pane with the resumed session.
+        settings_path = _write_task_settings(task.task_id)
         env = self._build_spawn_env(task.task_id)
         new_pane_id = await self._zellij.spawn_task(
             cwd=task.cwd,
             env=env,
             pane_name=f"cc-{task.task_id[:8]}",
-            extra_argv=["--resume", task.current_claude_session_id],
+            extra_argv=["--settings", str(settings_path), "--resume", task.current_claude_session_id],
         )
         task.zellij_pane_id = new_pane_id
         task.last_activity = int(time.time())

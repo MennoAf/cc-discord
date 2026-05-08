@@ -356,7 +356,9 @@ class TestTaskRegistry:
         # Mock zellij.spawn_task to return a pane_id
         pane_id = "terminal_1"
 
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str) -> str:
+        async def mock_spawn_task(
+            cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None
+        ) -> str:
             return pane_id
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -406,7 +408,7 @@ class TestTaskRegistry:
         """spawn_task injects CC_DISCORD_TASK_ID and BRIDGE_URL into env."""
         captured_env = {}
 
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str) -> str:
+        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
             captured_env.update(env)
             return "terminal_1"
 
@@ -434,7 +436,7 @@ class TestTaskRegistry:
         """spawn_task preserves BRIDGE_URL from os.environ if set."""
         captured_env = {}
 
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str) -> str:
+        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
             captured_env.update(env)
             return "terminal_1"
 
@@ -600,7 +602,7 @@ class TestTaskRegistry:
         """spawn_task on zellij failure marks task as crashed and re-raises."""
         from bridge.zellij import ZellijSpawnError
 
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str) -> str:
+        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
             raise ZellijSpawnError("Could not resolve pane id")
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -1269,7 +1271,10 @@ class TestTaskRegistryPhase3:
         # Should have spawned new pane with extra_argv
         assert len(spawn_calls) == 1
         assert spawn_calls[0]["cwd"] == "/tmp"
-        assert spawn_calls[0]["extra_argv"] == ["--resume", "sess-abc"]
+        # extra_argv now includes both --settings and --resume
+        assert "--settings" in spawn_calls[0]["extra_argv"]
+        assert "--resume" in spawn_calls[0]["extra_argv"]
+        assert "sess-abc" in spawn_calls[0]["extra_argv"]
 
         # Task pane should be updated
         assert task.zellij_pane_id == "terminal_2"
@@ -2680,3 +2685,203 @@ async def test_race_cancel_before_request_registers(in_memory_db):
     # Should resolve immediately with cancel sentinel
     assert answer == ""
     assert source == "cancelled"
+
+
+@pytest.mark.asyncio
+class TestTaskSettingsIntegration:
+    """Tests for task-scoped settings file integration with spawn/kill/restart."""
+
+    async def test_spawn_task_passes_settings_file_via_extra_argv(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
+    ) -> None:
+        """spawn_task passes settings file to zellij via extra_argv."""
+        from bridge import tasks as tasks_module
+        
+        # Replace both functions to use a test directory
+        settings_dir = tmp_path / "settings"
+        
+        original_write = tasks_module._write_task_settings
+        original_cleanup = tasks_module._cleanup_task_settings
+        
+        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
+            return original_write(
+                task_id,
+                settings_dir=settings_dir,
+                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+            )
+        
+        def patched_cleanup(task_id: str, *, settings_dir_param=None):
+            return original_cleanup(task_id, settings_dir=settings_dir)
+        
+        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
+        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+
+        captured_args = {}
+
+        async def mock_spawn_task(
+            cwd: str,
+            env: dict[str, str],
+            pane_name: str,
+            extra_argv: list[str] | None = None,
+        ) -> str:
+            captured_args["extra_argv"] = extra_argv
+            return "terminal_1"
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        task = await registry.spawn_task("/tmp")
+
+        # Verify extra_argv includes --settings
+        assert captured_args["extra_argv"] is not None
+        assert len(captured_args["extra_argv"]) >= 2
+        assert captured_args["extra_argv"][0] == "--settings"
+        assert captured_args["extra_argv"][1].endswith(f"{task.task_id}.json")
+
+    async def test_kill_task_cleans_up_settings_file(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
+    ) -> None:
+        """kill_task removes the task-scoped settings file."""
+        from bridge import tasks as tasks_module
+        
+        settings_dir = tmp_path / "settings"
+        
+        original_write = tasks_module._write_task_settings
+        original_cleanup = tasks_module._cleanup_task_settings
+        
+        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
+            return original_write(
+                task_id,
+                settings_dir=settings_dir,
+                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+            )
+        
+        def patched_cleanup(task_id: str, *, settings_dir_param=None):
+            return original_cleanup(task_id, settings_dir=settings_dir)
+        
+        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
+        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+
+        async def mock_spawn_task(
+            cwd: str,
+            env: dict[str, str],
+            pane_name: str,
+            extra_argv: list[str] | None = None,
+        ) -> str:
+            return "terminal_1"
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        task = await registry.spawn_task("/tmp")
+
+        # Verify settings file was created
+        settings_file = settings_dir / f"{task.task_id}.json"
+        assert settings_file.exists()
+
+        # Kill the task
+        await registry.kill_task(task.task_id)
+
+        # Verify settings file was removed
+        assert not settings_file.exists()
+
+    async def test_mark_stopped_cleans_up_settings_file(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
+    ) -> None:
+        """_mark_stopped removes the task-scoped settings file."""
+        from bridge import tasks as tasks_module
+        
+        settings_dir = tmp_path / "settings"
+        
+        original_write = tasks_module._write_task_settings
+        original_cleanup = tasks_module._cleanup_task_settings
+        
+        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
+            return original_write(
+                task_id,
+                settings_dir=settings_dir,
+                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+            )
+        
+        def patched_cleanup(task_id: str, *, settings_dir_param=None):
+            return original_cleanup(task_id, settings_dir=settings_dir)
+        
+        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
+        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+
+        async def mock_spawn_task(
+            cwd: str,
+            env: dict[str, str],
+            pane_name: str,
+            extra_argv: list[str] | None = None,
+        ) -> str:
+            return "terminal_1"
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        task = await registry.spawn_task("/tmp")
+
+        # Verify settings file was created
+        settings_file = settings_dir / f"{task.task_id}.json"
+        assert settings_file.exists()
+
+        # Mark as stopped (via _mark_stopped, which is called by stop_task)
+        await registry._mark_stopped(task)
+
+        # Verify settings file was removed
+        assert not settings_file.exists()
+
+    async def test_on_session_end_cleans_up_settings_file(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
+    ) -> None:
+        """_on_session_end removes the task-scoped settings file."""
+        from bridge import tasks as tasks_module
+        
+        settings_dir = tmp_path / "settings"
+        
+        original_write = tasks_module._write_task_settings
+        original_cleanup = tasks_module._cleanup_task_settings
+        
+        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
+            return original_write(
+                task_id,
+                settings_dir=settings_dir,
+                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+            )
+        
+        def patched_cleanup(task_id: str, *, settings_dir_param=None):
+            return original_cleanup(task_id, settings_dir=settings_dir)
+        
+        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
+        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+
+        async def mock_spawn_task(
+            cwd: str,
+            env: dict[str, str],
+            pane_name: str,
+            extra_argv: list[str] | None = None,
+        ) -> str:
+            return "terminal_1"
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        task = await registry.spawn_task("/tmp")
+
+        # Simulate SessionStart to set session_id
+        await registry._on_session_start({
+            "session_id": "sess-test-123",
+            "transcript_path": "/tmp/transcript.md",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": task.task_id},
+        })
+
+        # Verify settings file was created
+        settings_file = settings_dir / f"{task.task_id}.json"
+        assert settings_file.exists()
+
+        # Trigger SessionEnd event
+        await registry._on_session_end({"session_id": "sess-test-123"})
+
+        # Verify settings file was removed
+        assert not settings_file.exists()
