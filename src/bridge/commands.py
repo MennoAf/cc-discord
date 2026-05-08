@@ -185,6 +185,52 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
             f"✅ Sent `{rendered}` to `{task.task_id[:8]}`", ephemeral=True
         )
 
+    @tree.command(
+        name="rename",
+        description="Rename the task's thread (omit name to auto-generate via claude -p)",
+    )
+    @app_commands.describe(name="New thread name; omit to auto-generate")
+    async def rename_cmd(
+        interaction: discord.Interaction,
+        name: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
+        if name is None:
+            try:
+                generated = await registry.generate_thread_name(task.task_id)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Generation failed: {e}", ephemeral=True
+                )
+                return
+            if not generated:
+                await interaction.followup.send(
+                    "❌ Couldn't auto-generate (no transcript yet, or claude -p errored). Pass a name explicitly.",
+                    ephemeral=True,
+                )
+                return
+            name = generated
+
+        # Discord thread names: 1–100 chars, no newlines.
+        cleaned = " ".join(name.split())[:100]
+        if not cleaned:
+            await interaction.followup.send("❌ Empty name.", ephemeral=True)
+            return
+        try:
+            await bot.rename_thread(task.thread_id, cleaned)
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Rename failed: {e}", ephemeral=True
+            )
+            return
+        await interaction.followup.send(f"✏️ Renamed to `{cleaned}`", ephemeral=True)
+
     @tree.command(name="stats", description="Show model / token / cost stats for a task")
     @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
     async def stats_cmd(

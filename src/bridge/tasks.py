@@ -1326,6 +1326,79 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
 
+    async def generate_thread_name(self, task_id: str, *, timeout: float = 30.0) -> str | None:
+        """Use `claude -p` to suggest a short kebab-case name for the task's
+        thread, derived from the first user prompt + first assistant response
+        in the transcript. Returns the bare name (no quotes), or None if no
+        transcript / generation failed.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None or not task.current_transcript_path:
+            return None
+        path = Path(task.current_transcript_path)
+        if not path.is_file():
+            return None
+
+        first_user: str | None = None
+        first_assistant: str | None = None
+        for e in transcript.read_entries(path):
+            if e.get("isSidechain") is True or e.get("isMeta") is True:
+                continue
+            t = e.get("type")
+            msg = e.get("message")
+            if first_user is None and t == "user" and isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    first_user = content
+            elif first_user and first_assistant is None and t == "assistant" and isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    texts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    joined = " ".join(t for t in texts if t).strip()
+                    if joined:
+                        first_assistant = joined
+            if first_user and first_assistant:
+                break
+
+        if not first_user:
+            return None
+
+        prompt = (
+            "Generate a short kebab-case name (3-5 words, lowercase, hyphens only, "
+            "no leading/trailing whitespace, no quotes, no explanation) summarizing "
+            "this conversation. Reply with ONLY the name on a single line.\n\n"
+            f"USER: {first_user[:500]}\n\n"
+            f"ASSISTANT: {(first_assistant or '')[:500]}"
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude",
+                "-p",
+                prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("generate_thread_name: claude -p timed out for task %s", task_id)
+            return None
+        except Exception:
+            logger.exception("generate_thread_name: claude -p failed for task %s", task_id)
+            return None
+        if proc.returncode != 0:
+            return None
+        # Take the first non-empty line; claude sometimes adds extra text despite
+        # instructions.
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            s = line.strip().strip('"').strip("'")
+            if s:
+                return s
+        return None
+
     async def invoke_skill(
         self, task_id: str, skill_name: str, args: str | None = None
     ) -> None:

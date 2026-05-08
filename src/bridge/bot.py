@@ -210,6 +210,13 @@ class Bot:
             raise BotNotReady("bot not connected to Discord")
         return await self._client.fetch_channel(thread_id)
 
+    async def rename_thread(self, thread_id: int, name: str) -> None:
+        """Rename a Discord thread. Discord enforces 1–100 chars; caller should sanitize."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        thread = await self._client.fetch_channel(thread_id)
+        await thread.edit(name=name)
+
     async def archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread by ID.
 
