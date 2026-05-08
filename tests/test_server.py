@@ -2,20 +2,19 @@
 
 import asyncio
 import contextlib
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import aiosqlite
 import pytest
-from aiohttp import test_utils, web
+from aiohttp import test_utils
 
 from bridge.bot import BotNotReady
-from bridge.listener import Listener, _PendingAsk
+from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
-    LISTENER_KEY, ASK_LOCKS_KEY
+    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY
 )
 from bridge.threads import ThreadRegistry
 
@@ -132,7 +131,7 @@ async def client(fake_bot, in_memory_db):
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
     # Wire in listener and ask_locks for /v1/ask testing
-    from bridge.server import AskLockMap, THREADS_KEY, LISTENER_KEY, ASK_LOCKS_KEY
+    from bridge.server import AskLockMap
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = Listener()
     app[ASK_LOCKS_KEY] = AskLockMap()
@@ -277,8 +276,6 @@ async def test_notify_bot_error(client, fake_bot):
     """POST /v1/notify where bot.post raises exception returns 500."""
     fake_bot.set_ready(True)
     # Patch the bot to raise a generic exception
-    original_post = fake_bot.post
-
     async def failing_post(*args, **kwargs):
         raise RuntimeError("Something went wrong")
 
@@ -932,9 +929,9 @@ class TestAskEndpoint:
 
         # Verify ask is registered
         post_calls = fake_bot.get_post_calls()
-        if post_calls:
-            thread_id = post_calls[-1]["thread_id"]
-            assert thread_id in listener._pending
+        assert post_calls, "ask should have posted by now"
+        thread_id = post_calls[-1]["thread_id"]
+        assert thread_id in listener._pending
 
         # Cancel the task to avoid timeout wait
         task.cancel()
@@ -1023,7 +1020,6 @@ class TestAskEndpoint:
             if "first ask" in call.get("message", "")
         ]
         assert len(first_q_calls) == 1
-        thread_id = first_q_calls[0]["thread_id"]
 
         # Now create second concurrent ask for same session
         ask2_task = asyncio.create_task(
@@ -1059,3 +1055,41 @@ class TestAskEndpoint:
             await ask1_task
         with contextlib.suppress(asyncio.CancelledError):
             await ask2_task
+
+    @pytest.mark.asyncio
+    async def test_ask_invalid_timeout_secs(self, client, fake_bot):
+        """POST /v1/ask with non-numeric timeout_secs returns 400."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "session_id": "sess-test",
+                "cwd": "/tmp",
+                "question": "?",
+                "timeout_secs": "abc",
+            },
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["error"] == "invalid timeout_secs"
+
+    @pytest.mark.asyncio
+    async def test_ask_generic_exception(self, client, fake_bot):
+        """POST /v1/ask where bot.post raises generic Exception returns 500 with JSON body."""
+        fake_bot.set_ready(True)
+
+        async def failing_post(*args, **kwargs):
+            raise RuntimeError("Something went wrong")
+
+        fake_bot.post = failing_post
+        resp = await client.post(
+            "/v1/ask",
+            json={
+                "session_id": "sess-test",
+                "cwd": "/tmp",
+                "question": "?",
+            },
+        )
+        assert resp.status == 500
+        body = await resp.json()
+        assert body["error"] == "internal"

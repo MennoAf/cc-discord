@@ -181,35 +181,33 @@ async def _handle_ask(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
-    bot: Bot = request.app[BOT_KEY]
-    registry: ThreadRegistry = request.app[THREADS_KEY]
-    listener: Listener = request.app[LISTENER_KEY]
-    locks: AskLockMap = request.app[ASK_LOCKS_KEY]
-
-    # Check if bot is ready
-    if not bot.is_ready:
-        return web.Response(
-            status=503,
-            text=json.dumps({"error": "bot_not_connected"}),
-            content_type="application/json",
-        )
+    # Validate timeout_secs early if provided
+    if "timeout_secs" in body:
+        try:
+            _clamp_timeout(body["timeout_secs"])
+        except ValueError:
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "invalid timeout_secs"}),
+                content_type="application/json",
+            )
 
     try:
-        thread_id = await registry.get_or_create_thread(body["session_id"], body["cwd"])
-    except BotNotReady:
-        return web.Response(
-            status=503,
-            text=json.dumps({"error": "bot_not_connected"}),
-            content_type="application/json",
-        )
+        bot: Bot = request.app[BOT_KEY]
+        registry: ThreadRegistry = request.app[THREADS_KEY]
+        listener: Listener = request.app[LISTENER_KEY]
+        locks: AskLockMap = request.app[ASK_LOCKS_KEY]
 
-    # Acquire per-thread lock for FIFO serialization
-    lock = await locks.get(thread_id)
-    async with lock:
-        # Post the question AFTER acquiring the lock
-        ask_text = _format_question(body["question"], body["cwd"])
+        # Check if bot is ready
+        if not bot.is_ready:
+            return web.Response(
+                status=503,
+                text=json.dumps({"error": "bot_not_connected"}),
+                content_type="application/json",
+            )
+
         try:
-            await bot.post(ask_text, thread_id=thread_id)
+            thread_id = await registry.get_or_create_thread(body["session_id"], body["cwd"])
         except BotNotReady:
             return web.Response(
                 status=503,
@@ -217,30 +215,63 @@ async def _handle_ask(request: web.Request) -> web.Response:
                 content_type="application/json",
             )
 
-        # Register pending ask and wait for reply
-        asked_at = datetime.now(timezone.utc)
-        ask = _PendingAsk(asked_at)
-        await listener.register(thread_id, ask)
-        try:
-            # Parse and clamp timeout
-            timeout = _clamp_timeout(body.get("timeout_secs", 900))
-            result = await asyncio.wait_for(ask.future, timeout=timeout)
-        except asyncio.TimeoutError:
-            return web.Response(
-                status=408,
-                text=json.dumps({"error": "timeout"}),
-                content_type="application/json",
-            )
-        finally:
-            await listener.unregister(thread_id, ask)
+        # Acquire per-thread lock for FIFO serialization
+        lock = await locks.get(thread_id)
+        async with lock:
+            # Post the question AFTER acquiring the lock
+            ask_text = _format_question(body["question"], body["cwd"])
+            try:
+                await bot.post(ask_text, thread_id=thread_id)
+            except BotNotReady:
+                return web.Response(
+                    status=503,
+                    text=json.dumps({"error": "bot_not_connected"}),
+                    content_type="application/json",
+                )
 
-    return web.Response(
-        status=200,
-        text=json.dumps(
-            {"reply": result.reply, "replied_at": result.replied_at},
-        ),
-        content_type="application/json",
-    )
+            # Register pending ask and wait for reply
+            asked_at = datetime.now(timezone.utc)
+            ask = _PendingAsk(asked_at)
+            await listener.register(thread_id, ask)
+            try:
+                # Parse and clamp timeout
+                timeout = _clamp_timeout(body.get("timeout_secs", 900))
+                result = await asyncio.wait_for(ask.future, timeout=timeout)
+            except asyncio.TimeoutError:
+                return web.Response(
+                    status=408,
+                    text=json.dumps({"error": "timeout"}),
+                    content_type="application/json",
+                )
+            finally:
+                await listener.unregister(thread_id, ask)
+
+        return web.Response(
+            status=200,
+            text=json.dumps(
+                {"reply": result.reply, "replied_at": result.replied_at},
+            ),
+            content_type="application/json",
+        )
+    except BotNotReady:
+        return web.Response(
+            status=503,
+            text=json.dumps({"error": "bot_not_connected"}),
+            content_type="application/json",
+        )
+    except asyncio.TimeoutError:
+        return web.Response(
+            status=408,
+            text=json.dumps({"error": "timeout"}),
+            content_type="application/json",
+        )
+    except Exception:
+        logger.exception("ask failed")
+        return web.Response(
+            status=500,
+            text=json.dumps({"error": "internal"}),
+            content_type="application/json",
+        )
 
 
 async def _handle_health(request: web.Request) -> web.Response:
