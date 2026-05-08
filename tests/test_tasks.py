@@ -1211,3 +1211,172 @@ class TestTaskRegistryPhase3:
         # Future should be resolved
         assert fut.done()
 
+    async def test_write_initial_prompt_happy_path(
+        self, in_memory_db
+    ) -> None:
+        """write_initial_prompt writes text to pane and bumps last_activity."""
+        # Avoid fixture reuse issues with inline instantiation
+        from tests.test_commands import FakeZellij, FakeBot
+
+        fake_zellij = FakeZellij()
+        fake_bot = FakeBot()
+
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            zellij_pane_id="terminal_1",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        old_activity = task.last_activity
+
+        # Write prompt
+        await registry.write_initial_prompt("task-123", "hello world")
+
+        # Verify write_to_pane was called
+        assert len(fake_zellij._write_calls) == 1
+        call = fake_zellij._write_calls[0]
+        assert call["pane_id"] == "terminal_1"
+        assert "hello world\n" in call["text"]
+
+        # Verify last_activity was bumped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.last_activity > old_activity
+
+    async def test_write_initial_prompt_missing_task(
+        self, in_memory_db
+    ) -> None:
+        """write_initial_prompt logs warning if task is missing."""
+        from tests.test_commands import FakeZellij, FakeBot
+
+        registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
+
+        # Attempt to write to non-existent task
+        await registry.write_initial_prompt("nonexistent", "hello")
+
+        # Should not raise, just log
+
+    async def test_stop_task_already_stopped_is_idempotent(
+        self, in_memory_db
+    ) -> None:
+        """stop_task returns True immediately if task is already stopped."""
+        from tests.test_commands import FakeZellij, FakeBot
+
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        # Create a running task first
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        await registry.load_from_db()
+
+        # Manually set status to stopped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        task.status = "stopped"
+
+        # Stop should return True (idempotent, no-op)
+        result = await registry.stop_task("task-123")
+        assert result is True
+
+        # Verify no write_to_pane was called
+        assert len(fake_zellij._write_calls) == 0
+
+    async def test_kill_task_already_crashed_is_idempotent(
+        self, in_memory_db
+    ) -> None:
+        """kill_task returns None immediately if task is already crashed."""
+        from tests.test_commands import FakeZellij, FakeBot
+
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        # Create a running task first
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        await registry.load_from_db()
+
+        # Manually set status to crashed
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        task.status = "crashed"
+
+        # Kill should return None (idempotent, no-op)
+        await registry.kill_task("task-123")
+
+        # Verify no close_pane was called
+        assert len(fake_zellij._close_calls) == 0
+
+    async def test_restart_task_bumps_activity_when_live_pane(
+        self, in_memory_db
+    ) -> None:
+        """restart_task with live pane updates last_activity."""
+        # Import fixtures inline to avoid import issues
+        from tests.test_commands import FakeZellij, FakeBot
+
+        fake_zellij = FakeZellij()
+        fake_bot = FakeBot()
+
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        old_activity = task.last_activity
+
+        # Mock list_panes to return pane as alive
+        async def mock_list_panes():
+            return [{"id": "terminal_1", "exited": False, "title": "test"}]
+
+        fake_zellij.list_panes = mock_list_panes
+
+        # Restart
+        await registry.restart_task("task-123")
+
+        # Verify last_activity was bumped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.last_activity > old_activity
+
