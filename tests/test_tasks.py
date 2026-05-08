@@ -985,10 +985,10 @@ class TestTaskRegistry:
         posts = fake_bot.get_post_calls()
         assert len(posts) == 0
 
-    async def test_load_from_db_pane_alive_silent_recovery(
+    async def test_load_from_db_pane_alive_posts_bridge_restart_notice(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
     ) -> None:
-        """load_from_db with live pane: task stays running, no message."""
+        """load_from_db with live pane: task stays running, posts bridge-restart notice."""
         now = 1000
         await upsert_task(
             in_memory_db,
@@ -1014,9 +1014,12 @@ class TestTaskRegistry:
         assert task is not None
         assert task.status == "running"
 
-        # No posts (silent recovery)
+        # Should post bridge-restart notice to live recovered task
         posts = fake_bot.get_post_calls()
-        assert len(posts) == 0
+        assert len(posts) == 1
+        assert posts[0]["thread_id"] == 999
+        assert "Bridge restarted" in posts[0]["content"]
+        assert "hook level" in posts[0]["content"]
 
     async def test_load_from_db_pane_missing_marks_crashed(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
@@ -3408,3 +3411,156 @@ class TestTaskSettingsIntegration:
 
         # Verify settings file was removed
         assert not settings_file.exists()
+
+    async def test_spawn_task_cleanup_on_zellij_failure(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
+    ) -> None:
+        """spawn_task cleans up settings file when zellij.spawn_task raises ZellijError."""
+        from bridge import tasks as tasks_module
+        from bridge.zellij import ZellijError
+
+        settings_dir = tmp_path / "settings"
+
+        original_write = tasks_module._write_task_settings
+        original_cleanup = tasks_module._cleanup_task_settings
+
+        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
+            return original_write(
+                task_id,
+                settings_dir=settings_dir,
+                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+            )
+
+        def patched_cleanup(task_id: str, *, settings_dir_param=None):
+            return original_cleanup(task_id, settings_dir=settings_dir)
+
+        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
+        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+
+        # Mock spawn_task to raise ZellijError
+        async def mock_spawn_task(
+            cwd: str,
+            env: dict[str, str],
+            pane_name: str,
+            extra_argv: list[str] | None = None,
+        ) -> str:
+            raise ZellijError("spawn failed")
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        # Try to spawn, expect ZellijError (re-raised after cleanup)
+        with pytest.raises(ZellijError):
+            await registry.spawn_task("/tmp")
+
+        # After the spawn failure, there should be no settings files left
+        # (since the file was cleaned up)
+        assert not list(settings_dir.glob("*.json")) or all(
+            not f.exists() for f in settings_dir.glob("*.json")
+        )
+
+    async def test_on_session_end_abnormal_exit_removes_from_indexes(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with abnormal exit removes task from _by_thread_id and _by_session_id."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Verify task is indexed
+        assert registry.get_by_thread_id(999) is not None
+        assert registry.get_by_session_id("sess-abc") is not None
+
+        # Trigger abnormal SessionEnd
+        await registry._on_session_end({
+            "session_id": "sess-abc",
+            "exit_reason": "Error: process crashed",
+        })
+
+        # Verify task was removed from indexes
+        assert registry.get_by_thread_id(999) is None
+        assert registry.get_by_session_id("sess-abc") is None
+
+    async def test_on_session_end_normal_exit_removes_from_indexes(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with normal exit removes task from _by_thread_id and _by_session_id."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-456",
+            888,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-def",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Verify task is indexed
+        assert registry.get_by_thread_id(888) is not None
+        assert registry.get_by_session_id("sess-def") is not None
+
+        # Trigger normal SessionEnd (graceful exit)
+        await registry._on_session_end({
+            "session_id": "sess-def",
+            "exit_reason": "exit",
+        })
+
+        # Verify task was removed from indexes
+        assert registry.get_by_thread_id(888) is None
+        assert registry.get_by_session_id("sess-def") is None
+
+    async def test_tui_handler_task_auto_cleanup_on_completion(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_track_tui_handler_task removes entry when handler task completes."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-789",
+            777,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-ghi",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        task = registry.get_by_task_id("task-789")
+        assert task is not None
+
+        # Create a simple coroutine that completes immediately
+        async def quick_handler():
+            return "done"
+
+        # Create and track a handler task
+        handler_task = asyncio.create_task(quick_handler())
+        registry._track_tui_handler_task(task.task_id, handler_task)
+
+        # Verify task is tracked
+        assert task.task_id in registry._tui_handler_tasks
+
+        # Wait for the handler task to complete
+        await handler_task
+
+        # Yield control to allow the done_callback to fire
+        await asyncio.sleep(0)
+
+        # Verify task was auto-removed from tracking
+        assert task.task_id not in registry._tui_handler_tasks

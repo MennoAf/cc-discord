@@ -276,6 +276,8 @@ class TaskRegistry:
             # Defensive: set live_pane_ids to all pane IDs we know about, so they're kept as-is
             live_pane_ids = {row.zellij_pane_id for row in rows if row.zellij_pane_id}
 
+        recovered_live_tasks: list[Task] = []
+
         for row in rows:
             task = Task.from_row(row)
             # If task has no pane_id, it's mid-spawn; keep it loaded as-is
@@ -287,6 +289,7 @@ class TaskRegistry:
             # Task has a pane_id; check if it's still alive
             if task.zellij_pane_id in live_pane_ids:
                 await self._index(task)
+                recovered_live_tasks.append(task)
                 logger.info("recovered task %s on pane %s", task.task_id[:8], task.zellij_pane_id)
                 continue
 
@@ -314,6 +317,17 @@ class TaskRegistry:
             except Exception:
                 logger.exception("failed to archive thread for task %s", task.task_id)
             _cleanup_task_settings(task.task_id)
+
+        # Post a generic notice to live recovered tasks (we don't have per-task pending-approval state,
+        # so we post unconditionally to live recovered tasks)
+        for task in recovered_live_tasks:
+            try:
+                await self._bot.post(
+                    "ℹ Bridge restarted; any pending approval was denied at the hook level",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post bridge-restart notice for task %s", task.task_id)
 
     def get_by_task_id(self, task_id: str) -> Task | None:
         """Get task by task_id."""
@@ -524,6 +538,8 @@ class TaskRegistry:
                 current_claude_session_id=None,
                 current_transcript_path=None,
             )
+            # Clean up the task-scoped settings file
+            _cleanup_task_settings(task_id)
             # Phase 3 slash-command handler will see this crashed status.
             # TODO: Phase 3 should clean up the Discord thread on failure.
             raise
@@ -765,6 +781,11 @@ class TaskRegistry:
                 except Exception:
                     logger.exception("failed to post final assistant turn for task %s", task.task_id)
 
+    def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
+        """Track a TUI handler task and remove it from tracking when it completes."""
+        handler_task.add_done_callback(lambda t, k=task_id: self._tui_handler_tasks.pop(k, None))
+        self._tui_handler_tasks[task_id] = handler_task
+
     async def _on_notification(self, body: dict) -> None:
         """Handle Notification event. Stop typing indicator and spawn TUI handlers asynchronously.
 
@@ -793,7 +814,7 @@ class TaskRegistry:
                 self._handle_free_text_stall(task),
                 name=f"tui-free_text-{task.task_id[:8]}",
             )
-            self._tui_handler_tasks[task.task_id] = handler_task
+            self._track_tui_handler_task(task.task_id, handler_task)
             return
 
         pending = transcript.find_latest_unresolved_tool_use(Path(transcript_path))
@@ -803,20 +824,20 @@ class TaskRegistry:
                 self._handle_ask_user_question(task, pending),
                 name=f"tui-ask_question-{task.task_id[:8]}",
             )
-            self._tui_handler_tasks[task.task_id] = handler_task
+            self._track_tui_handler_task(task.task_id, handler_task)
         elif pending and pending["name"] == "ExitPlanMode":
             handler_task = asyncio.create_task(
                 self._handle_exit_plan_mode(task, pending),
                 name=f"tui-exit_plan-{task.task_id[:8]}",
             )
-            self._tui_handler_tasks[task.task_id] = handler_task
+            self._track_tui_handler_task(task.task_id, handler_task)
         else:
             # Generic free-text stall
             handler_task = asyncio.create_task(
                 self._handle_free_text_stall(task),
                 name=f"tui-free_text-{task.task_id[:8]}",
             )
-            self._tui_handler_tasks[task.task_id] = handler_task
+            self._track_tui_handler_task(task.task_id, handler_task)
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
@@ -856,6 +877,10 @@ class TaskRegistry:
                 logger.exception("failed to post crash notice for task %s", task.task_id)
             await self._archive_thread(task.thread_id)
             _cleanup_task_settings(task.task_id)
+            # Remove from live indexes; crashed tasks should not be returned by get_by_thread_id/get_by_session_id
+            self._by_thread_id.pop(task.thread_id, None)
+            if task.current_claude_session_id is not None:
+                self._by_session_id.pop(task.current_claude_session_id, None)
         elif task.status == "running":
             # Graceful exit; mark stopped. Note: stop_task also calls _mark_stopped which
             # archives the thread, so we may double-archive here. That's OK — archive_thread
@@ -865,6 +890,10 @@ class TaskRegistry:
             await self._persist(task)
             await self._archive_thread(task.thread_id)
             _cleanup_task_settings(task.task_id)
+            # Remove from live indexes; stopped tasks should not be returned by get_by_thread_id/get_by_session_id
+            self._by_thread_id.pop(task.thread_id, None)
+            if task.current_claude_session_id is not None:
+                self._by_session_id.pop(task.current_claude_session_id, None)
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event (no-op in Phase 1)."""
