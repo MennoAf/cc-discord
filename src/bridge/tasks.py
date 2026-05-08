@@ -529,8 +529,14 @@ class TaskRegistry:
     async def _on_session_start(self, body: dict) -> None:
         """Handle SessionStart event.
 
-        Updates task status from 'spawning' to 'running', binds session_id +
-        transcript_path, and posts a bind notice to the Discord thread.
+        Branches on matcher value:
+        - 'startup': first bind. Look up by CC_DISCORD_TASK_ID, populate session/transcript,
+          flip status to running, post '🟢 Task started' notice.
+        - 'clear':   /clear inside TUI. Rebind same task to new session id, post '🧹' notice.
+        - 'compact': /compact inside TUI. Rebind same task to new session id, post '🧰' notice.
+        - 'resume':  claude --resume by /restart. Same as startup but no notice (user already
+                     saw the /restart command's reply).
+        - default:   unknown matcher → fall through to startup behavior (safest).
 
         Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
         Also drops if session_id or transcript_path is missing.
@@ -539,8 +545,9 @@ class TaskRegistry:
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
         task_id = env_passthrough.get("CC_DISCORD_TASK_ID")
+        matcher = body.get("matcher") or "startup"
 
-        logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}")
+        logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}, matcher={matcher}")
 
         # AC2.4: drop SessionStart without task_id, session_id, or transcript_path
         if not task_id or not session_id or not transcript_path:
@@ -557,26 +564,44 @@ class TaskRegistry:
             logger.warning(f"SessionStart: task_id {task_id} not found in registry")
             return
 
-        # Update task fields
-        prev_session_id = task.current_claude_session_id
+        # Detach from old session id index; re-index under new
+        old_session_id = task.current_claude_session_id
         task.current_claude_session_id = session_id
         task.current_transcript_path = transcript_path
         task.status = "running"
         task.last_activity = int(time.time())
-
-        # Re-index (re-keys _by_session_id)
-        await self._index(task, prev_session_id=prev_session_id)
+        if old_session_id and old_session_id in self._by_session_id:
+            del self._by_session_id[old_session_id]
+        if session_id:
+            self._by_session_id[session_id] = task
 
         # Persist
         await self._persist(task)
 
-        # Post bind notice
-        short_session_id = session_id[:8] if session_id else "?"
-        bind_notice = f"🟢 Task started — claude session `{short_session_id}`"
-        await self._bot.post(
-            bind_notice,
-            thread_id=task.thread_id,
-        )
+        # Post appropriate notice based on matcher
+        notice = None
+        if matcher == "startup":
+            short_session_id = session_id[:8] if session_id else "?"
+            notice = f"🟢 Task started — claude session `{short_session_id}`"
+        elif matcher == "clear":
+            short_session_id = session_id[:8] if session_id else "?"
+            notice = f"🧹 Context cleared (new session: `{short_session_id}`)"
+        elif matcher == "compact":
+            notice = "🧰 Context compacted"
+        elif matcher == "resume":
+            # Don't post — the user just ran /restart; spamming is noisy.
+            notice = None
+        else:
+            # Unknown matcher: log and post a small bind notice
+            logger.info("SessionStart with unrecognized matcher %r", matcher)
+            short_session_id = session_id[:8] if session_id else "?"
+            notice = f"🟢 Bound to session `{short_session_id}` (matcher={matcher})"
+
+        if notice:
+            try:
+                await self._bot.post(notice, thread_id=task.thread_id)
+            except Exception:
+                logger.exception("failed to post session start notice")
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
         """Handle UserPromptSubmit event. Start typing indicator and cancel pending TUI prompts."""

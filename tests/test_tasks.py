@@ -618,6 +618,181 @@ class TestTaskRegistry:
         assert len(thread_calls) == 1
         # The exception was raised, which is what we're testing
 
+    async def test_on_session_start_matcher_startup(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_start with matcher='startup' posts 🟢 notice."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-abc123",
+            "transcript_path": "/path/to/transcript",
+            "matcher": "startup",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry._on_session_start(body)
+
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "🟢 Task started" in posts[0]["content"]
+
+    async def test_on_session_start_matcher_clear(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_start with matcher='clear' posts 🧹 notice and rebinds."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-old",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Verify old session id is indexed
+        assert registry.get_by_session_id("sess-old") is not None
+
+        body = {
+            "session_id": "sess-new123",
+            "transcript_path": "/path/to/transcript2",
+            "matcher": "clear",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry._on_session_start(body)
+
+        # Verify rebind
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id == "sess-new123"
+        assert task.current_transcript_path == "/path/to/transcript2"
+        assert task.status == "running"  # Status unchanged
+
+        # Verify session_id index updated
+        assert registry.get_by_session_id("sess-old") is None
+        assert registry.get_by_session_id("sess-new123") is not None
+
+        # Verify notice
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "🧹 Context cleared" in posts[0]["content"]
+        assert "sess-new" in posts[0]["content"]
+
+    async def test_on_session_start_matcher_compact(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_start with matcher='compact' posts 🧰 notice and rebinds."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-old",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-new456",
+            "transcript_path": "/path/to/transcript3",
+            "matcher": "compact",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry._on_session_start(body)
+
+        # Verify rebind
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id == "sess-new456"
+
+        # Verify notice
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "🧰 Context compacted" in posts[0]["content"]
+
+    async def test_on_session_start_matcher_resume(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_start with matcher='resume' rebinds without posting notice."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-old",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-resumed789",
+            "transcript_path": "/path/to/transcript4",
+            "matcher": "resume",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry._on_session_start(body)
+
+        # Verify rebind
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id == "sess-resumed789"
+
+        # Verify NO notice
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_on_session_start_matcher_unknown(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_start with unknown matcher posts fallback notice."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-unknown",
+            "transcript_path": "/path/to/transcript",
+            "matcher": "weird_matcher",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry._on_session_start(body)
+
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "Bound to session" in posts[0]["content"]
+
 
 @dataclass
 class FakeChannel:
