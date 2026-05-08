@@ -13,10 +13,11 @@ from bridge.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
-    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY, TASK_REGISTRY_KEY
+    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY, TASK_REGISTRY_KEY, ZELLIJ_KEY
 )
 from bridge.threads import ThreadRegistry
 from bridge.tasks import TaskRegistry
+from bridge.zellij import ZellijManager
 
 
 @dataclass
@@ -107,12 +108,20 @@ async def fake_bot():
 
 
 @pytest.fixture
-async def client(fake_bot, in_memory_db):
+async def client(fake_bot, in_memory_db, monkeypatch):
     """Create a test client for the aiohttp app with ThreadRegistry and TaskRegistry wired in."""
     started_at = time.monotonic()
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
-    task_registry = TaskRegistry(in_memory_db, fake_bot)
+    # Create a mocked ZellijManager for testing
+    zellij = ZellijManager()
+
+    async def mock_run(*argv, env=None, timeout=10.0):
+        """Mock _run to always return success."""
+        return (0, "", "")
+
+    monkeypatch.setattr(zellij, "_run", mock_run)
+    task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
     await task_registry.load_from_db()
     # Wire in listener and ask_locks for /v1/ask testing
     from bridge.server import AskLockMap
@@ -120,6 +129,7 @@ async def client(fake_bot, in_memory_db):
     app[LISTENER_KEY] = Listener()
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 

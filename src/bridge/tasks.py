@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import aiosqlite
 
 from bridge.state import TaskRow, list_active_tasks, upsert_task
+from bridge.zellij import ZellijManager
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +56,11 @@ class TaskRegistry:
         "PreCompact": "_on_pre_compact",
     }
 
-    def __init__(self, conn: aiosqlite.Connection, bot) -> None:
-        """Initialize with database connection and bot."""
+    def __init__(self, conn: aiosqlite.Connection, bot, zellij: ZellijManager) -> None:
+        """Initialize with database connection, bot, and zellij manager."""
         self._conn = conn
         self._bot = bot
+        self._zellij = zellij
         self._by_task_id: dict[str, Task] = {}
         self._by_thread_id: dict[int, Task] = {}
         self._by_session_id: dict[str, Task] = {}

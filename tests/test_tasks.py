@@ -6,6 +6,7 @@ import pytest
 
 from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry
+from bridge.zellij import ZellijManager
 
 
 @dataclass
@@ -26,6 +27,19 @@ class FakeBot:
 @pytest.fixture
 async def fake_bot():
     return FakeBot()
+
+
+@pytest.fixture
+async def fake_zellij(monkeypatch):
+    """Create a ZellijManager with mocked _run method."""
+    mgr = ZellijManager()
+
+    async def mock_run(*argv, env=None, timeout=10.0):
+        """Mock _run to always return success."""
+        return (0, "", "")
+
+    monkeypatch.setattr(mgr, "_run", mock_run)
+    return mgr
 
 
 
@@ -63,7 +77,7 @@ class TestTask:
 class TestTaskRegistry:
     """Tests for TaskRegistry."""
 
-    async def test_load_from_db(self, fake_bot, in_memory_db) -> None:
+    async def test_load_from_db(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """load_from_db populates all three maps."""
         now = 1000
         # Insert some tasks
@@ -90,7 +104,7 @@ class TestTaskRegistry:
             in_memory_db, "task-3", 1003, "/c", "stopped", now=now
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         # Should have loaded 2 tasks
@@ -107,14 +121,14 @@ class TestTaskRegistry:
         assert registry.get_by_session_id("sess-1") is not None
         assert registry.get_by_session_id("sess-2") is not None
 
-    async def test_get_by_task_id(self, fake_bot, in_memory_db) -> None:
+    async def test_get_by_task_id(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """get_by_task_id returns task or None."""
         now = 1000
         await upsert_task(
             in_memory_db, "task-123", 999, "/tmp", "running", now=now
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         task = registry.get_by_task_id("task-123")
@@ -123,14 +137,14 @@ class TestTaskRegistry:
 
         assert registry.get_by_task_id("unknown") is None
 
-    async def test_get_by_thread_id(self, fake_bot, in_memory_db) -> None:
+    async def test_get_by_thread_id(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """get_by_thread_id returns task or None."""
         now = 1000
         await upsert_task(
             in_memory_db, "task-123", 999, "/tmp", "running", now=now
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         task = registry.get_by_thread_id(999)
@@ -139,7 +153,7 @@ class TestTaskRegistry:
 
         assert registry.get_by_thread_id(888) is None
 
-    async def test_get_by_session_id(self, fake_bot, in_memory_db) -> None:
+    async def test_get_by_session_id(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """get_by_session_id returns task or None."""
         now = 1000
         await upsert_task(
@@ -152,7 +166,7 @@ class TestTaskRegistry:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         task = registry.get_by_session_id("sess-abc")
@@ -162,7 +176,7 @@ class TestTaskRegistry:
         assert registry.get_by_session_id("unknown") is None
 
     async def test_handle_event_session_start_with_task(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event('SessionStart') with matching task_id updates and posts."""
         now = 1000
@@ -175,7 +189,7 @@ class TestTaskRegistry:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         # Handle SessionStart with matching task_id
@@ -201,7 +215,7 @@ class TestTaskRegistry:
         assert "🟢 SessionStart" in posts[0]["content"]
 
     async def test_handle_event_session_start_rotates_session_id(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event('SessionStart') rotates session_id and invalidates old mapping."""
         now = 1000
@@ -216,7 +230,7 @@ class TestTaskRegistry:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         # Verify initial state
@@ -244,7 +258,7 @@ class TestTaskRegistry:
         assert registry.get_by_session_id("sess-B") is not None
 
     async def test_handle_event_session_start_missing_session_id(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event('SessionStart') without session_id is silent no-op (guards against None)."""
         now = 1000
@@ -257,7 +271,7 @@ class TestTaskRegistry:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         # SessionStart without session_id should be skipped
@@ -279,10 +293,10 @@ class TestTaskRegistry:
         assert len(posts) == 0
 
     async def test_handle_event_session_start_without_task(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event('SessionStart') without task_id is silent no-op."""
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         body = {
@@ -298,7 +312,7 @@ class TestTaskRegistry:
         assert len(posts) == 0
 
     async def test_handle_event_unknown_event(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event with unknown event name returns without raising."""
         now = 1000
@@ -306,7 +320,7 @@ class TestTaskRegistry:
             in_memory_db, "task-123", 999, "/tmp", "running", now=now
         )
 
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
         # Should not raise
@@ -318,10 +332,10 @@ class TestTaskRegistry:
         assert len(posts) == 0
 
     async def test_handlers_dict_has_all_event_names(
-        self, fake_bot, in_memory_db
+        self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """_HANDLERS dict contains all expected event names."""
-        registry = TaskRegistry(in_memory_db, fake_bot)
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
 
         expected_events = {
             "SessionStart",

@@ -14,6 +14,7 @@ from bridge.listener import Listener, _PendingAsk
 from bridge.secrets import Secrets
 from bridge.tasks import TaskRegistry
 from bridge.threads import ThreadRegistry
+from bridge.zellij import ZellijManager
 from bridge import state
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ THREADS_KEY: web.AppKey[ThreadRegistry] = web.AppKey("threads", ThreadRegistry)
 LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
 ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
 TASK_REGISTRY_KEY: web.AppKey[TaskRegistry] = web.AppKey("task_registry", TaskRegistry)
+ZELLIJ_KEY: web.AppKey[ZellijManager] = web.AppKey("zellij", ZellijManager)
 
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
 
@@ -360,13 +362,16 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=listener.deliver)
     conn = await state.open_db()
     registry = ThreadRegistry(bot, conn)
-    task_registry = TaskRegistry(conn, bot)
+    zellij = ZellijManager()
+    await zellij.ensure_session_alive()
+    task_registry = TaskRegistry(conn, bot, zellij)
     await task_registry.load_from_db()
     app = await build_app(bot)
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = listener
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
