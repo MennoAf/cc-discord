@@ -1,5 +1,6 @@
 """Tests for Task and TaskRegistry."""
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 
@@ -8,39 +9,7 @@ import pytest
 from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry, TaskSpawnError
 from bridge.zellij import ZellijManager
-
-
-@dataclass
-class FakeBot:
-    """Minimal fake Bot for testing TaskRegistry."""
-
-    _post_calls: list[dict] = field(default_factory=list)
-    _thread_calls: list[dict] = field(default_factory=list)
-    _archive_calls: list[dict] = field(default_factory=list)
-
-    async def post(self, content: str, *, thread_id: int | None = None) -> list[int]:
-        """Fake post: record the call, return a fake message ID."""
-        self._post_calls.append({"content": content, "thread_id": thread_id})
-        return [1001]
-
-    async def create_thread(self, name: str) -> int:
-        """Fake create_thread: record the call, return a fake thread ID."""
-        thread_id = 2000 + len(self._thread_calls)
-        self._thread_calls.append({"name": name})
-        return thread_id
-
-    async def archive_thread(self, thread_id: int) -> None:
-        """Fake archive_thread: record the call."""
-        self._archive_calls.append({"thread_id": thread_id})
-
-    def get_post_calls(self) -> list[dict]:
-        return self._post_calls
-
-    def get_thread_calls(self) -> list[dict]:
-        return self._thread_calls
-
-    def get_archive_calls(self) -> list[dict]:
-        return self._archive_calls
+from tests.fakes import FakeBot, FakeZellij
 
 
 @pytest.fixture
@@ -1058,6 +1027,76 @@ class TestTaskRegistryPhase3:
         with pytest.raises(TaskNotFound):
             await registry.kill_task("unknown")
 
+    async def test_stop_task_removes_from_thread_and_session_indexes(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """After stop_task, get_by_thread_id and get_by_session_id return None."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Verify task is in indexes before stop
+        assert registry.get_by_thread_id(999) is not None
+        assert registry.get_by_session_id("sess-abc") is not None
+
+        # Mock SessionEnd to complete the stop
+        loop = asyncio.get_running_loop()
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            # Trigger SessionEnd immediately
+            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "sess-abc"})))
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        await registry.stop_task("task-123")
+
+        # After stop, task should not be in indexes
+        assert registry.get_by_thread_id(999) is None
+        assert registry.get_by_session_id("sess-abc") is None
+        # But still findable by task_id
+        assert registry.get_by_task_id("task-123") is not None
+
+    async def test_kill_task_removes_from_thread_and_session_indexes(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """After kill_task, get_by_thread_id and get_by_session_id return None."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Verify task is in indexes before kill
+        assert registry.get_by_thread_id(999) is not None
+        assert registry.get_by_session_id("sess-abc") is not None
+
+        await registry.kill_task("task-123")
+
+        # After kill, task should not be in indexes
+        assert registry.get_by_thread_id(999) is None
+        assert registry.get_by_session_id("sess-abc") is None
+        # But still findable by task_id
+        assert registry.get_by_task_id("task-123") is not None
+
     async def test_restart_task_with_live_pane_writes_resume_command(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
     ) -> None:
@@ -1216,7 +1255,7 @@ class TestTaskRegistryPhase3:
     ) -> None:
         """write_initial_prompt writes text to pane and bumps last_activity."""
         # Avoid fixture reuse issues with inline instantiation
-        from tests.test_commands import FakeZellij, FakeBot
+        # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
         fake_bot = FakeBot()
@@ -1257,7 +1296,7 @@ class TestTaskRegistryPhase3:
         self, in_memory_db
     ) -> None:
         """write_initial_prompt logs warning if task is missing."""
-        from tests.test_commands import FakeZellij, FakeBot
+        # FakeBot and FakeZellij already imported at top
 
         registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
 
@@ -1270,7 +1309,7 @@ class TestTaskRegistryPhase3:
         self, in_memory_db
     ) -> None:
         """stop_task returns True immediately if task is already stopped."""
-        from tests.test_commands import FakeZellij, FakeBot
+        # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
         now = 1000
@@ -1306,7 +1345,7 @@ class TestTaskRegistryPhase3:
         self, in_memory_db
     ) -> None:
         """kill_task returns None immediately if task is already crashed."""
-        from tests.test_commands import FakeZellij, FakeBot
+        # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
         now = 1000
@@ -1342,7 +1381,7 @@ class TestTaskRegistryPhase3:
     ) -> None:
         """restart_task with live pane updates last_activity."""
         # Import fixtures inline to avoid import issues
-        from tests.test_commands import FakeZellij, FakeBot
+        # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
         fake_bot = FakeBot()
