@@ -1,7 +1,6 @@
 """Tests for the ask_discord.py skill script."""
 
 import asyncio
-import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
