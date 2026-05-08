@@ -269,13 +269,17 @@ class ApprovalRouter:
             self._tui_by_thread_id.setdefault(thread_id, []).append(pending)
 
             # Check if this thread was recently cancelled (race condition)
-            # If cancel_thread_tui ran before we registered, resolve immediately
+            # If cancel_thread_tui ran before we registered, resolve immediately.
             recent_cancel_time = self._recently_cancelled_threads.get(thread_id)
-            if recent_cancel_time is not None and recent_cancel_time > pending.created_at - 1.0:
-                # This request arrived after cancellation; resolve immediately
-                pending.future.set_result(("", "cancelled"))
-                await self._cleanup_tui(request_id)
-                return ("", "cancelled")
+            cancelled_early = (
+                recent_cancel_time is not None
+                and recent_cancel_time > pending.created_at - 1.0
+            )
+
+        if cancelled_early:
+            pending.future.set_result(("", "cancelled"))
+            await self._cleanup_tui(request_id)
+            return ("", "cancelled")
 
         try:
             message_ids = await self._bot.post(prompt_body, thread_id=thread_id)

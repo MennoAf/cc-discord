@@ -614,12 +614,8 @@ async def test_request_tui_answer_cancelled(tmp_path):
 
     async def cancel_future():
         await asyncio.sleep(0.05)
-        # Find and cancel the pending future
-        pending_list = list(router._tui_pending.values())
-        if pending_list:
-            pending = pending_list[0]
-            if not pending.future.done():
-                pending.future.cancel()
+        # Use the public cancel_thread_tui API (sentinel approach).
+        await router.cancel_thread_tui(2006)
 
     task = asyncio.create_task(cancel_future())
 
