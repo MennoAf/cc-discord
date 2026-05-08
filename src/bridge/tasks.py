@@ -246,18 +246,26 @@ class TaskRegistry:
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
 
-    async def load_from_db(self) -> None:
-        """Restore in-memory task map from SQLite, then reconcile with live zellij panes.
+    async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
+        """Restore in-memory task map from SQLite.
 
-        For each row:
-        - If status is 'running' or 'spawning' AND its zellij_pane_id is in `list_panes()` AND
-          that pane has exited=False: keep as-is, no Discord message.
-        - If status is 'running'/'spawning' but pane is missing or exited=True: flip to
-          'crashed', post 💥, archive thread.
-        - If status is already 'stopped' or 'crashed': skip (don't re-add to in-memory map).
+        With ``reconcile_with_zellij=False`` (the default), every active row is
+        loaded into the in-memory map verbatim — used by tests and any caller
+        that already knows the panes are alive.
+
+        With ``reconcile_with_zellij=True`` (production daemon startup), each row
+        is also reconciled against ``list_panes()``:
+        - row's pane_id present and not exited → keep as-is
+        - row's pane_id missing or exited=True → flip to 'crashed', post 💥, archive
+        Tasks already in 'stopped'/'crashed' are excluded by ``list_active_tasks``.
         """
         rows = await list_active_tasks(self._conn)
         if not rows:
+            return
+
+        if not reconcile_with_zellij:
+            for row in rows:
+                await self._index(Task.from_row(row))
             return
 
         try:

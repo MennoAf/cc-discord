@@ -456,7 +456,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     conn = await state.open_db()
     approval_router = ApprovalRouter(None, conn)  # type: ignore
     task_registry = TaskRegistry(conn, None, zellij, approval_router)  # type: ignore
-    await task_registry.load_from_db()
+    await task_registry.load_from_db(reconcile_with_zellij=True)
 
     # Create dispatcher with partially initialized components. The dispatcher will be
     # called after bot is created (it updates task_registry._bot and approval_router._bot).

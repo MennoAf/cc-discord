@@ -1007,7 +1007,7 @@ class TestTaskRegistry:
         monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-        await registry.load_from_db()
+        await registry.load_from_db(reconcile_with_zellij=True)
 
         # Task should be loaded and in memory
         task = registry.get_by_task_id("task-123")
@@ -1040,7 +1040,7 @@ class TestTaskRegistry:
         monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-        await registry.load_from_db()
+        await registry.load_from_db(reconcile_with_zellij=True)
 
         # Task should be loaded but marked crashed
         task = registry.get_by_task_id("task-123")
@@ -1078,7 +1078,7 @@ class TestTaskRegistry:
         monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-        await registry.load_from_db()
+        await registry.load_from_db(reconcile_with_zellij=True)
 
         task = registry.get_by_task_id("task-123")
         assert task is not None
