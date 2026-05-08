@@ -12,17 +12,18 @@ from aiohttp import test_utils, web
 
 @pytest.fixture
 async def fake_bridge():
-    """Create a fake bridge server for testing the pretooluse hook."""
+    """Create a fake bridge server for testing the pretooluse hook.
+
+    The fake bridge can be configured to return different responses. Set the
+    next_response on the fixture dict before calling the hook.
+    """
     seen = []
+    next_response = {"decision": "deny", "reason": "test deny"}  # default
 
     async def handle_pretooluse(req):
         seen.append(await req.json())
-        # Return a configurable response from the latest request's decision_override
-        latest = seen[-1] if seen else {}
-        override = latest.pop("__decision_override", None)
-        if override:
-            return web.json_response(override)
-        return web.json_response({"decision": "deny", "reason": "test deny"})
+        # Return the configured response
+        return web.json_response(next_response)
 
     app = web.Application()
     app.router.add_post("/v1/hook/pretooluse", handle_pretooluse)
@@ -32,8 +33,22 @@ async def fake_bridge():
 
     base_url = f"http://{server.host}:{server.port}"
 
+    fixture_state = {
+        "url": base_url,
+        "seen": seen,
+        "_next_response": next_response,
+    }
+
+    def set_next_response(decision: str, reason: str):
+        """Configure the next response from the fake bridge."""
+        fixture_state["_next_response"] = {"decision": decision, "reason": reason}
+        nonlocal next_response
+        next_response = {"decision": decision, "reason": reason}
+
+    fixture_state["set_next_response"] = set_next_response
+
     try:
-        yield {"url": base_url, "seen": seen}
+        yield fixture_state
     finally:
         await server.close()
 
@@ -86,14 +101,15 @@ def _parse_hook_output(stdout: bytes) -> dict:
 
 @pytest.mark.asyncio
 async def test_pretooluse_allow_decision(fake_bridge):
-    """Hook forwards request to bridge, returns allow decision."""
+    """Hook forwards request to bridge, correctly relays allow decision."""
     payload = {
         "tool_name": "Bash",
         "tool_input": {"cmd": "ls /tmp"},
     }
 
     # Configure bridge to return allow
-    # For this we just rely on the default behavior
+    fake_bridge["set_next_response"]("allow", "user approved the tool")
+
     result = await _run_hook(
         payload,
         bridge_url=fake_bridge["url"],
@@ -103,7 +119,8 @@ async def test_pretooluse_allow_decision(fake_bridge):
     assert result.returncode == 0
     output = _parse_hook_output(result.stdout)
     assert output["hookEventName"] == "PreToolUse"
-    assert output["permissionDecision"] == "deny"  # default
+    assert output["permissionDecision"] == "allow"
+    assert "approved" in output["permissionDecisionReason"]
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,12 @@ class ApprovalRouter:
             async with self._lock:
                 self._by_message_id[primary_msg_id] = pending
             # Add reactions to the FIRST chunk only (the one users react on).
-            await self._bot.add_reactions(primary_msg_id, thread_id, ["✅", "❌"])
+            try:
+                await self._bot.add_reactions(primary_msg_id, thread_id, ["✅", "❌"])
+            except Exception:
+                logger.exception("failed to add approval reactions")
+                await self._cleanup(request_id)
+                return ("deny", "failed to add approval reactions (check bot permissions)")
         except Exception:
             logger.exception("failed to post approval prompt")
             await self._cleanup(request_id)
@@ -132,9 +137,13 @@ class ApprovalRouter:
 
         return (decision, reason)
 
-    async def resolve_by_reaction(self, message_id: int, emoji: str, user_is_bot: bool) -> bool:
-        """Called by the bot on reaction-add. Returns True if a Future was resolved."""
-        if user_is_bot:
+    async def resolve_by_reaction(self, message_id: int, emoji: str, user_is_self_bot: bool) -> bool:
+        """Called by the bot on reaction-add. Returns True if a Future was resolved.
+
+        Filters out reactions added by the bridge's own bot user (user_is_self_bot=True).
+        Reactions from other bots in the channel ARE processed.
+        """
+        if user_is_self_bot:
             return False
         if emoji not in _REACTION_DECISIONS:
             return False
@@ -150,13 +159,23 @@ class ApprovalRouter:
 
     async def resolve_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
         """Called by the bot on a thread message. Resolves any pending approval for this thread
-        as deny-with-reason.
+        as deny-with-reason only if the message contains non-whitespace text.
+
+        Empty or whitespace-only messages (e.g., image-only posts) do NOT resolve the approval;
+        they fall through to task routing or the listener.
 
         At most one pending approval per thread at a time is the common case — the design
         implies sequential approvals. When multiple exist, the most recently created one is
         selected.
+
+        Free-text reply order: if the user reacts AND types text, the first to land wins
+        (the loser's resolution attempt is dropped because the future is already done).
         """
         if author_is_bot:
+            return False
+        # Only resolve if the message contains non-whitespace text
+        stripped = text.strip()
+        if not stripped:
             return False
         async with self._lock:
             # Find all pending approvals for this thread
@@ -168,7 +187,7 @@ class ApprovalRouter:
             return False
         # Most-recent-first: select by created_at
         pending = max(candidates, key=lambda p: p.created_at)
-        pending.future.set_result(("deny", text.strip() or "denied with empty reply"))
+        pending.future.set_result(("deny", stripped))
         return True
 
     def _format_prompt(self, tool_name: str, tool_input: dict[str, Any]) -> str:

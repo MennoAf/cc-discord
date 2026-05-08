@@ -392,6 +392,41 @@ async def _handle_pretooluse(request: web.Request) -> web.Response:
         )
 
 
+def make_message_dispatcher(
+    approval_router: ApprovalRouter,
+    task_registry: TaskRegistry,
+    listener: Listener,
+) -> callable:
+    """Create a message dispatcher closure.
+
+    The dispatcher enforces a critical order: resolve_by_text (approval replies)
+    takes precedence over maybe_route_message (task thread routing), which takes
+    precedence over listener.deliver (general listener).
+
+    This invariant must not regress: if a user types a free-text deny reply to an
+    approval prompt, it is NOT routed to the task pane.
+
+    Args:
+        approval_router: ApprovalRouter instance for resolving approvals
+        task_registry: TaskRegistry instance for routing task-thread messages
+        listener: Listener instance for delivering non-routed messages
+
+    Returns:
+        async callable that dispatches messages in the correct order
+    """
+    async def _dispatch_message(msg):
+        # First, try to resolve any pending approval via text reply
+        if await approval_router.resolve_by_text(msg.channel.id, msg.content or "", msg.author.bot):
+            return
+        # Then, check task threads for tool output routing
+        if await task_registry.maybe_route_message(msg):
+            return
+        # Finally, fall back to the general listener
+        await listener.deliver(msg)
+
+    return _dispatch_message
+
+
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
@@ -415,36 +450,25 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     zellij = ZellijManager()
     await zellij.ensure_session_alive()
 
-    # Forward-declare task_registry and approval_router for the dispatcher closures
-    task_registry: TaskRegistry
-    approval_router: ApprovalRouter
+    conn = await state.open_db()
+    task_registry = TaskRegistry(conn, None, zellij)  # type: ignore
+    await task_registry.load_from_db()
+    approval_router = ApprovalRouter(None, conn)  # type: ignore
 
-    async def _dispatch_message(msg):
-        """Dispatch incoming messages.
-
-        Order matters: pending approval takes precedence over task-pane routing. When the user
-        types a deny-with-reason reply to an approval prompt, we resolve it here and don't also
-        write the same text to the zellij pane.
-        """
-        # First, try to resolve any pending approval via text reply
-        if await approval_router.resolve_by_text(msg.channel.id, msg.content or "", msg.author.bot):
-            return
-        # Then, check task threads for tool output routing
-        if await task_registry.maybe_route_message(msg):
-            return
-        # Finally, fall back to the general listener
-        await listener.deliver(msg)
+    # Create dispatcher with partially initialized components. The dispatcher will be
+    # called after bot is created (it updates task_registry._bot and approval_router._bot).
+    _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
 
     async def _on_reaction_dispatch(payload):
         """Dispatch raw reaction events to the approval router."""
-        user_is_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
-        await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_bot)
+        user_is_self_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
+        await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
-    conn = await state.open_db()
-    task_registry = TaskRegistry(conn, bot, zellij)
-    await task_registry.load_from_db()
-    approval_router = ApprovalRouter(bot, conn)
+
+    # Update references to bot now that it's created
+    task_registry._bot = bot
+    approval_router._bot = bot
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry

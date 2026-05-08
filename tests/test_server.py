@@ -10,6 +10,7 @@ import pytest
 from aiohttp import test_utils
 
 from bridge import state
+from bridge.approvals import ApprovalRouter
 from bridge.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
@@ -1309,6 +1310,101 @@ class TestHookEvent:
 @pytest.mark.asyncio
 class TestDispatcher:
     """Tests for message dispatcher in serve()."""
+
+    async def test_production_dispatcher_resolve_by_text_precedence(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Test the production dispatcher enforces resolve_by_text → maybe_route_message → listener order.
+
+        This regression test verifies the critical dispatch-order invariant: when a pending
+        approval exists for a thread and the user types a free-text reply, that reply is
+        resolved as deny-with-reason and NOT routed to zellij (maybe_route_message is skipped).
+        """
+        from bridge.server import make_message_dispatcher
+        from bridge.state import upsert_task
+
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        # Create a task in the database
+        task_id = "task-approval-test"
+        thread_id = 5001
+        pane_id = "pane_approval"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-abc",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Create approval router and register a pending approval
+        approval_router = ApprovalRouter(fake_bot, in_memory_db, timeout=0.1)
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Create a pending approval for this thread
+        import asyncio
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        import time
+        from bridge.approvals import _PendingApproval
+        pending = _PendingApproval(
+            request_id="req-1",
+            task_id=task_id,
+            tool_name="Bash",
+            tool_input={},
+            thread_id=thread_id,
+            created_at=int(time.time()),
+            future=fut,
+        )
+        async with approval_router._lock:
+            approval_router._by_request_id["req-1"] = pending
+
+        # Create the production dispatcher
+        _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
+
+        # Simulate a free-text reply to the approval in the thread
+        msg = FakeMsg(
+            author=FakeUser(id=111),
+            channel=FakeChannel(id=thread_id),
+            content="use a different approach instead"
+        )
+
+        await _dispatch_message(msg)
+
+        # Verify the approval was resolved by text
+        assert fut.done()
+        decision, reason = fut.result()
+        assert decision == "deny"
+        assert reason == "use a different approach instead"
+
+        # Verify the message was NOT routed to zellij
+        assert len(zellij_calls) == 0
+        # Verify the message was NOT delivered to listener
+        assert len(listener_calls) == 0
 
     async def test_dispatcher_routes_task_thread_message(
         self, fake_bot, in_memory_db, monkeypatch
