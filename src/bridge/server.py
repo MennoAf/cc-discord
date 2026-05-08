@@ -1,6 +1,7 @@
 """aiohttp web server for /v1/notify, /v1/health, and /v1/ask endpoints."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import signal
@@ -14,6 +15,7 @@ from bridge.approvals import ApprovalRouter
 from bridge.bot import Bot, BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.secrets import Secrets
+from bridge import tasks as tasks_module
 from bridge.tasks import TaskRegistry
 from bridge.threads import ThreadRegistry
 from bridge.zellij import ZellijManager
@@ -506,6 +508,24 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     synced = await tree.sync(guild=guild)
     logger.info("synced %d slash commands to guild %d", len(synced), guild_id)
 
+    # Sweep stale attachments at startup, then schedule hourly background
+    # sweep. TTL is `BRIDGE_ATTACHMENT_TTL_SECS` env var (default 7 days).
+    tasks_module.sweep_old_attachments()
+
+    async def _attachment_sweep_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(3600)
+                tasks_module.sweep_old_attachments()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("attachment sweep failed")
+
+    sweep_task = asyncio.create_task(
+        _attachment_sweep_loop(), name="attachment-sweep"
+    )
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -514,6 +534,9 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     try:
         await stop.wait()
     finally:
+        sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep_task
         await bot.close()
         await runner.cleanup()
         await state.close_db(conn)

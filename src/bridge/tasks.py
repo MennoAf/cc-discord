@@ -92,6 +92,69 @@ def _cleanup_task_settings(task_id: str, *, settings_dir: Path = TASK_SETTINGS_D
         logger.exception("failed to remove task settings file %s", p)
 
 
+def _cleanup_task_attachments(
+    task_id: str, *, attachments_dir: Path = ATTACHMENTS_DIR
+) -> None:
+    """Remove the per-task attachment directory. Idempotent — silent on missing dir."""
+    import shutil
+
+    d = attachments_dir / task_id
+    if not d.exists():
+        return
+    try:
+        shutil.rmtree(d)
+    except Exception:
+        logger.exception("failed to remove attachments dir %s", d)
+
+
+def _cleanup_task_artifacts(task_id: str) -> None:
+    """Remove all on-disk state for a finished task: settings file + attachments.
+
+    Used at every lifecycle terminal (stop / kill / crash / archive) so the two
+    artifacts can't drift apart. Both helpers are idempotent.
+    """
+    _cleanup_task_settings(task_id)
+    _cleanup_task_attachments(task_id)
+
+
+def sweep_old_attachments(
+    *,
+    attachments_dir: Path = ATTACHMENTS_DIR,
+    ttl_secs: int | None = None,
+) -> None:
+    """Walk the attachments root and remove any file older than `ttl_secs`.
+
+    Empty per-task dirs are removed too. Defaults to BRIDGE_ATTACHMENT_TTL_SECS
+    env var (fallback: 7 days). Best-effort — failures are logged and skipped
+    so a single bad file doesn't abort the sweep.
+    """
+    if ttl_secs is None:
+        try:
+            ttl_secs = int(os.environ.get("BRIDGE_ATTACHMENT_TTL_SECS") or 7 * 24 * 3600)
+        except ValueError:
+            ttl_secs = 7 * 24 * 3600
+    if not attachments_dir.exists():
+        return
+    cutoff = time.time() - ttl_secs
+    removed = 0
+    for task_dir in attachments_dir.iterdir():
+        if not task_dir.is_dir():
+            continue
+        for f in task_dir.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                logger.exception("failed to remove stale attachment %s", f)
+        try:
+            task_dir.rmdir()  # only succeeds when empty
+        except OSError:
+            pass
+    if removed:
+        logger.info("attachment sweep removed %d stale file(s)", removed)
+
+
 class TaskSpawnError(Exception):
     """Raised when a task cannot be spawned."""
 
@@ -312,7 +375,7 @@ class TaskRegistry:
                 ],
                 "archive": True,
             })
-            _cleanup_task_settings(task.task_id)
+            _cleanup_task_artifacts(task.task_id)
 
         for task in recovered_live_tasks:
             self._pending_startup_notices.append({
@@ -441,7 +504,7 @@ class TaskRegistry:
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
         # Clean up the task-scoped settings file
-        _cleanup_task_settings(task.task_id)
+        _cleanup_task_artifacts(task.task_id)
 
     async def _archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
@@ -559,7 +622,7 @@ class TaskRegistry:
                 current_transcript_path=None,
             )
             # Clean up the task-scoped settings file
-            _cleanup_task_settings(task_id)
+            _cleanup_task_artifacts(task_id)
             # Phase 3 slash-command handler will see this crashed status.
             # TODO: Phase 3 should clean up the Discord thread on failure.
             raise
@@ -1132,7 +1195,7 @@ class TaskRegistry:
             except Exception:
                 logger.exception("failed to post crash notice for task %s", task.task_id)
             await self._archive_thread(task.thread_id)
-            _cleanup_task_settings(task.task_id)
+            _cleanup_task_artifacts(task.task_id)
             # Remove from live indexes; crashed tasks should not be returned by get_by_thread_id/get_by_session_id
             self._by_thread_id.pop(task.thread_id, None)
             if task.current_claude_session_id is not None:
@@ -1145,7 +1208,7 @@ class TaskRegistry:
             task.last_activity = int(time.time())
             await self._persist(task)
             await self._archive_thread(task.thread_id)
-            _cleanup_task_settings(task.task_id)
+            _cleanup_task_artifacts(task.task_id)
             # Remove from live indexes; stopped tasks should not be returned by get_by_thread_id/get_by_session_id
             self._by_thread_id.pop(task.thread_id, None)
             if task.current_claude_session_id is not None:
@@ -1367,7 +1430,7 @@ class TaskRegistry:
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
         # Clean up the task-scoped settings file
-        _cleanup_task_settings(task_id)
+        _cleanup_task_artifacts(task_id)
 
     async def restart_task(self, task_id: str) -> Task:
         """Resume a task by spawning a new claude with --resume <session_id>.
