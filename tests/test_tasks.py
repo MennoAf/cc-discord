@@ -16,6 +16,7 @@ class FakeBot:
 
     _post_calls: list[dict] = field(default_factory=list)
     _thread_calls: list[dict] = field(default_factory=list)
+    _archive_calls: list[dict] = field(default_factory=list)
 
     async def post(self, content: str, *, thread_id: int | None = None) -> list[int]:
         """Fake post: record the call, return a fake message ID."""
@@ -28,11 +29,18 @@ class FakeBot:
         self._thread_calls.append({"name": name})
         return thread_id
 
+    async def archive_thread(self, thread_id: int) -> None:
+        """Fake archive_thread: record the call."""
+        self._archive_calls.append({"thread_id": thread_id})
+
     def get_post_calls(self) -> list[dict]:
         return self._post_calls
 
     def get_thread_calls(self) -> list[dict]:
         return self._thread_calls
+
+    def get_archive_calls(self) -> list[dict]:
+        return self._archive_calls
 
 
 @pytest.fixture
@@ -812,4 +820,394 @@ class TestMaybeRouteMessage:
         assert result is True
         assert len(write_calls) == 1
         assert "(image attached — image relay not yet supported)" in write_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+class TestTaskRegistryPhase3:
+    """Tests for Phase 3 task lifecycle methods: list_tasks, stop_task, kill_task, restart_task."""
+
+    async def test_list_tasks_returns_active_ordered_by_last_activity(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """list_tasks returns active tasks ordered by last_activity DESC; filters out stopped/crashed."""
+        now = 1000
+        # Insert active task
+        await upsert_task(
+            in_memory_db,
+            "task-1",
+            1001,
+            "/a",
+            "running",
+            current_claude_session_id="sess-1",
+            now=now,
+        )
+        # Insert another active task with more recent last_activity
+        await upsert_task(
+            in_memory_db,
+            "task-2",
+            1002,
+            "/b",
+            "running",
+            current_claude_session_id="sess-2",
+            now=now + 100,
+        )
+        # Insert stopped task (should be filtered out)
+        await upsert_task(
+            in_memory_db,
+            "task-3",
+            1003,
+            "/c",
+            "stopped",
+            now=now,
+        )
+        # Insert crashed task (should be filtered out)
+        await upsert_task(
+            in_memory_db,
+            "task-4",
+            1004,
+            "/d",
+            "crashed",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        tasks = await registry.list_tasks()
+
+        # Should return 2 active tasks, with task-2 first (higher last_activity)
+        assert len(tasks) == 2
+        assert tasks[0].task_id == "task-2"
+        assert tasks[1].task_id == "task-1"
+
+    async def test_stop_task_with_pane_alive_sends_exit_and_waits_for_session_end(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """stop_task sends /exit and waits for SessionEnd to resolve; returns True on success."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        # Spawn stop_task (will be waiting for SessionEnd)
+        import asyncio
+
+        stop_task_handle = asyncio.create_task(registry.stop_task("task-123", timeout=5.0))
+
+        # Give it a moment to send /exit
+        await asyncio.sleep(0.1)
+
+        # Verify /exit was sent
+        assert len(write_calls) == 1
+        assert write_calls[0]["text"] == "/exit\n"
+
+        # Now simulate SessionEnd event to resolve the future
+        await registry.handle_event("SessionEnd", {"session_id": "sess-abc"})
+
+        # Wait for stop_task to complete
+        stopped = await stop_task_handle
+
+        # Should return True (stopped cleanly)
+        assert stopped is True
+
+        # Task should be marked as stopped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"
+
+        # Thread should be archived (bot method called)
+        assert len(fake_bot.get_archive_calls()) == 1
+        assert fake_bot.get_archive_calls()[0]["thread_id"] == 999
+
+    async def test_stop_task_timeout_returns_false_and_marks_stopped(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """stop_task with timeout returns False if SessionEnd doesn't arrive; still marks stopped."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            pass
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        # stop_task with very short timeout
+        stopped = await registry.stop_task("task-123", timeout=0.1)
+
+        # Should return False (timed out)
+        assert stopped is False
+
+        # Task should still be marked as stopped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"
+
+    async def test_stop_task_with_no_pane_marks_stopped(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """stop_task when pane_id is None (mid-spawn) immediately marks stopped."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            zellij_pane_id=None,
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        stopped = await registry.stop_task("task-123")
+
+        # Should return True (fail-safe stop)
+        assert stopped is True
+
+        # Task should be marked as stopped
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"
+
+    async def test_stop_task_unknown_task_raises(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """stop_task with unknown task_id raises TaskNotFound."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        from bridge.tasks import TaskNotFound
+
+        with pytest.raises(TaskNotFound):
+            await registry.stop_task("unknown")
+
+    async def test_kill_task_closes_pane_and_marks_crashed(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """kill_task closes the pane and marks status='crashed'."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        close_calls = []
+
+        async def mock_close_pane(pane_id: str) -> None:
+            close_calls.append({"pane_id": pane_id})
+
+        monkeypatch.setattr(fake_zellij, "close_pane", mock_close_pane)
+
+        await registry.kill_task("task-123")
+
+        # Should have called close_pane
+        assert len(close_calls) == 1
+        assert close_calls[0]["pane_id"] == "terminal_1"
+
+        # Task should be marked as crashed
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "crashed"
+
+    async def test_kill_task_unknown_task_raises(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """kill_task with unknown task_id raises TaskNotFound."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        from bridge.tasks import TaskNotFound
+
+        with pytest.raises(TaskNotFound):
+            await registry.kill_task("unknown")
+
+    async def test_restart_task_with_live_pane_writes_resume_command(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """restart_task with live pane writes claude --resume command."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+        pane_list = [{"id": "terminal_1", "title": "", "pwd": "/tmp", "terminal_command": "claude", "exited": False}]
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        async def mock_list_panes() -> list:
+            return pane_list
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        task = await registry.restart_task("task-123")
+
+        # Should have written the resume command
+        assert len(write_calls) == 1
+        assert "claude --resume sess-abc" in write_calls[0]["text"]
+
+        # Task should still be running
+        assert task.status == "running"
+
+    async def test_restart_task_with_dead_pane_spawns_new_pane(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """restart_task with dead pane spawns a new pane with extra_argv."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        pane_list = []  # Empty — no panes alive
+
+        async def mock_list_panes() -> list:
+            return pane_list
+
+        spawn_calls = []
+
+        async def mock_spawn_task(
+            cwd: str, env: dict, pane_name: str, extra_argv: list | None = None
+        ) -> str:
+            spawn_calls.append(
+                {"cwd": cwd, "env": env, "pane_name": pane_name, "extra_argv": extra_argv}
+            )
+            return "terminal_2"
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        task = await registry.restart_task("task-123")
+
+        # Should have spawned new pane with extra_argv
+        assert len(spawn_calls) == 1
+        assert spawn_calls[0]["cwd"] == "/tmp"
+        assert spawn_calls[0]["extra_argv"] == ["--resume", "sess-abc"]
+
+        # Task pane should be updated
+        assert task.zellij_pane_id == "terminal_2"
+
+    async def test_restart_task_no_session_id_raises(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """restart_task with no claude session_id raises TaskRestartError."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id=None,
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        from bridge.tasks import TaskRestartError
+
+        with pytest.raises(TaskRestartError):
+            await registry.restart_task("task-123")
+
+    async def test_restart_task_unknown_task_raises(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """restart_task with unknown task_id raises TaskNotFound."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        from bridge.tasks import TaskNotFound
+
+        with pytest.raises(TaskNotFound):
+            await registry.restart_task("unknown")
+
+    async def test_on_session_end_resolves_stop_future(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """_on_session_end resolves a pending stop_future when task matches."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Manually set up a pending stop_future
+        import asyncio
+
+        fut = asyncio.get_running_loop().create_future()
+        registry._stop_futures["task-123"] = fut
+
+        # Trigger SessionEnd
+        await registry._on_session_end({"session_id": "sess-abc"})
+
+        # Future should be resolved
+        assert fut.done()
 

@@ -265,7 +265,8 @@ class ZellijManager:
             logger.info(f"close-pane {pane_id}: {stderr}")
 
     async def spawn_task(
-        self, cwd: str, env: dict[str, str], pane_name: str
+        self, cwd: str, env: dict[str, str], pane_name: str, *,
+        extra_argv: list[str] | None = None,
     ) -> str:
         """Spawn a new pane running `claude` and resolve its pane ID.
 
@@ -284,6 +285,7 @@ class ZellijManager:
             cwd: Working directory for the new pane
             env: Environment dict to pass to subprocess
             pane_name: Name for the new pane (e.g., "cc-abc123")
+            extra_argv: Optional list of extra arguments to append after "claude" (e.g. ["--resume", "session_id"])
 
         Returns:
             The pane ID of the newly spawned pane (e.g., "terminal_1")
@@ -337,6 +339,8 @@ class ZellijManager:
                 "--",
                 "claude",
             ]
+            if extra_argv:
+                argv.extend(extra_argv)
             returncode, _, stderr = await self._run_unlocked(*argv, env=env)
             if returncode != 0:
                 raise ZellijSpawnError(f"Failed to spawn pane: {stderr}")

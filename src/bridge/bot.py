@@ -199,3 +199,18 @@ class Bot:
             return True
         except discord.NotFound:
             return False
+
+    async def archive_thread(self, thread_id: int) -> None:
+        """Archive a Discord thread by ID.
+
+        Fetches the thread and marks it as archived. Silently ignores 404 (thread already gone).
+        Raises BotNotReady if the bot isn't connected.
+        """
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        try:
+            thread = await self._client.fetch_channel(thread_id)
+            if isinstance(thread, discord.Thread):
+                await thread.edit(archived=True)
+        except discord.NotFound:
+            pass  # Thread already gone, which is fine

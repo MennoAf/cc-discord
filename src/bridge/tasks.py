@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -20,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 class TaskSpawnError(Exception):
     """Raised when a task cannot be spawned."""
+
+    pass
+
+
+class TaskNotFound(Exception):
+    """Raised when a task cannot be found by its ID."""
+
+    pass
+
+
+class TaskRestartError(Exception):
+    """Raised when a task cannot be restarted (e.g., no session to resume)."""
 
     pass
 
@@ -77,6 +90,7 @@ class TaskRegistry:
         self._by_task_id: dict[str, Task] = {}
         self._by_thread_id: dict[int, Task] = {}
         self._by_session_id: dict[str, Task] = {}
+        self._stop_futures: dict[str, asyncio.Future] = {}
 
     async def load_from_db(self) -> None:
         """Load active tasks from database into memory maps."""
@@ -134,6 +148,43 @@ class TaskRegistry:
             current_transcript_path=task.current_transcript_path,
         )
 
+    def _build_spawn_env(self, task_id: str) -> dict[str, str]:
+        """Build environment dict for spawning a claude process.
+
+        Returns os.environ.copy() with CC_DISCORD_TASK_ID and BRIDGE_URL added.
+        """
+        env = os.environ.copy()
+        env["CC_DISCORD_TASK_ID"] = task_id
+        if "BRIDGE_URL" not in env:
+            env["BRIDGE_URL"] = "http://127.0.0.1:8787"
+        return env
+
+    async def _is_pane_alive(self, pane_id: str) -> bool:
+        """Check if a pane is still running (returns False if exited)."""
+        try:
+            panes = await self._zellij.list_panes()
+            for pane in panes:
+                if pane.get("id") == pane_id and not pane.get("exited", True):
+                    return True
+            return False
+        except Exception:
+            logger.exception("_is_pane_alive failed for pane %s", pane_id)
+            return False
+
+    async def _mark_stopped(self, task: Task) -> None:
+        """Mark a task as stopped and archive its thread."""
+        task.status = "stopped"
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        await self._archive_thread(task.thread_id)
+
+    async def _archive_thread(self, thread_id: int) -> None:
+        """Archive a Discord thread."""
+        try:
+            await self._bot.archive_thread(thread_id)
+        except Exception:
+            logger.exception("Failed to archive thread %d", thread_id)
+
     async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
         """Spawn a new claude session in a Discord-bound task.
 
@@ -178,10 +229,7 @@ class TaskRegistry:
         )
 
         # Build env for spawned claude
-        env = os.environ.copy()
-        env["CC_DISCORD_TASK_ID"] = task_id
-        if "BRIDGE_URL" not in env:
-            env["BRIDGE_URL"] = "http://127.0.0.1:8787"
+        env = self._build_spawn_env(task_id)
 
         # Spawn via zellij; on failure, mark the task as crashed and re-raise
         try:
@@ -390,11 +438,19 @@ class TaskRegistry:
             )
 
     async def _on_session_end(self, body: dict) -> None:
-        """Handle SessionEnd event."""
+        """Handle SessionEnd event.
+
+        Resolves any pending stop_future for the task so stop_task can proceed.
+        Also posts a notification to the thread.
+        """
         session_id = body.get("session_id")
         logger.info(f"SessionEnd: session_id={session_id}")
         task = self.get_by_session_id(session_id) if session_id else None
         if task:
+            # Resolve the stop future if one exists (allows graceful stop to complete)
+            fut = self._stop_futures.get(task.task_id)
+            if fut is not None and not fut.done():
+                fut.set_result(None)
             await self._bot.post(
                 "🏁 SessionEnd received",
                 thread_id=task.thread_id,
@@ -407,3 +463,107 @@ class TaskRegistry:
     async def _on_pre_compact(self, body: dict) -> None:
         """Handle PreCompact event (no-op in Phase 1)."""
         logger.debug("PreCompact received")
+
+    async def list_tasks(self) -> list[Task]:
+        """Return active tasks ordered by last_activity DESC.
+
+        Filters out 'stopped' and 'crashed' rows. Returns in-memory tasks;
+        load_from_db at boot ensures freshness.
+        """
+        return sorted(
+            (t for t in self._by_task_id.values() if t.status in ("spawning", "running")),
+            key=lambda t: t.last_activity,
+            reverse=True,
+        )
+
+    async def stop_task(self, task_id: str, *, timeout: float = 5.0) -> bool:
+        """Gracefully stop a task.
+
+        Sends `/exit\\n` to the pane, waits up to `timeout` for SessionEnd.
+        Returns True if SessionEnd was observed, False if it timed out.
+        On success or timeout: archives the thread, flips status to 'stopped'.
+
+        Raises TaskNotFound if task_id doesn't exist.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(task_id)
+
+        if task.zellij_pane_id is None:
+            # Mid-spawn; treat as immediate fail-safe stop
+            await self._mark_stopped(task)
+            return True
+
+        # Set up a future that SessionEnd handler will resolve.
+        loop = asyncio.get_running_loop()
+        self._stop_futures[task_id] = loop.create_future()
+        try:
+            await self._zellij.write_to_pane(task.zellij_pane_id, "/exit\n")
+            try:
+                await asyncio.wait_for(self._stop_futures[task_id], timeout=timeout)
+                stopped_cleanly = True
+            except asyncio.TimeoutError:
+                stopped_cleanly = False
+        finally:
+            self._stop_futures.pop(task_id, None)
+
+        await self._mark_stopped(task)
+        return stopped_cleanly
+
+    async def kill_task(self, task_id: str) -> None:
+        """Immediately close a task's pane.
+
+        Marks status='crashed' and archives the thread.
+        Raises TaskNotFound if task_id doesn't exist.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(task_id)
+
+        if task.zellij_pane_id is not None:
+            await self._zellij.close_pane(task.zellij_pane_id)
+
+        task.status = "crashed"
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        await self._archive_thread(task.thread_id)
+
+    async def restart_task(self, task_id: str) -> Task:
+        """Resume a task by spawning a new claude with --resume <session_id>.
+
+        Reuses the existing pane if it's still alive; spawns a new pane otherwise.
+        Raises TaskNotFound if task_id doesn't exist.
+        Raises TaskRestartError if there's no claude session to resume.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(task_id)
+
+        if task.current_claude_session_id is None:
+            raise TaskRestartError("no claude session to resume")
+
+        pane_id = task.zellij_pane_id
+        pane_alive = pane_id is not None and await self._is_pane_alive(pane_id)
+
+        if pane_alive:
+            # Just write the resume command into the existing pane; user sees the new banner.
+            await self._zellij.write_to_pane(
+                pane_id,
+                f"\nclaude --resume {task.current_claude_session_id}\n",
+            )
+            # Status stays 'running' — SessionStart will rebind on the new session id
+            return task
+
+        # Spawn a fresh pane with the resumed session.
+        env = self._build_spawn_env(task.task_id)
+        new_pane_id = await self._zellij.spawn_task(
+            cwd=task.cwd,
+            env=env,
+            pane_name=f"cc-{task.task_id[:8]}",
+            extra_argv=["--resume", task.current_claude_session_id],
+        )
+        task.zellij_pane_id = new_pane_id
+        task.last_activity = int(time.time())
+        await self._index(task)
+        await self._persist(task)
+        return task
