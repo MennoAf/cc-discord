@@ -1,10 +1,21 @@
-"""Voice-memo transcription via Wispr Flow API.
+"""Voice-memo transcription.
 
-Wispr Flow's `POST /transcribe` accepts only base64-encoded 16kHz mono PCM WAV
-(<= 25MB, <= 6 minutes), so we convert the original Discord upload through
-ffmpeg before posting. Auth: bearer JWT in `WISPR_FLOW_API_TOKEN`.
+Two backends, auto-selected:
 
-Docs: https://api-docs.wisprflow.ai/client_api_transcribe
+  - Wispr Flow API (cloud) when `WISPR_FLOW_API_TOKEN` is set. Exact behavior
+    documented at https://api-docs.wisprflow.ai/client_api_transcribe — at the
+    time of writing, Wispr only grants tokens to approved orgs, which is why
+    this is the opt-in branch rather than the default.
+  - Local OpenAI-Whisper CLI otherwise. Install via `pip install -U
+    openai-whisper`. Override the binary path with `BRIDGE_WHISPER_BIN` and
+    the model with `BRIDGE_WHISPER_MODEL` (default `base`). Compatible
+    invocations from `whisper.cpp` / `faster-whisper-cli` should also work
+    if their argv accepts `<file> --model <name> --output_format txt
+    --output_dir <dir>`; otherwise point `BRIDGE_WHISPER_BIN` at a wrapper
+    script.
+
+In both cases ffmpeg is used to normalize the audio first (Wispr requires
+16kHz mono PCM WAV; whisper-flavored CLIs are happier with the same).
 """
 
 from __future__ import annotations
@@ -42,21 +53,18 @@ def is_audio_path(path: Path) -> bool:
     return path.suffix.lower() in _AUDIO_SUFFIXES
 
 
-async def transcribe(audio_path: Path, *, timeout: float = 60.0) -> str | None:
-    """Transcribe an audio file via Wispr Flow.
+async def transcribe(audio_path: Path, *, timeout: float = 120.0) -> str | None:
+    """Transcribe an audio file. Returns None if no backend is configured or
+    the chosen backend fails. Failures are logged at WARNING."""
+    if os.environ.get("WISPR_FLOW_API_TOKEN"):
+        return await _transcribe_wispr(audio_path, timeout=timeout)
+    return await _transcribe_local_whisper(audio_path, timeout=timeout)
 
-    Returns the transcription string on success, or None on:
-      - missing `WISPR_FLOW_API_TOKEN`
-      - ffmpeg conversion failure (binary missing or unreadable input)
-      - HTTP error from Wispr (non-2xx, malformed JSON, missing `text`)
-      - timeout
-    Failures are logged; callers should treat None as "no transcript".
-    """
+
+async def _transcribe_wispr(audio_path: Path, *, timeout: float) -> str | None:
+    """Wispr Flow REST. Requires base64 16kHz mono PCM WAV (<= 25MB / 6 min)."""
     token = os.environ.get("WISPR_FLOW_API_TOKEN")
-    if not token:
-        logger.warning(
-            "voice attachment received but WISPR_FLOW_API_TOKEN is not set"
-        )
+    if not token:  # double-check; transcribe() guards but keep this safe
         return None
 
     wav_path = await _convert_to_pcm_wav(audio_path)
@@ -105,6 +113,72 @@ async def transcribe(audio_path: Path, *, timeout: float = 60.0) -> str | None:
         return text.strip()
     logger.warning("Wispr transcribe returned no `text`; payload=%r", data)
     return None
+
+
+async def _transcribe_local_whisper(
+    audio_path: Path, *, timeout: float
+) -> str | None:
+    """Shell out to the OpenAI-Whisper CLI (or compatible). Reads the produced
+    `<basename>.txt` from the output dir."""
+    binary = os.environ.get("BRIDGE_WHISPER_BIN") or "whisper"
+    model = os.environ.get("BRIDGE_WHISPER_MODEL") or "base"
+    out_dir = audio_path.parent
+    expected_out = out_dir / f"{audio_path.stem}.txt"
+    # Remove a stale .txt from a prior run so a missing/failed conversion
+    # doesn't surface old text.
+    try:
+        expected_out.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.exception("failed to clear stale transcript %s", expected_out)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            str(audio_path),
+            "--model",
+            model,
+            "--output_format",
+            "txt",
+            "--output_dir",
+            str(out_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "transcription CLI %r not found — install with "
+            "`pip install -U openai-whisper`, or set BRIDGE_WHISPER_BIN to a "
+            "different binary",
+            binary,
+        )
+        return None
+
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.warning(
+            "transcribe timed out after %ss for %s", timeout, audio_path
+        )
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "transcribe failed (rc=%d): %s",
+            proc.returncode,
+            stderr.decode("utf-8", errors="replace")[:500],
+        )
+        return None
+    if not expected_out.is_file():
+        logger.warning("transcribe produced no output at %s", expected_out)
+        return None
+    try:
+        text = expected_out.read_text(errors="replace").strip()
+    except OSError:
+        logger.exception("failed to read transcript output %s", expected_out)
+        return None
+    return text or None
 
 
 async def _convert_to_pcm_wav(src: Path) -> Path | None:
