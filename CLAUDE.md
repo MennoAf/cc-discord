@@ -33,11 +33,14 @@ The systemd unit at `packaging/claude-discord-bridge.service` hardcodes `%h/.loc
 
 ## Architecture quick reference
 
-- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`. `AskLockMap` lives here.
+- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`. `AskLockMap` lives here.
 - `src/bridge/bot.py` — `discord.py` wrapper. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes.
 - `src/bridge/threads.py` — `ThreadRegistry` owns session_id→thread_id mapping with 404 recovery. Single global lock is intentional (per-session contention is rare).
 - `src/bridge/listener.py` — sliding-window coalescing for `/v1/ask` replies. `GRACE_SECS = 3.0` default; tests override.
-- `src/bridge/state.py` — aiosqlite, WAL mode, `sessions` table.
+- `src/bridge/state.py` — aiosqlite, WAL mode. Tables: `sessions`, `tasks`, `approval_log`.
+- `src/bridge/tasks.py` — `TaskRegistry` for Discord-driven sessions. Owns task lifecycle, hook-event dispatch, typing/tool-summary/transcript relay, startup reconciliation against zellij.
+- `src/bridge/zellij.py` — async wrapper around the `zellij` CLI. All spawned panes share the `bridge` session.
+- `src/bridge/approvals.py` — `ApprovalRouter` for PreToolUse round-trips (Discord reactions/text → hook decision) and `Notification` TUI prompts (AskUserQuestion / ExitPlanMode / free-text).
 - `src/bridge/secrets.py` — 0600 JSON at `~/.config/claude-discord-bridge/secrets.json`.
-- `hooks/` — Claude Code Stop/Notification hooks. Posts to `BRIDGE_URL` (default `http://127.0.0.1:8787`); falls back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down.
+- `hooks/` — Claude Code hooks. `notify-stop.py` / `notify-notification.py` are the standalone-bridge hooks. `event.py` (multi-event dispatcher) and `pretooluse-approve.py` (fail-closed approval wrapper) are the Discord-driven-session hooks injected via `--settings`. All post to `BRIDGE_URL` (default `http://127.0.0.1:8787`); the notify hooks fall back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down.
 - `skills/` — `/ask-discord` skill. `SKILL.md` is symlinked into `~/.claude/skills/ask-discord/`.
