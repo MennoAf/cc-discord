@@ -7,11 +7,33 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+
+# Marker convention agents use to attach files back to the Discord thread.
+# Example: `[[attach: /tmp/screenshot.png]]` in a streamed text block.
+_ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
+# Discord per-message attachment cap.
+_MAX_ATTACHMENTS_PER_POST = 10
+
+
+def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
+    """Strip `[[attach: <path>]]` markers from text and return the cleaned
+    text plus the list of resolved file paths (must be absolute & exist)."""
+    paths: list[Path] = []
+    for match in _ATTACH_MARKER.finditer(text):
+        candidate = Path(match.group(1).strip())
+        if candidate.is_absolute() and candidate.is_file():
+            paths.append(candidate)
+        else:
+            logger.info("attach marker skipped (not absolute / missing): %r", str(candidate))
+    cleaned = _ATTACH_MARKER.sub("", text).strip()
+    return cleaned, paths[:_MAX_ATTACHMENTS_PER_POST]
 
 import aiosqlite
 
@@ -1091,10 +1113,19 @@ class TaskRegistry:
                     if btype == "text":
                         text = block.get("text")
                         if isinstance(text, str) and text.strip():
+                            cleaned, attach_paths = _parse_attach_markers(text)
+                            body = (prefix + cleaned) if cleaned else None
                             try:
-                                await self._bot.post(
-                                    prefix + text, thread_id=task.thread_id
-                                )
+                                if attach_paths:
+                                    await self._bot.post_with_attachments(
+                                        attach_paths,
+                                        thread_id=task.thread_id,
+                                        text=body,
+                                    )
+                                elif body:
+                                    await self._bot.post(
+                                        body, thread_id=task.thread_id
+                                    )
                             except Exception:
                                 logger.exception(
                                     "failed to stream text for task %s", task.task_id

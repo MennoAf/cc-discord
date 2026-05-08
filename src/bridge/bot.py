@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import discord
@@ -180,6 +181,38 @@ class Bot:
         ids: list[int] = []
         for chunk in _chunk(message):
             msg = await target.send(chunk)
+            ids.append(msg.id)
+        return ids
+
+    async def post_with_attachments(
+        self,
+        file_paths: list[Path],
+        *,
+        thread_id: int | None = None,
+        text: str | None = None,
+    ) -> list[int]:
+        """Send up to 10 file attachments (Discord's per-message cap) plus an
+        optional text body. If `text` exceeds Discord's char limit it's chunked
+        across follow-up text-only messages, with the attachments going on the
+        first send. Returns created message IDs in order.
+        """
+        if not self.is_ready or self._channel is None:
+            raise BotNotReady("bot not connected to Discord")
+        if not file_paths:
+            raise ValueError("file_paths must not be empty")
+        target: discord.abc.Messageable = self._channel
+        if thread_id is not None:
+            target = await self._client.fetch_channel(thread_id)
+
+        capped = file_paths[:10]
+        chunks = list(_chunk(text)) if text else [None]
+        first_chunk = chunks[0]
+        files = [discord.File(str(p)) for p in capped]
+        ids: list[int] = []
+        msg = await target.send(content=first_chunk, files=files)
+        ids.append(msg.id)
+        for follow in chunks[1:]:
+            msg = await target.send(follow)
             ids.append(msg.id)
         return ids
 
