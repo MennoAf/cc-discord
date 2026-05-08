@@ -48,9 +48,7 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
         if prompt:
             try:
                 await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
-                await registry._zellij.write_to_pane(  # type: ignore[reportPrivateUsage]
-                    task.zellij_pane_id, prompt + "\n"
-                )
+                await registry.write_initial_prompt(task.task_id, prompt)
             except asyncio.TimeoutError:
                 logger.warning("task %s did not bind within 10s", task.task_id)
 
@@ -79,7 +77,7 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
     @app_commands.describe(thread="Thread to stop (defaults to invocation thread)")
     async def stop(
         interaction: discord.Interaction,
-        thread: discord.TextChannel | None = None,
+        thread: discord.Thread | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
@@ -104,7 +102,7 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
     @app_commands.describe(thread="Thread to kill (defaults to invocation thread)")
     async def kill(
         interaction: discord.Interaction,
-        thread: discord.TextChannel | None = None,
+        thread: discord.Thread | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
@@ -123,7 +121,7 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
     @app_commands.describe(thread="Thread to restart (defaults to invocation thread)")
     async def restart(
         interaction: discord.Interaction,
-        thread: discord.TextChannel | None = None,
+        thread: discord.Thread | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
@@ -142,7 +140,7 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
 
 
 def _resolve_task(
-    registry: TaskRegistry, interaction: discord.Interaction, override: discord.TextChannel | None
+    registry: TaskRegistry, interaction: discord.Interaction, override: discord.Thread | None
 ) -> Task:
     """Resolve the task context from interaction or override thread.
 

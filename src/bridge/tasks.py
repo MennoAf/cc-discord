@@ -464,6 +464,23 @@ class TaskRegistry:
         """Handle PreCompact event (no-op in Phase 1)."""
         logger.debug("PreCompact received")
 
+    async def write_initial_prompt(self, task_id: str, prompt: str) -> None:
+        """Write initial prompt to a task's zellij pane after session bind.
+
+        Looks up the task by task_id. If pane_id is None or task is missing,
+        logs warning and returns. Otherwise writes prompt + newline and bumps last_activity.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            logger.warning("write_initial_prompt: task_id %s not found", task_id)
+            return
+        if task.zellij_pane_id is None:
+            logger.warning("write_initial_prompt: task %s has no pane_id", task_id)
+            return
+        await self._zellij.write_to_pane(task.zellij_pane_id, prompt + "\n")
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
     async def list_tasks(self) -> list[Task]:
         """Return active tasks ordered by last_activity DESC.
 
@@ -488,6 +505,10 @@ class TaskRegistry:
         task = self.get_by_task_id(task_id)
         if task is None:
             raise TaskNotFound(task_id)
+
+        # Guard: already stopped or crashed; idempotent no-op
+        if task.status not in {"running", "spawning"}:
+            return True
 
         if task.zellij_pane_id is None:
             # Mid-spawn; treat as immediate fail-safe stop
@@ -519,6 +540,10 @@ class TaskRegistry:
         task = self.get_by_task_id(task_id)
         if task is None:
             raise TaskNotFound(task_id)
+
+        # Guard: already stopped or crashed; idempotent no-op
+        if task.status not in {"running", "spawning"}:
+            return
 
         if task.zellij_pane_id is not None:
             await self._zellij.close_pane(task.zellij_pane_id)
@@ -552,6 +577,8 @@ class TaskRegistry:
                 f"\nclaude --resume {task.current_claude_session_id}\n",
             )
             # Status stays 'running' — SessionStart will rebind on the new session id
+            task.last_activity = int(time.time())
+            await self._persist(task)
             return task
 
         # Spawn a fresh pane with the resumed session.
