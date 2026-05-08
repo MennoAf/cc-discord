@@ -23,6 +23,34 @@ def read_entries(path: Path) -> Iterator[dict]:
         return
 
 
+def is_recent_tool_use_sidechain(path: Path, tool_name: str) -> bool:
+    """Whether the most recent `tool_use` block of `tool_name` came from a
+    sidechain (i.e. a subagent dispatched via the Task tool).
+
+    Walks the transcript newest-first and stops at the first matching
+    `tool_use` block, returning the parent assistant entry's `isSidechain`
+    flag. Returns False if the tool isn't found or the file isn't readable.
+    """
+    entries = list(read_entries(path))
+    for e in reversed(entries):
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == tool_name
+            ):
+                return e.get("isSidechain") is True
+    return False
+
+
 def find_latest_unresolved_tool_use(path: Path) -> dict | None:
     """Return the latest tool_use block from the most recent assistant entry whose id has
     no matching tool_result block in subsequent user entries. Returns None if no such block.

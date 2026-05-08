@@ -80,6 +80,12 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         emoji = _EMOJI_FAIL if failed else _EMOJI_TASK
         return f"{emoji} Task: {_truncate(desc, 80)}"
 
+    if tool_name == "Skill":
+        # Skill tool input includes `skill` (skill name) and optional `args`.
+        name = tool_input.get("skill") or "?"
+        emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
+        return f"{emoji} Skill: {name}"
+
     # Generic fallback
     emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
     return f"{emoji} {tool_name}"

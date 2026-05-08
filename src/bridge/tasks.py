@@ -746,6 +746,7 @@ class TaskRegistry:
     async def _on_post_tool_use(self, body: dict) -> None:
         """Handle PostToolUse event. Stream pending assistant prose, append
         tool summary, and post a diff/content block for Edit/MultiEdit/Write.
+        Subagent (sidechain) tool calls get a `↳ ` prefix.
         """
         session_id = body.get("session_id")
         if not session_id:
@@ -763,9 +764,25 @@ class TaskRegistry:
         tool_input = body.get("tool_input", {}) or {}
         tool_response = body.get("tool_response", {}) or {}
 
+        sidechain = self._is_sidechain_tool(body, tool_name)
         line = tool_summary.summarize(tool_name, tool_input, tool_response)
+        if sidechain:
+            line = "↳ " + line
         self._agg_for(task).append(line)
         await self._post_tool_diff(task, tool_name, tool_input)
+
+    def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
+        """Best-effort: did the most recent `tool_use` of `tool_name` come from
+        a subagent? Looks at the transcript file referenced by the hook body.
+        """
+        tp = body.get("transcript_path")
+        if not isinstance(tp, str):
+            return False
+        try:
+            return transcript.is_recent_tool_use_sidechain(Path(tp), tool_name)
+        except Exception:
+            logger.exception("is_recent_tool_use_sidechain failed for %s", tp)
+            return False
 
     async def _on_post_tool_use_failure(self, body: dict) -> None:
         """Handle PostToolUseFailure event. Force-failure summary."""
@@ -930,11 +947,13 @@ class TaskRegistry:
         for e in entries[last_user_idx + 1:]:
             if e.get("type") != "assistant":
                 continue
-            if e.get("isSidechain") is True or e.get("isMeta") is True:
+            if e.get("isMeta") is True:
                 continue
             uid = e.get("uuid")
             if not isinstance(uid, str) or uid in task.posted_assistant_uuids:
                 continue
+            sidechain = e.get("isSidechain") is True
+            prefix = "↳ " if sidechain else ""
 
             msg = e.get("message")
             content = msg.get("content") if isinstance(msg, dict) else None
@@ -947,7 +966,9 @@ class TaskRegistry:
                         text = block.get("text")
                         if isinstance(text, str) and text.strip():
                             try:
-                                await self._bot.post(text, thread_id=task.thread_id)
+                                await self._bot.post(
+                                    prefix + text, thread_id=task.thread_id
+                                )
                             except Exception:
                                 logger.exception(
                                     "failed to stream text for task %s", task.task_id
@@ -960,7 +981,7 @@ class TaskRegistry:
                         if isinstance(thought, str) and thought.strip():
                             try:
                                 await self._bot.post(
-                                    self._format_thinking(thought),
+                                    prefix + self._format_thinking(thought),
                                     thread_id=task.thread_id,
                                 )
                             except Exception:
