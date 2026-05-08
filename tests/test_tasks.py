@@ -8,7 +8,7 @@ import pytest
 
 from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry, TaskSpawnError, _ToolSummaryAggregator
-from bridge.zellij import ZellijManager
+from bridge.zellij import ZellijError, ZellijManager
 from tests.fakes import FakeBot, FakeZellij
 
 
@@ -984,6 +984,160 @@ class TestTaskRegistry:
         # Should be silent no-op
         posts = fake_bot.get_post_calls()
         assert len(posts) == 0
+
+    async def test_load_from_db_pane_alive_silent_recovery(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """load_from_db with live pane: task stays running, no message."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_3",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            return [{"id": "terminal_3", "exited": False}]
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Task should be loaded and in memory
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "running"
+
+        # No posts (silent recovery)
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_load_from_db_pane_missing_marks_crashed(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """load_from_db with missing pane: task marked crashed, posts 💥, thread archived."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_3",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            return [{"id": "terminal_4", "exited": False}]  # Different pane
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Task should be loaded but marked crashed
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "crashed"
+
+        # Post recovery crash notice
+        posts = fake_bot.get_post_calls()
+        assert any("💥 Bridge restarted" in p["content"] for p in posts)
+        assert any("🛡 ❌ Any pending approval" in p["content"] for p in posts)
+
+        # Thread archived
+        archives = fake_bot.get_archive_calls()
+        assert len(archives) == 1
+
+    async def test_load_from_db_pane_exited_marks_crashed(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """load_from_db with exited pane: task marked crashed."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_3",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            return [{"id": "terminal_3", "exited": True}]  # Pane exited
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "crashed"
+
+    async def test_load_from_db_stopped_task_not_loaded(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """load_from_db skips stopped/crashed tasks (original behavior)."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-stopped",
+            1001,
+            "/tmp",
+            "stopped",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            return []
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Stopped task should not be in memory
+        task = registry.get_by_task_id("task-stopped")
+        assert task is None
+
+    async def test_load_from_db_zellij_fails_assumes_alive(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """load_from_db when list_panes fails: assumes all panes alive (defensive)."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_3",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            raise ZellijError("zellij command failed")
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Task should be kept as-is (defensive assumption)
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "running"  # Not crashed
 
 
 @dataclass

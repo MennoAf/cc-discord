@@ -231,12 +231,65 @@ class TaskRegistry:
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
 
     async def load_from_db(self) -> None:
-        """Load active tasks from database into memory maps."""
+        """Restore in-memory task map from SQLite, then reconcile with live zellij panes.
+
+        For each row:
+        - If status is 'running' or 'spawning' AND its zellij_pane_id is in `list_panes()` AND
+          that pane has exited=False: keep as-is, no Discord message.
+        - If status is 'running'/'spawning' but pane is missing or exited=True: flip to
+          'crashed', post 💥, archive thread.
+        - If status is already 'stopped' or 'crashed': skip (don't re-add to in-memory map).
+        """
         rows = await list_active_tasks(self._conn)
+        if not rows:
+            return
+
+        try:
+            live_panes = await self._zellij.list_panes()
+            live_pane_ids = {p["id"] for p in live_panes if not p.get("exited", False)}
+        except ZellijError:
+            logger.exception("failed to query zellij during recovery; assuming all panes alive")
+            # Defensive: set live_pane_ids to all pane IDs we know about, so they're kept as-is
+            live_pane_ids = {row.zellij_pane_id for row in rows if row.zellij_pane_id}
+
         for row in rows:
-            if row.status not in {"stopped", "crashed"}:
-                task = Task.from_row(row)
+            task = Task.from_row(row)
+            # If task has no pane_id, it's mid-spawn; keep it loaded as-is
+            if not task.zellij_pane_id:
                 await self._index(task)
+                logger.info("recovered spawning task %s (no pane yet)", task.task_id[:8])
+                continue
+
+            # Task has a pane_id; check if it's still alive
+            if task.zellij_pane_id in live_pane_ids:
+                await self._index(task)
+                logger.info("recovered task %s on pane %s", task.task_id[:8], task.zellij_pane_id)
+                continue
+
+            # Pane is gone — mark crashed
+            task.status = "crashed"
+            task.last_activity = int(time.time())
+            await self._index(task)
+            await self._persist(task)
+            try:
+                await self._bot.post(
+                    "💥 Bridge restarted; this task's pane is gone",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post recovery-crash notice for task %s", task.task_id)
+            try:
+                await self._bot.post(
+                    "🛡 ❌ Any pending approval was denied (bridge restarted)",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post approval-denied notice for task %s", task.task_id)
+            try:
+                await self._archive_thread(task.thread_id)
+            except Exception:
+                logger.exception("failed to archive thread for task %s", task.task_id)
+            _cleanup_task_settings(task.task_id)
 
     def get_by_task_id(self, task_id: str) -> Task | None:
         """Get task by task_id."""
