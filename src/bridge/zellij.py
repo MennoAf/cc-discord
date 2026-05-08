@@ -141,16 +141,16 @@ class ZellijManager:
     async def write_to_pane(self, pane_id: str, text: str) -> None:
         """Type text into the task tab named `pane_id`.
 
-        Multi-line text is wrapped in bracketed-paste markers
-        (ESC[200~ ... ESC[201~) so Claude's TUI treats embedded newlines as
-        content rather than Enter; LF (byte 10) separates segments inside
-        the paste block. A trailing newline on the input submits the
-        buffered prompt via a final CR (byte 13).
+        Multi-line text is wrapped in bracketed paste so Claude's TUI
+        treats embedded LFs as content rather than Enter. The whole
+        sequence — paste-begin + UTF-8 body + paste-end + optional CR —
+        is dispatched in a single `action write` so zellij delivers it
+        atomically; per-segment write-chars + interleaved write calls
+        race with the TUI's paste-mode state and lose trailing content.
         """
         submit = text.endswith("\n")
         body = text[:-1] if submit else text
-        segments = body.split("\n")
-        multiline = len(segments) > 1
+        multiline = "\n" in body
 
         async with self._session_lock:
             rc, _, stderr = await self._run_unlocked(
@@ -161,42 +161,32 @@ class ZellijManager:
                 raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")
 
             if multiline:
-                # ESC [ 2 0 0 ~  — begin bracketed paste
-                await self._action_write_bytes(27, 91, 50, 48, 48, 126)
-                for i, segment in enumerate(segments):
-                    if segment:
-                        logger.info(
-                            "write-chars seg %d/%d (%d chars): %r",
-                            i + 1,
-                            len(segments),
-                            len(segment),
-                            segment[:120] + ("…" if len(segment) > 120 else ""),
-                        )
-                        rc, _, stderr = await self._run_unlocked(
-                            self._executable, "--session", SESSION_NAME,
-                            "action", "write-chars", segment,
-                        )
-                        if rc != 0:
-                            raise ZellijError(f"write-chars failed: {stderr}")
-                    if i < len(segments) - 1:
-                        await self._action_write_bytes(10)
-                # ESC [ 2 0 1 ~  — end bracketed paste
-                await self._action_write_bytes(27, 91, 50, 48, 49, 126)
-            elif body:
+                # ESC [ 2 0 0 ~ … body … ESC [ 2 0 1 ~ [CR]
+                bytes_out: list[int] = [27, 91, 50, 48, 48, 126]
+                bytes_out.extend(body.encode("utf-8"))
+                bytes_out.extend([27, 91, 50, 48, 49, 126])
+                if submit:
+                    bytes_out.append(13)
                 logger.info(
-                    "write-chars single-line (%d chars): %r",
-                    len(body),
-                    body[:120] + ("…" if len(body) > 120 else ""),
+                    "relay → pane single write (%d bytes, paste-wrapped, submit=%s)",
+                    len(bytes_out), submit,
                 )
-                rc, _, stderr = await self._run_unlocked(
-                    self._executable, "--session", SESSION_NAME,
-                    "action", "write-chars", body,
-                )
-                if rc != 0:
-                    raise ZellijError(f"write-chars failed: {stderr}")
-
-            if submit:
-                await self._action_write_bytes(13)
+                await self._action_write_bytes(*bytes_out)
+            else:
+                if body:
+                    logger.info(
+                        "write-chars single-line (%d chars): %r",
+                        len(body),
+                        body[:120] + ("…" if len(body) > 120 else ""),
+                    )
+                    rc, _, stderr = await self._run_unlocked(
+                        self._executable, "--session", SESSION_NAME,
+                        "action", "write-chars", body,
+                    )
+                    if rc != 0:
+                        raise ZellijError(f"write-chars failed: {stderr}")
+                if submit:
+                    await self._action_write_bytes(13)
 
     async def _action_write_bytes(self, *byte_vals: int) -> None:
         """Send raw bytes to the focused pane via `zellij action write`.
