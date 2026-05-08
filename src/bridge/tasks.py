@@ -115,15 +115,24 @@ class TaskRestartError(Exception):
 
 
 class _ToolSummaryAggregator:
-    """Collects PostToolUse summaries within a 1s window and flushes as one Discord message."""
+    """Collects PostToolUse summaries within a 1s window and flushes as one Discord message.
+
+    On 429 rate limit, enters slow mode (5s window) for the task's lifetime.
+    """
 
     FLUSH_WINDOW = 1.0  # seconds
+    SLOW_FLUSH_WINDOW = 5.0  # seconds (when rate-limited)
 
     def __init__(self, bot: Bot, thread_id: int) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []
         self._flush_task: asyncio.Task | None = None
+        self._slow_mode = False  # True after we hit a 429
+
+    def _flush_window(self) -> float:
+        """Return appropriate flush window based on rate-limit status."""
+        return self.SLOW_FLUSH_WINDOW if self._slow_mode else self.FLUSH_WINDOW
 
     def append(self, line: str) -> None:
         self._lines.append(line)
@@ -132,7 +141,7 @@ class _ToolSummaryAggregator:
 
     async def _flush_after_window(self) -> None:
         try:
-            await asyncio.sleep(self.FLUSH_WINDOW)
+            await asyncio.sleep(self._flush_window())
         except asyncio.CancelledError:
             return
         if not self._lines:
@@ -147,8 +156,15 @@ class _ToolSummaryAggregator:
             # Restore lines so flush_now can re-emit them
             self._lines[:0] = local_lines
             raise
-        except Exception:
-            logger.exception("failed to post tool summary chunk")
+        except Exception as e:
+            # Check for 429 (rate limit)
+            if getattr(e, "status", None) == 429:
+                logger.warning("tool summary hit 429; switching to slow mode")
+                self._slow_mode = True
+                # Re-queue the body for retry
+                self._lines.insert(0, body)
+            else:
+                logger.exception("failed to post tool summary chunk")
 
     async def flush_now(self) -> None:
         """Force flush (called on Stop / SessionEnd to avoid orphaned summaries)."""
