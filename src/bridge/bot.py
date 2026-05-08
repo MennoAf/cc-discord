@@ -112,6 +112,16 @@ class Bot:
     def channel_id(self) -> int:
         return self._channel_id
 
+    @property
+    def client(self) -> discord.Client:
+        """Underlying discord.py Client. Used by commands.py to attach a CommandTree."""
+        return self._client
+
+    @property
+    def channel(self) -> discord.TextChannel | None:
+        """Configured channel object (set after on_ready). Used to resolve guild for command sync."""
+        return self._channel
+
     async def on_ready(self) -> None:
         """Called when the bot finishes the gateway handshake."""
         ch = self._client.get_channel(self._channel_id) or await self._client.fetch_channel(

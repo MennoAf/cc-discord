@@ -283,3 +283,13 @@ class TestBot:
 
         # Callback should NOT have been called
         assert call_count == 0
+
+    def test_bot_client_property(self):
+        """Bot.client returns the underlying discord.Client."""
+        bot = Bot("test_token", 12345)
+        assert bot.client is bot._client
+
+    def test_bot_channel_property_before_ready(self):
+        """Bot.channel is None before on_ready is called."""
+        bot = Bot("test_token", 12345)
+        assert bot.channel is None
