@@ -94,6 +94,7 @@ class Bot:
         channel_id: int,
         *,
         on_message: Callable[[discord.Message], Awaitable[None]] | None = None,
+        on_reaction: Callable[[discord.RawReactionActionEvent], Awaitable[None]] | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # required for Phase 3 reply routing
@@ -103,10 +104,13 @@ class Bot:
         self._channel: discord.TextChannel | None = None
         self._ready = asyncio.Event()
         self._on_message_cb = on_message
+        self._on_reaction_cb = on_reaction
         # discord.py registers event handlers by method name.
         self._client.event(self.on_ready)
         if on_message is not None:
             self._client.event(self.on_message)
+        if on_reaction is not None:
+            self._client.event(self.on_raw_reaction_add)
 
     @property
     def channel_id(self) -> int:
@@ -220,3 +224,25 @@ class Bot:
                 await thread.edit(archived=True)
         except discord.NotFound:
             pass  # Thread already gone, which is fine
+
+    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+        """Add emoji reactions to a message.
+
+        Args:
+            message_id: The Discord message ID
+            thread_id: The Discord thread ID (or channel ID)
+            emoji: List of emoji strings to add (e.g., ["✅", "❌"])
+
+        Raises BotNotReady if the bot isn't connected.
+        """
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        channel = await self._client.fetch_channel(thread_id)
+        msg = await channel.fetch_message(message_id)
+        for e in emoji:
+            await msg.add_reaction(e)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """Called by discord.py on every reaction-add. Bridges to the approval router callback."""
+        if self._on_reaction_cb is not None:
+            await self._on_reaction_cb(payload)

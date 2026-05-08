@@ -366,3 +366,68 @@ class TestBot:
 
         # Verify edit was called with archived=True
         mock_thread.edit.assert_called_once_with(archived=True)
+
+    @pytest.mark.asyncio
+    async def test_add_reactions_calls_add_reaction(self):
+        """add_reactions calls add_reaction for each emoji."""
+        bot = Bot("test_token", 12345)
+        bot._ready.set()
+
+        # Mock fetch_channel to return a channel with fetch_message
+        mock_channel = mock.MagicMock()
+        mock_msg = mock.MagicMock()
+        mock_msg.add_reaction = mock.AsyncMock()
+
+        bot._client.fetch_channel = mock.AsyncMock(return_value=mock_channel)
+        mock_channel.fetch_message = mock.AsyncMock(return_value=mock_msg)
+
+        # Call add_reactions
+        await bot.add_reactions(1001, 1002, ["✅", "❌"])
+
+        # Verify fetch_channel and fetch_message were called correctly
+        bot._client.fetch_channel.assert_called_once_with(1002)
+        mock_channel.fetch_message.assert_called_once_with(1001)
+        # Verify add_reaction was called for each emoji
+        assert mock_msg.add_reaction.call_count == 2
+        calls = mock_msg.add_reaction.call_args_list
+        assert calls[0] == mock.call("✅")
+        assert calls[1] == mock.call("❌")
+
+    @pytest.mark.asyncio
+    async def test_add_reactions_raises_when_not_ready(self):
+        """add_reactions raises BotNotReady if bot not connected."""
+        bot = Bot("test_token", 12345)
+        # Don't set _ready
+        with pytest.raises(BotNotReady):
+            await bot.add_reactions(1001, 1002, ["✅"])
+
+    @pytest.mark.asyncio
+    async def test_on_raw_reaction_add_dispatches_to_callback(self):
+        """on_raw_reaction_add calls the registered callback."""
+        callback_called = []
+
+        async def mock_callback(payload):
+            callback_called.append(payload)
+
+        bot = Bot("test_token", 12345, on_reaction=mock_callback)
+
+        # Create a mock RawReactionActionEvent
+        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
+
+        # Call on_raw_reaction_add
+        await bot.on_raw_reaction_add(payload)
+
+        # Verify callback was called with payload
+        assert len(callback_called) == 1
+        assert callback_called[0] is payload
+
+    @pytest.mark.asyncio
+    async def test_on_raw_reaction_add_no_callback(self):
+        """on_raw_reaction_add does nothing if no callback registered."""
+        bot = Bot("test_token", 12345)  # No on_reaction callback
+
+        # Create a mock RawReactionActionEvent
+        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
+
+        # Should not raise
+        await bot.on_raw_reaction_add(payload)

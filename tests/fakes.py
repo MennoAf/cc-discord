@@ -63,6 +63,7 @@ class FakeBot:
     _post_calls: list[dict] = field(default_factory=list)
     _thread_calls: list[dict] = field(default_factory=list)
     _archive_calls: list[dict] = field(default_factory=list)
+    _reaction_calls: list[dict] = field(default_factory=list)
     _fake_channels: dict[int, FakeBotChannel] = field(default_factory=dict)
     is_ready: bool = True
 
@@ -89,6 +90,10 @@ class FakeBot:
         """Fake archive_thread: record the call."""
         self._archive_calls.append({"thread_id": thread_id})
 
+    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+        """Fake add_reactions: record the call."""
+        self._reaction_calls.append({"message_id": message_id, "thread_id": thread_id, "emoji": emoji})
+
     async def fetch_messageable(self, thread_id: int) -> FakeBotChannel:
         """Fake fetch_messageable: return a FakeBotChannel."""
         if thread_id not in self._fake_channels:
@@ -103,6 +108,9 @@ class FakeBot:
 
     def get_archive_calls(self) -> list[dict]:
         return self._archive_calls
+
+    def get_reaction_calls(self) -> list[dict]:
+        return self._reaction_calls
 
 
 @dataclass
