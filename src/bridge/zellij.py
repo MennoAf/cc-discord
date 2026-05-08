@@ -141,18 +141,11 @@ class ZellijManager:
     async def write_to_pane(self, pane_id: str, text: str) -> None:
         """Type text into the task tab named `pane_id`.
 
-        Segments are encoded as UTF-8 bytes and sent via `action write
-        <byte> <byte> …` instead of `action write-chars <segment>`. zellij's
-        clap parser drops `write-chars` arguments that look like flags
-        (anything starting with `-`, even after `--`), which silently
-        truncated lines like markdown bullets. Decimal-byte argv can't be
-        confused for flags.
-
         Multi-line text is wrapped in bracketed-paste markers
         (ESC[200~ ... ESC[201~) so Claude's TUI treats embedded newlines as
-        content; LF (byte 10) separates segments inside the paste block. A
-        trailing newline on the input submits the buffered prompt via a
-        final CR (byte 13).
+        content rather than Enter; LF (byte 10) separates segments inside
+        the paste block. A trailing newline on the input submits the
+        buffered prompt via a final CR (byte 13).
         """
         submit = text.endswith("\n")
         body = text[:-1] if submit else text
@@ -172,25 +165,26 @@ class ZellijManager:
                 await self._action_write_bytes(27, 91, 50, 48, 48, 126)
                 for i, segment in enumerate(segments):
                     if segment:
-                        await self._write_text_as_bytes(segment)
+                        rc, _, stderr = await self._run_unlocked(
+                            self._executable, "--session", SESSION_NAME,
+                            "action", "write-chars", segment,
+                        )
+                        if rc != 0:
+                            raise ZellijError(f"write-chars failed: {stderr}")
                     if i < len(segments) - 1:
                         await self._action_write_bytes(10)
                 # ESC [ 2 0 1 ~  — end bracketed paste
                 await self._action_write_bytes(27, 91, 50, 48, 49, 126)
             elif body:
-                await self._write_text_as_bytes(body)
+                rc, _, stderr = await self._run_unlocked(
+                    self._executable, "--session", SESSION_NAME,
+                    "action", "write-chars", body,
+                )
+                if rc != 0:
+                    raise ZellijError(f"write-chars failed: {stderr}")
 
             if submit:
                 await self._action_write_bytes(13)
-
-    async def _write_text_as_bytes(self, text: str) -> None:
-        """Send `text` (UTF-8) to the focused pane as decimal bytes via
-        `action write`. Bypasses `write-chars`'s argparse, which silently
-        drops segments that start with `-`.
-        """
-        if not text:
-            return
-        await self._action_write_bytes(*text.encode("utf-8"))
 
     async def _action_write_bytes(self, *byte_vals: int) -> None:
         """Send raw bytes to the focused pane via `zellij action write`.

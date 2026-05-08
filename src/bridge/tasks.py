@@ -728,9 +728,12 @@ class TaskRegistry:
             parts.append(text)
         parts.extend(voice_segments)
         if other_paths:
+            # Plain paths, one per line — no `- ` bullet prefix. Markdown
+            # bullets confuse zellij's argparse (leading `-` is read as a
+            # flag), and Claude reads paths just as well without them.
             parts.append(
                 "attached files (use the Read tool to view):\n"
-                + "\n".join(f"- {p}" for p in other_paths)
+                + "\n".join(str(p) for p in other_paths)
             )
         combined = "\n\n".join(parts)
 
