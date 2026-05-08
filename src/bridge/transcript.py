@@ -23,6 +23,64 @@ def read_entries(path: Path) -> Iterator[dict]:
         return
 
 
+def find_latest_unresolved_tool_use(path: Path) -> dict | None:
+    """Return the latest tool_use block from the most recent assistant entry whose id has
+    no matching tool_result block in subsequent user entries. Returns None if no such block.
+
+    Returned dict shape: {"id": str, "name": str, "input": dict}.
+    """
+    entries = list(read_entries(path))
+
+    # Collect tool_use ids that have been resolved.
+    resolved: set[str] = set()
+    for e in entries:
+        if e.get("type") != "user":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tu_id = block.get("tool_use_id")
+                if isinstance(tu_id, str):
+                    resolved.add(tu_id)
+
+    # Walk assistant entries newest-first; return the first unresolved tool_use we find.
+    for e in reversed(entries):
+        if e.get("type") != "assistant":
+            continue
+        if e.get("isSidechain") is True or e.get("isMeta") is True:
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        # Within one assistant entry, walk tool_use blocks newest-last (last in array).
+        # The latest unresolved one is the prompt.
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use":
+                continue
+            tid = block.get("id")
+            if not isinstance(tid, str):
+                continue
+            if tid in resolved:
+                continue
+            return {
+                "id": tid,
+                "name": block.get("name", ""),
+                "input": block.get("input") or {},
+            }
+
+    return None
+
+
 def extract_final_assistant_text(path: Path) -> str:
     """Return the concatenated text of all assistant entries since the last user prompt.
 

@@ -3,7 +3,7 @@
 from pathlib import Path
 import json
 
-from bridge.transcript import read_entries, extract_final_assistant_text
+from bridge.transcript import read_entries, extract_final_assistant_text, find_latest_unresolved_tool_use
 
 
 class TestReadEntries:
@@ -536,3 +536,311 @@ class TestExtractFinalAssistantText:
         # The parts join with newline, but the final .strip() removes leading/trailing space of the joined result
         assert not result.startswith(" ")
         assert not result.endswith(" ")
+
+
+class TestFindLatestUnresolvedToolUse:
+    """Tests for find_latest_unresolved_tool_use function."""
+
+    def test_returns_none_for_empty_transcript(self, tmp_path: Path) -> None:
+        """Empty transcript returns None."""
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text("")
+        assert find_latest_unresolved_tool_use(transcript) is None
+
+    def test_returns_none_for_nonexistent_file(self, tmp_path: Path) -> None:
+        """Nonexistent file returns None without raising."""
+        transcript = tmp_path / "nonexistent.jsonl"
+        assert find_latest_unresolved_tool_use(transcript) is None
+
+    def test_returns_unresolved_ask_user_question(self, tmp_path: Path) -> None:
+        """Returns latest unresolved AskUserQuestion tool_use."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "AskUserQuestion",
+                            "input": {
+                                "questions": [
+                                    {
+                                        "question": "Which approach?",
+                                        "options": [
+                                            {"label": "A", "description": "Option A"},
+                                            {"label": "B", "description": "Option B"},
+                                        ],
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            }
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is not None
+        assert result["id"] == "toolu_123"
+        assert result["name"] == "AskUserQuestion"
+        assert "questions" in result["input"]
+
+    def test_returns_none_if_tool_use_resolved(self, tmp_path: Path) -> None:
+        """Returns None if the tool_use has been resolved in a user entry."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "AskUserQuestion",
+                            "input": {"questions": []},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "user selected option 1",
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is None
+
+    def test_returns_latest_unresolved_from_newest_assistant(self, tmp_path: Path) -> None:
+        """Returns latest unresolved tool_use from the most recent assistant entry."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_old",
+                            "name": "Bash",
+                            "input": {},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_old",
+                            "content": "done",
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_new",
+                            "name": "ExitPlanMode",
+                            "input": {"plan": "## Step 1\n## Step 2"},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is not None
+        assert result["id"] == "toolu_new"
+        assert result["name"] == "ExitPlanMode"
+
+    def test_skips_sidechain_assistant_entries(self, tmp_path: Path) -> None:
+        """Skips sidechain assistant entries when searching."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real",
+                            "name": "AskUserQuestion",
+                            "input": {},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_sidechain",
+                            "name": "Bash",
+                            "input": {},
+                        }
+                    ],
+                },
+                "isSidechain": True,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is not None
+        assert result["id"] == "toolu_real"
+
+    def test_skips_meta_assistant_entries(self, tmp_path: Path) -> None:
+        """Skips meta assistant entries when searching."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real",
+                            "name": "AskUserQuestion",
+                            "input": {},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_meta",
+                            "name": "Bash",
+                            "input": {},
+                        }
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": True,
+            },
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is not None
+        assert result["id"] == "toolu_real"
+
+    def test_returns_none_if_only_text_blocks(self, tmp_path: Path) -> None:
+        """Returns None if there are no tool_use blocks."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Just some text"}
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            }
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is None
+
+    def test_returns_last_tool_use_in_assistant_entry(self, tmp_path: Path) -> None:
+        """Returns the last (most recent) tool_use within an assistant entry."""
+        transcript = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_first",
+                            "name": "Bash",
+                            "input": {},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_last",
+                            "name": "AskUserQuestion",
+                            "input": {},
+                        },
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            }
+        ]
+        with open(transcript, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        result = find_latest_unresolved_tool_use(transcript)
+        assert result is not None
+        assert result["id"] == "toolu_last"
