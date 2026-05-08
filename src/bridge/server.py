@@ -359,13 +359,23 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     Opens the database for session persistence and instantiates ThreadRegistry.
     """
     listener = Listener()
-    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=listener.deliver)
-    conn = await state.open_db()
-    registry = ThreadRegistry(bot, conn)
     zellij = ZellijManager()
     await zellij.ensure_session_alive()
+
+    # Forward-declare task_registry for the dispatcher closure
+    task_registry: TaskRegistry
+
+    async def _dispatch_message(msg):
+        """Dispatch incoming messages: check task threads first, then fall back to listener."""
+        if await task_registry.maybe_route_message(msg):
+            return
+        await listener.deliver(msg)
+
+    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message)
+    conn = await state.open_db()
     task_registry = TaskRegistry(conn, bot, zellij)
     await task_registry.load_from_db()
+    registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = listener

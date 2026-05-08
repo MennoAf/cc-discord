@@ -1,5 +1,7 @@
 """Task and TaskRegistry for managing discord-driven sessions."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
 
@@ -233,6 +236,34 @@ class TaskRegistry:
         await self._index(task)
 
         return task
+
+    async def maybe_route_message(self, msg: MessageLike) -> bool:
+        """If msg is in a task-bound thread, write to its zellij pane and return True.
+        Otherwise return False so the caller falls through to the existing /v1/ask listener.
+        """
+        thread_id = msg.channel.id
+        task = self.get_by_thread_id(thread_id)
+        if task is None:
+            return False
+        if task.zellij_pane_id is None:
+            # Task is mid-spawn; treat as no-op so the message goes to the /v1/ask listener
+            # (which will also drop it; net effect: silent ignore — fine).
+            return False
+        if task.status not in ("running", "spawning"):
+            # task is stopped/crashed — silent ignore per AC3.6 spirit
+            return True
+        text = msg.content or ""
+        if not text.strip():
+            # Discord empty message (likely image-only). Phase 3 doesn't relay images;
+            # surface "(image attachment)" placeholder if attachments exist, else swallow.
+            if msg.attachments:
+                text = "(image attached — image relay not yet supported)"
+            else:
+                return True  # consumed silently
+        await self._zellij.write_to_pane(task.zellij_pane_id, text + "\n")
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        return True
 
     async def handle_event(self, hook_event_name: str, body: dict) -> None:
         """Dispatch event to appropriate handler by name."""

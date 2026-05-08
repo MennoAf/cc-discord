@@ -55,10 +55,16 @@ class FakeBot:
         self._create_thread_calls: list[dict] = []
         self._next_thread_id = 2000
         self._thread_alive_map: dict[int, bool] = {}
+        self._client = None  # Stub for commands.py compatibility
 
     @property
     def channel_id(self) -> int:
         return self._channel_id
+
+    @property
+    def client(self):
+        """Stub for commands.py compatibility."""
+        return self._client
 
     @property
     def is_ready(self) -> bool:
@@ -1289,3 +1295,123 @@ class TestHookEvent:
         assert resp.status == 500
         body = await resp.json()
         assert body["error"] == "internal"
+
+
+@pytest.mark.asyncio
+class TestDispatcher:
+    """Tests for message dispatcher in serve()."""
+
+    async def test_dispatcher_routes_task_thread_message(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Dispatcher routes task-thread messages to zellij, not listener."""
+        from bridge.state import upsert_task
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            """Mock _run to always return success."""
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        # Create a task in the database
+        task_id = "task-123"
+        thread_id = 5000
+        pane_id = "pane_1"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-abc",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Build dispatcher
+        async def _dispatch_message(msg):
+            if await task_registry.maybe_route_message(msg):
+                return
+            await listener.deliver(msg)
+
+        # Simulate a message in the task thread
+        msg = FakeMsg(
+            author=FakeUser(id=111),
+            channel=FakeChannel(id=thread_id),
+            content="hello"
+        )
+        await _dispatch_message(msg)
+
+        # Verify dispatcher called zellij, not listener
+        assert len(zellij_calls) == 1
+        assert zellij_calls[0]["pane_id"] == pane_id
+        assert "hello" in zellij_calls[0]["text"]
+        assert len(listener_calls) == 0
+
+    async def test_dispatcher_falls_through_to_listener(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Dispatcher falls through to listener for non-task messages."""
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            """Mock _run to always return success."""
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Build dispatcher
+        async def _dispatch_message(msg):
+            if await task_registry.maybe_route_message(msg):
+                return
+            await listener.deliver(msg)
+
+        # Simulate a message in a thread with NO bound task
+        msg = FakeMsg(
+            author=FakeUser(id=222),
+            channel=FakeChannel(id=9999),  # Not a task thread
+            content="ask something"
+        )
+        await _dispatch_message(msg)
+
+        # Verify dispatcher called listener, not zellij
+        assert len(listener_calls) == 1
+        assert listener_calls[0] is msg
+        assert len(zellij_calls) == 0

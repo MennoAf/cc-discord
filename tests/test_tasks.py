@@ -640,3 +640,176 @@ class TestTaskRegistry:
         thread_calls = fake_bot.get_thread_calls()
         assert len(thread_calls) == 1
         # The exception was raised, which is what we're testing
+
+
+@dataclass
+class FakeChannel:
+    """Minimal fake channel for maybe_route_message tests."""
+    id: int
+
+
+@dataclass
+class FakeAuthor:
+    """Minimal fake author for maybe_route_message tests."""
+    id: int
+    bot: bool = False
+
+
+@dataclass
+class FakeAttachment:
+    """Minimal fake attachment for maybe_route_message tests."""
+    url: str = "http://example.com/image.png"
+
+
+@dataclass
+class FakeMsgLike:
+    """Fake message matching MessageLike protocol for routing tests."""
+    channel: FakeChannel
+    content: str = ""
+    attachments: list[FakeAttachment] = field(default_factory=list)
+    author: FakeAuthor = field(default_factory=lambda: FakeAuthor(id=123))
+    created_at: object = field(default_factory=lambda: __import__('datetime').datetime.now(__import__('datetime').timezone.utc))
+
+
+@pytest.mark.asyncio
+class TestMaybeRouteMessage:
+    """Tests for TaskRegistry.maybe_route_message."""
+
+    async def test_maybe_route_message_no_task_returns_false(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """maybe_route_message returns False when no task is bound to the thread."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        msg = FakeMsgLike(channel=FakeChannel(id=999))
+        result = await registry.maybe_route_message(msg)
+        assert result is False
+
+    async def test_maybe_route_message_no_pane_id_returns_false(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """maybe_route_message returns False when task.zellij_pane_id is None."""
+        # Create a task with no pane_id
+        task_id = "task-xyz"
+        thread_id = 5000
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "spawning",
+            zellij_pane_id=None,
+            current_claude_session_id=None,
+            current_transcript_path=None,
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        msg = FakeMsgLike(channel=FakeChannel(id=thread_id))
+        result = await registry.maybe_route_message(msg)
+        assert result is False
+
+    async def test_maybe_route_message_writes_to_pane(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """maybe_route_message calls zellij.write_to_pane and returns True for a bound task."""
+        task_id = "task-abc"
+        thread_id = 6000
+        pane_id = "pane_1"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-123",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Track write_to_pane calls
+        write_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        msg = FakeMsgLike(channel=FakeChannel(id=thread_id), content="hello world")
+        result = await registry.maybe_route_message(msg)
+
+        assert result is True
+        assert len(write_calls) == 1
+        assert write_calls[0]["pane_id"] == pane_id
+        assert write_calls[0]["text"] == "hello world\n"
+
+    async def test_maybe_route_message_empty_content_no_attachments_returns_true(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """maybe_route_message returns True silently for empty message with no attachments."""
+        task_id = "task-def"
+        thread_id = 7000
+        pane_id = "pane_2"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-456",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        # Empty message, no attachments
+        msg = FakeMsgLike(channel=FakeChannel(id=thread_id), content="")
+        result = await registry.maybe_route_message(msg)
+
+        assert result is True
+        assert len(write_calls) == 0  # No write to pane
+
+    async def test_maybe_route_message_image_placeholder(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """maybe_route_message writes placeholder for message with attachments but no content."""
+        task_id = "task-ghi"
+        thread_id = 8000
+        pane_id = "pane_3"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-789",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        # Empty content but with attachment
+        msg = FakeMsgLike(
+            channel=FakeChannel(id=thread_id),
+            content="",
+            attachments=[FakeAttachment(url="http://example.com/image.png")]
+        )
+        result = await registry.maybe_route_message(msg)
+
+        assert result is True
+        assert len(write_calls) == 1
+        assert "(image attached — image relay not yet supported)" in write_calls[0]["text"]
+
