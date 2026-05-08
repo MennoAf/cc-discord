@@ -13,7 +13,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from bridge import tool_summary
+from bridge import tool_summary, transcript
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
@@ -522,7 +522,7 @@ class TaskRegistry:
         self._agg_for(task).append(line)
 
     async def _on_stop(self, body: dict) -> None:
-        """Handle Stop event. Stop typing indicator and flush tool summaries."""
+        """Handle Stop event. Stop typing indicator, flush tool summaries, and post final assistant turn."""
         session_id = body.get("session_id")
         if not session_id:
             return
@@ -533,10 +533,20 @@ class TaskRegistry:
         await self._persist(task)
         await self._stop_typing(task.task_id)
 
-        # Flush pending tool summaries
+        # Flush pending tool summaries first
         agg = self._aggregators.get(task.task_id)
         if agg is not None:
             await agg.flush_now()
+
+        # Read transcript and post the final assistant turn
+        transcript_path = body.get("transcript_path") or task.current_transcript_path
+        if transcript_path:
+            text = transcript.extract_final_assistant_text(Path(transcript_path))
+            if text:
+                try:
+                    await self._bot.post(text, thread_id=task.thread_id)
+                except Exception:
+                    logger.exception("failed to post final assistant turn for task %s", task.task_id)
 
     async def _on_notification(self, body: dict) -> None:
         """Handle Notification event. Stop typing indicator."""

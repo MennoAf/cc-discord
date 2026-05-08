@@ -1724,3 +1724,247 @@ class TestTaskRegistryPhase3:
 
         # Reset
         _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
+
+    async def test_on_stop_posts_final_assistant_turn(self, in_memory_db, tmp_path) -> None:
+        """_on_stop extracts and posts the final assistant turn from the transcript."""
+        import json
+
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        # Create a temporary transcript file
+        transcript_path = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hi"},
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Hello there"},
+                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                    ],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "All done"}],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            current_transcript_path=str(transcript_path),
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Call Stop with transcript_path in body
+        await registry._on_stop({
+            "session_id": "sess-abc",
+            "transcript_path": str(transcript_path),
+        })
+
+        # Verify the final assistant turn was posted
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        content = posts[0]["content"]
+        assert "Hello there" in content
+        assert "All done" in content
+
+    async def test_on_stop_does_not_post_empty_transcript(self, in_memory_db, tmp_path) -> None:
+        """_on_stop does not post when transcript has no assistant text."""
+        import json
+
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        # Create a transcript with only a user prompt (no assistant response)
+        transcript_path = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hi"},
+                "isSidechain": False,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Call Stop with transcript_path
+        await registry._on_stop({
+            "session_id": "sess-abc",
+            "transcript_path": str(transcript_path),
+        })
+
+        # Verify no post was made (only empty content is skipped)
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_on_stop_flushes_before_final_post(self, in_memory_db, tmp_path) -> None:
+        """_on_stop flushes tool summaries before posting the final turn."""
+        import json
+
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        # Create a transcript with final assistant text
+        transcript_path = tmp_path / "transcript.jsonl"
+        entries = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "run test"},
+                "isSidechain": False,
+                "isMeta": False,
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Final response"}],
+                },
+                "isSidechain": False,
+                "isMeta": False,
+            },
+        ]
+        with open(transcript_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            current_transcript_path=str(transcript_path),
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        _ToolSummaryAggregator.FLUSH_WINDOW = 10.0  # Very long window
+        await registry.load_from_db()
+
+        # Add a tool summary (with a long flush window, it won't auto-flush)
+        await registry._on_post_tool_use({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        agg = registry._aggregators["task-123"]
+        assert len(agg._lines) == 1  # Pending
+
+        # Call Stop
+        await registry._on_stop({
+            "session_id": "sess-abc",
+            "transcript_path": str(transcript_path),
+        })
+
+        # Verify both posts happened: tool summary first, then final turn
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 2
+        # First post should be the tool summary
+        assert "pytest" in posts[0]["content"]
+        # Second post should be the final assistant turn
+        assert "Final response" in posts[1]["content"]
+
+        # Reset
+        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
+
+    async def test_on_stop_handles_missing_transcript_path(self, in_memory_db) -> None:
+        """_on_stop does not crash if transcript_path is missing."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Call Stop without transcript_path
+        await registry._on_stop({"session_id": "sess-abc"})
+
+        # Should not crash and should not post
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_on_stop_handles_nonexistent_transcript(self, in_memory_db) -> None:
+        """_on_stop does not crash if the transcript file doesn't exist."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Call Stop with a nonexistent file path
+        await registry._on_stop({
+            "session_id": "sess-abc",
+            "transcript_path": "/nonexistent/transcript.jsonl",
+        })
+
+        # Should not crash and should not post
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
