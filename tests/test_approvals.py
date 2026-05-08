@@ -309,3 +309,100 @@ async def test_approval_router_concurrent_approvals(tmp_path):
     assert second_result[1] == "deny"  # decision
 
     await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_resolve_by_text_returns_false_on_empty_input(tmp_path):
+    """resolve_by_text returns False and doesn't resolve pending approval on empty/whitespace input."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-8", 1008, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, timeout=0.5)
+
+    async def spawn_request():
+        """Spawn the pending request and keep it alive briefly."""
+        # Start the request in a task so it doesn't block
+        task = asyncio.create_task(
+            router.request_permission(
+                request_id="req-8",
+                task_id="task-8",
+                thread_id=1008,
+                tool_name="Bash",
+                tool_input={"cmd": "ls"},
+            )
+        )
+        # Give it time to post
+        await asyncio.sleep(0.05)
+        return task
+
+    request_task = await spawn_request()
+
+    # Test empty string
+    result = await router.resolve_by_text(1008, "", author_is_bot=False)
+    assert result is False
+
+    # Test whitespace-only string
+    result = await router.resolve_by_text(1008, "   \n   ", author_is_bot=False)
+    assert result is False
+
+    # Verify the pending approval is still there (not resolved)
+    pending_list = list(router._by_request_id.values())
+    assert len(pending_list) == 1
+    assert not pending_list[0].future.done()
+
+    # Clean up: cancel the request task
+    request_task.cancel()
+    try:
+        await request_task
+    except asyncio.CancelledError:
+        pass
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_permission_add_reactions_failure(tmp_path):
+    """request_permission returns ('deny', 'failed to add approval reactions...') when add_reactions raises."""
+    from bridge.approvals import ApprovalRouter
+    from tests.fakes import FakeBot
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    # Extend FakeBot to raise on add_reactions
+    async def failing_add_reactions(*args: any, **kwargs: any) -> None:
+        raise RuntimeError("Bot permissions missing for add_reactions")
+
+    bot.add_reactions = failing_add_reactions
+
+    await state.upsert_task(conn, "task-9", 1009, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, timeout=10.0)
+
+    decision, reason = await router.request_permission(
+        request_id="req-9",
+        task_id="task-9",
+        thread_id=1009,
+        tool_name="Bash",
+        tool_input={"cmd": "ls"},
+    )
+
+    # Verify it returns deny with the expected reason
+    assert decision == "deny"
+    assert "failed to add approval reactions" in reason
+
+    # Verify request_id is no longer in the router's request dict
+    assert "req-9" not in router._by_request_id
+
+    # Verify message_id is no longer in the router's message dict
+    # (Since the add_reactions failed, we can't reliably check what message_id was posted,
+    # but we can verify the dict is cleaned up)
+    assert len(router._by_message_id) == 0
+
+    await state.close_db(conn)
