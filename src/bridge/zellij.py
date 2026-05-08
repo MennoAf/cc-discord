@@ -201,6 +201,21 @@ class ZellijManager:
         if rc != 0:
             raise ZellijError(f"write {byte_vals!r} failed: {stderr}")
 
+    async def send_keys(self, pane_id: str, *byte_vals: int) -> None:
+        """Focus the named tab and dispatch the given raw byte values to it
+        in a single `action write` call. Used for sending control keys like
+        Tab (9), Enter (13), or hot-key digits to TUI prompts.
+        """
+        async with self._session_lock:
+            rc, _, stderr = await self._run_unlocked(
+                self._executable, "--session", SESSION_NAME,
+                "action", "go-to-tab-name", pane_id,
+                timeout=3.0,
+            )
+            if rc != 0:
+                raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")
+            await self._action_write_bytes(*byte_vals)
+
     async def close_pane(self, pane_id: str) -> None:
         """Close the task tab named `pane_id`. Best-effort: idempotent on
         missing tab, swallows timeouts/errors so callers (e.g. /kill) can

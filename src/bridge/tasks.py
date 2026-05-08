@@ -1617,9 +1617,17 @@ class TaskRegistry:
 
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
         """Handle AskUserQuestion prompt: post each question to Discord with
-        option reactions, in sequence. AskUserQuestion can bundle multiple
-        questions in one tool call — we present them one at a time, type the
-        answer into the pane after each so claude's TUI advances to the next.
+        option reactions, in sequence.
+
+        Single-select: numeric reactions resolve immediately to the selected
+        option's number, which is typed into the pane (Enter advances).
+
+        Multi-select: numeric reactions toggle freely; ✅ confirms. The bridge
+        types each toggled option's digit into the pane (TUI hot-keys toggle),
+        then sends Tab (byte 9) to advance to the next question.
+
+        After all questions are answered, claude's TUI shows a final submit
+        screen — the bridge sends Enter (byte 13) to confirm the whole batch.
         """
         if not self._approval_router:
             logger.warning(
@@ -1632,16 +1640,20 @@ class TaskRegistry:
             return await self._handle_free_text_stall(task)
 
         total = len(questions)
+        any_answered = False
         for idx, q in enumerate(questions, start=1):
             options = [opt.get("label", "") for opt in (q.get("options") or [])]
             if not options:
-                # Question without options → fall back to free-text for this
-                # one, then continue on to the next.
                 await self._handle_free_text_stall(task)
                 continue
 
+            is_multi = bool(q.get("multiSelect"))
             counter = f" ({idx}/{total})" if total > 1 else ""
             lines = [f"❓ **{q.get('question', '?')}**{counter}"]
+            if is_multi:
+                lines.append(
+                    "_(multi-select: tap each option you want, then ✅ to submit)_"
+                )
             for i, opt in enumerate(q.get("options") or [], start=1):
                 emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"][i - 1] if i <= 4 else f"{i}."
                 label = opt.get("label", "")
@@ -1658,19 +1670,53 @@ class TaskRegistry:
                 task_id=task.task_id,
                 thread_id=task.thread_id,
                 pane_id=task.zellij_pane_id or "",
-                kind="ask_question",
+                kind="multi_select" if is_multi else "ask_question",
                 prompt_body=body,
                 options=options,
             )
-            await self._inject_to_pane(task, answer, source)
             if source in ("cancelled", "timeout", "post_failed"):
                 # User answered in zellij or it failed; stop dispatching the
-                # remaining questions to Discord (claude is already moving on
-                # via the user's TUI input or the failure).
+                # remaining questions and don't send the final submit Enter
+                # (claude is already moving on or stalled).
                 return
-            # Brief pause so claude's TUI has time to advance to the next
-            # question's prompt before we post Q+1 to Discord.
+
+            if not task.zellij_pane_id:
+                return
+
+            if is_multi:
+                # answer is list[int] of 0-based selected indices.
+                if not isinstance(answer, list):
+                    return
+                # Type each toggle digit (TUI hot-keys), then Tab to advance.
+                key_bytes: list[int] = []
+                for sel in answer:
+                    key_bytes.append(ord(str(sel + 1)))
+                key_bytes.append(9)  # Tab
+                try:
+                    await self._zellij.send_keys(task.zellij_pane_id, *key_bytes)
+                except Exception:
+                    logger.exception(
+                        "failed to type multi-select keys for task %s", task.task_id
+                    )
+            else:
+                # Single-select: existing flow types `answer + "\n"` which
+                # selects + advances.
+                await self._inject_to_pane(task, answer, source)
+
+            any_answered = True
+            # Brief pause so claude's TUI has time to advance before we post
+            # the next prompt (or the final Enter).
             await asyncio.sleep(0.5)
+
+        # After the last question, the TUI shows a "submit" screen — Enter
+        # confirms and lets the AskUserQuestion tool return.
+        if any_answered and task.zellij_pane_id:
+            try:
+                await self._zellij.send_keys(task.zellij_pane_id, 13)
+            except Exception:
+                logger.exception(
+                    "failed to send final submit Enter for task %s", task.task_id
+                )
 
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
         """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""

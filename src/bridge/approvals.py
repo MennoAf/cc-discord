@@ -291,6 +291,10 @@ class ApprovalRouter:
                     n = min(len(options), 4)
                     emojis = list(_NUMERIC_REACTIONS.keys())[:n]
                     await self._bot.add_reactions(pending.message_id, thread_id, emojis)
+                elif kind == "multi_select" and options:
+                    n = min(len(options), 4)
+                    emojis = list(_NUMERIC_REACTIONS.keys())[:n] + ["✅"]
+                    await self._bot.add_reactions(pending.message_id, thread_id, emojis)
                 elif kind == "exit_plan":
                     # Two reactions only. Users who want to leave feedback type a thread
                     # reply directly — text replies always resolve via `resolve_tui_by_text`.
@@ -351,7 +355,43 @@ class ApprovalRouter:
             # _PLAN_REACTIONS maps ✅→1 and ❌→2.
             pending.future.set_result((answer, "reaction"))
             return True
+
+        if pending.kind == "multi_select":
+            # Numeric reactions toggle freely; we only resolve on the ✅
+            # confirm. At submit time we re-fetch the message and read the
+            # current set of non-bot reactions to determine what's selected.
+            if emoji != "✅":
+                return False
+            try:
+                indices = await self._fetch_selected_indices(pending)
+            except Exception:
+                logger.exception("failed to fetch multi-select reactions")
+                indices = []
+            pending.future.set_result((indices, "reaction"))
+            return True
         return False
+
+    async def _fetch_selected_indices(self, pending: "_PendingTuiAnswer") -> list[int]:
+        """Re-fetch the prompt message and return option indices (0-based)
+        that have at least one non-bot reaction. Used by multi_select on ✅.
+        """
+        if not self._bot or pending.message_id is None:
+            return []
+        bot_user = self._bot.client.user if self._bot.client else None
+        bot_user_id = bot_user.id if bot_user else None
+        target = await self._bot.fetch_messageable(pending.thread_id)
+        msg = await target.fetch_message(pending.message_id)
+        selected: set[int] = set()
+        for r in msg.reactions:
+            emoji = str(r.emoji)
+            idx = _NUMERIC_REACTIONS.get(emoji)
+            if idx is None or idx >= len(pending.options):
+                continue
+            async for user in r.users():
+                if user.id != bot_user_id:
+                    selected.add(idx)
+                    break
+        return sorted(selected)
 
     async def resolve_tui_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
         if author_is_bot:
