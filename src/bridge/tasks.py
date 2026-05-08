@@ -1468,8 +1468,12 @@ class TaskRegistry:
             await agg.flush_now()
 
         transcript_path = body.get("transcript_path") or task.current_transcript_path
+        logger.info(
+            "Notification: session=%s transcript=%s",
+            session_id[:8] if session_id else "?",
+            transcript_path,
+        )
         if not transcript_path:
-            # Generic stall — spawn handler task
             handler_task = asyncio.create_task(
                 self._handle_free_text_stall(task),
                 name=f"tui-free_text-{task.task_id[:8]}",
@@ -1477,7 +1481,18 @@ class TaskRegistry:
             self._track_tui_handler_task(task.task_id, handler_task)
             return
 
-        pending = transcript.find_latest_unresolved_tool_use(Path(transcript_path))
+        # Walk the main transcript first; if nothing pending, also walk
+        # subagent files for this session — AskUserQuestion / ExitPlanMode
+        # in modern CC live in `<session>/subagents/agent-*.jsonl` for
+        # subagent-driven prompts.
+        main_path = Path(transcript_path)
+        pending = transcript.find_latest_unresolved_tool_use(main_path)
+        if pending is None:
+            pending = self._find_unresolved_tool_use_in_subagents(main_path)
+        logger.info(
+            "Notification: pending=%s",
+            pending["name"] if pending else None,
+        )
 
         if pending and pending["name"] == "AskUserQuestion":
             handler_task = asyncio.create_task(
@@ -1492,12 +1507,37 @@ class TaskRegistry:
             )
             self._track_tui_handler_task(task.task_id, handler_task)
         else:
-            # Generic free-text stall
             handler_task = asyncio.create_task(
                 self._handle_free_text_stall(task),
                 name=f"tui-free_text-{task.task_id[:8]}",
             )
             self._track_tui_handler_task(task.task_id, handler_task)
+
+    def _find_unresolved_tool_use_in_subagents(
+        self, main_transcript_path: Path
+    ) -> dict | None:
+        """Scan `<session>/subagents/agent-*.jsonl` (most-recently-modified
+        first) and return the latest unresolved tool_use found. Mirrors the
+        shape of `transcript.find_latest_unresolved_tool_use`."""
+        subagents_dir = main_transcript_path.parent / main_transcript_path.stem / "subagents"
+        if not subagents_dir.is_dir():
+            return None
+        try:
+            files = sorted(
+                subagents_dir.glob("agent-*.jsonl"),
+                key=lambda f: -f.stat().st_mtime,
+            )
+        except OSError:
+            return None
+        for f in files:
+            try:
+                pending = transcript.find_latest_unresolved_tool_use(f)
+            except Exception:
+                logger.exception("subagent unresolved scan failed for %s", f)
+                continue
+            if pending is not None:
+                return pending
+        return None
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
