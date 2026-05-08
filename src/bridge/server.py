@@ -418,6 +418,9 @@ def make_message_dispatcher(
         # First, try to resolve any pending approval via text reply
         if await approval_router.resolve_by_text(msg.channel.id, msg.content or "", msg.author.bot):
             return
+        # Then, try to resolve any pending TUI answer via text reply
+        if await approval_router.resolve_tui_by_text(msg.channel.id, msg.content or "", msg.author.bot):
+            return
         # Then, check task threads for tool output routing
         if await task_registry.maybe_route_message(msg):
             return
@@ -460,9 +463,13 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
 
     async def _on_reaction_dispatch(payload):
-        """Dispatch raw reaction events to the approval router."""
+        """Dispatch raw reaction events to approval and TUI resolvers."""
         user_is_self_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
-        await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
+        # Try approval reactions first
+        if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
+            return
+        # Then try TUI reactions
+        await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
 

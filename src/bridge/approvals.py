@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiosqlite
@@ -24,6 +24,25 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_APPROVAL_TIMEOUT = 600.0  # seconds
+
+TUI_DEFAULT_TIMEOUT = 600.0
+
+
+_NUMERIC_REACTIONS = {
+    "1️⃣": 0,
+    "2️⃣": 1,
+    "3️⃣": 2,
+    "4️⃣": 3,
+}
+
+_PLAN_REACTIONS = {
+    "✅": ("approve", "approve plan via reaction"),
+    "❌": ("reject", "reject plan via reaction"),
+    # 💬 has no entry — the user is expected to type their feedback as a thread reply,
+    # which `resolve_tui_by_text` already handles. Adding 💬 to the reaction set would
+    # introduce dead state (an "awaiting comment" flag with no semantic difference from
+    # the default behavior, since text replies always resolve).
+}
 
 # Reaction emoji -> decision
 _REACTION_DECISIONS = {
@@ -44,6 +63,19 @@ class _PendingApproval:
     message_id: int | None = None  # Discord message id; set after we post the prompt
 
 
+@dataclass
+class _PendingTuiAnswer:
+    request_id: str
+    task_id: str
+    thread_id: int
+    pane_id: str
+    kind: str  # "ask_question" | "exit_plan" | "free_text"
+    options: list[str]  # [] for free_text and exit_plan; option labels for ask_question
+    future: asyncio.Future  # resolves to (answer_text: str, source: "reaction"|"reply"|"zellij")
+    message_id: int | None = None
+    created_at: float = field(default_factory=time.time)
+
+
 class ApprovalRouter:
     def __init__(
         self,
@@ -51,12 +83,17 @@ class ApprovalRouter:
         conn: aiosqlite.Connection,
         *,
         timeout: float = DEFAULT_APPROVAL_TIMEOUT,
+        tui_timeout: float = TUI_DEFAULT_TIMEOUT,
     ) -> None:
         self._bot = bot
         self._conn = conn
         self._timeout = timeout
+        self._tui_timeout = tui_timeout
         self._by_request_id: dict[str, _PendingApproval] = {}
         self._by_message_id: dict[int, _PendingApproval] = {}
+        self._tui_pending: dict[str, _PendingTuiAnswer] = {}
+        self._tui_by_message_id: dict[int, _PendingTuiAnswer] = {}
+        self._tui_by_thread_id: dict[int, list[_PendingTuiAnswer]] = {}
         self._lock = asyncio.Lock()
 
     async def request_permission(
@@ -199,6 +236,157 @@ class ApprovalRouter:
             s = s[:1500] + "\n  ...(truncated)..."
         body += s + "\n```"
         return body
+
+    async def request_tui_answer(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        thread_id: int,
+        pane_id: str,
+        kind: str,
+        prompt_body: str,
+        options: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        """Post the prompt, await user response, return (answer_text_to_inject, source).
+
+        Returns ("", "cancelled") if the future is cancelled (e.g., user answered in zellij).
+        """
+        if timeout is None:
+            timeout = self._tui_timeout
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        pending = _PendingTuiAnswer(
+            request_id=request_id,
+            task_id=task_id,
+            thread_id=thread_id,
+            pane_id=pane_id,
+            kind=kind,
+            options=options or [],
+            future=fut,
+        )
+
+        async with self._lock:
+            self._tui_pending[request_id] = pending
+            self._tui_by_thread_id.setdefault(thread_id, []).append(pending)
+
+        try:
+            message_ids = await self._bot.post(prompt_body, thread_id=thread_id)
+            if message_ids:
+                pending.message_id = message_ids[0]
+                async with self._lock:
+                    self._tui_by_message_id[pending.message_id] = pending
+                if kind == "ask_question" and options:
+                    n = min(len(options), 4)
+                    emojis = list(_NUMERIC_REACTIONS.keys())[:n]
+                    await self._bot.add_reactions(pending.message_id, thread_id, emojis)
+                elif kind == "exit_plan":
+                    # Two reactions only. Users who want to leave feedback type a thread
+                    # reply directly — text replies always resolve via `resolve_tui_by_text`.
+                    await self._bot.add_reactions(pending.message_id, thread_id, ["✅", "❌"])
+                # free_text: no reactions
+        except Exception:
+            logger.exception("failed to post tui prompt")
+            await self._cleanup_tui(request_id)
+            return ("", "post_failed")
+
+        try:
+            answer, source = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            answer, source = ("", "timeout")
+            try:
+                await self._bot.post("⏱ TUI prompt timed out", thread_id=thread_id)
+            except Exception:
+                logger.exception("failed to post timeout notice")
+        except asyncio.CancelledError:
+            answer, source = ("", "cancelled")
+            try:
+                await self._bot.post("(Answered in zellij)", thread_id=thread_id)
+            except Exception:
+                logger.exception("failed to post cancel notice")
+        finally:
+            await self._cleanup_tui(request_id)
+
+        return (answer, source)
+
+    async def resolve_tui_by_reaction(self, message_id: int, emoji: str, user_is_bot: bool) -> bool:
+        if user_is_bot:
+            return False
+        async with self._lock:
+            pending = self._tui_by_message_id.get(message_id)
+            if pending is None:
+                return False
+        if pending.future.done():
+            return False
+
+        if pending.kind == "ask_question":
+            if emoji not in _NUMERIC_REACTIONS:
+                return False
+            idx = _NUMERIC_REACTIONS[emoji]
+            if idx >= len(pending.options):
+                return False
+            # Inject the option's *number* (1-indexed) — Claude's AskUserQuestion TUI accepts
+            # the index. This is the simplest interop; the alternative (typing the label text)
+            # depends on how the TUI is currently parsing user input.
+            pending.future.set_result((str(idx + 1), "reaction"))
+            return True
+
+        if pending.kind == "exit_plan":
+            if emoji not in _PLAN_REACTIONS:
+                return False
+            answer, _reason = _PLAN_REACTIONS[emoji]
+            if answer == "approve":
+                # ExitPlanMode in TUI is typically resolved via choosing "Yes, proceed" — we
+                # inject "1" (the first option) per Claude Code's convention. Verify the
+                # injection mapping during smoke. If "1" doesn't work, fall back to the
+                # literal label "Yes, proceed" via write-chars.
+                pending.future.set_result(("1", "reaction"))
+                return True
+            if answer == "reject":
+                pending.future.set_result(("2", "reaction"))
+                return True
+        return False
+
+    async def resolve_tui_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
+        if author_is_bot:
+            return False
+        async with self._lock:
+            pendings = self._tui_by_thread_id.get(thread_id, [])
+            candidates = [p for p in pendings if not p.future.done()]
+        if not candidates:
+            return False
+        # Most recently created wins
+        pending = max(candidates, key=lambda p: p.created_at)
+        # For exit_plan we always treat text as the comment body.
+        # For ask_question we treat text as the typed answer (could be a number or a free-form
+        # answer; inject literally — Claude's TUI parses).
+        # For free_text we just inject the text.
+        pending.future.set_result((text.strip(), "reply"))
+        return True
+
+    async def cancel_thread_tui(self, thread_id: int) -> int:
+        """Cancel all pending TUI prompts in this thread (used when zellij UserPromptSubmit
+        fires while a Discord prompt is still pending). Returns count cancelled."""
+        async with self._lock:
+            pendings = self._tui_by_thread_id.get(thread_id, [])
+            to_cancel = [p for p in pendings if not p.future.done()]
+        for p in to_cancel:
+            if not p.future.done():
+                p.future.cancel()
+        return len(to_cancel)
+
+    async def _cleanup_tui(self, request_id: str) -> None:
+        async with self._lock:
+            pending = self._tui_pending.pop(request_id, None)
+            if pending is None:
+                return
+            if pending.message_id is not None:
+                self._tui_by_message_id.pop(pending.message_id, None)
+            tlist = self._tui_by_thread_id.get(pending.thread_id, [])
+            tlist[:] = [p for p in tlist if p.request_id != request_id]
+            if not tlist:
+                self._tui_by_thread_id.pop(pending.thread_id, None)
 
     async def _cleanup(self, request_id: str) -> None:
         async with self._lock:

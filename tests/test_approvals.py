@@ -406,3 +406,282 @@ async def test_request_permission_add_reactions_failure(tmp_path):
     assert len(router._by_message_id) == 0
 
     await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_ask_question_reaction(tmp_path):
+    """request_tui_answer(kind='ask_question') resolves via reaction."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-1", 2001, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    async def trigger_reaction():
+        """Simulate user clicking 1️⃣ after a short delay."""
+        await asyncio.sleep(0.05)
+        pending_list = list(router._tui_pending.values())
+        if pending_list:
+            pending = pending_list[0]
+            if pending.message_id:
+                await router.resolve_tui_by_reaction(pending.message_id, "1️⃣", False)
+
+    task = asyncio.create_task(trigger_reaction())
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-1",
+        task_id="task-1",
+        thread_id=2001,
+        pane_id="pane_1",
+        kind="ask_question",
+        prompt_body="Which option?",
+        options=["A", "B", "C"],
+        timeout=10.0,
+    )
+
+    await task
+    assert answer == "1"
+    assert source == "reaction"
+    assert len(bot.get_post_calls()) > 0
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_exit_plan_approve(tmp_path):
+    """request_tui_answer(kind='exit_plan') resolves via ✅ reaction."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-2", 2002, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    async def trigger_reaction():
+        await asyncio.sleep(0.05)
+        pending_list = list(router._tui_pending.values())
+        if pending_list:
+            pending = pending_list[0]
+            if pending.message_id:
+                await router.resolve_tui_by_reaction(pending.message_id, "✅", False)
+
+    task = asyncio.create_task(trigger_reaction())
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-2",
+        task_id="task-2",
+        thread_id=2002,
+        pane_id="pane_2",
+        kind="exit_plan",
+        prompt_body="Plan ready?",
+        timeout=10.0,
+    )
+
+    await task
+    assert answer == "1"
+    assert source == "reaction"
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_exit_plan_reject(tmp_path):
+    """request_tui_answer(kind='exit_plan') resolves via ❌ reaction."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-3", 2003, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    async def trigger_reaction():
+        await asyncio.sleep(0.05)
+        pending_list = list(router._tui_pending.values())
+        if pending_list:
+            pending = pending_list[0]
+            if pending.message_id:
+                await router.resolve_tui_by_reaction(pending.message_id, "❌", False)
+
+    task = asyncio.create_task(trigger_reaction())
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-3",
+        task_id="task-3",
+        thread_id=2003,
+        pane_id="pane_3",
+        kind="exit_plan",
+        prompt_body="Plan ready?",
+        timeout=10.0,
+    )
+
+    await task
+    assert answer == "2"
+    assert source == "reaction"
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_free_text_reply(tmp_path):
+    """request_tui_answer(kind='free_text') resolves via text reply."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-4", 2004, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    async def trigger_text():
+        await asyncio.sleep(0.05)
+        await router.resolve_tui_by_text(2004, "typed answer", False)
+
+    task = asyncio.create_task(trigger_text())
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-4",
+        task_id="task-4",
+        thread_id=2004,
+        pane_id="pane_4",
+        kind="free_text",
+        prompt_body="Waiting for input...",
+        timeout=10.0,
+    )
+
+    await task
+    assert answer == "typed answer"
+    assert source == "reply"
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_timeout(tmp_path):
+    """request_tui_answer returns ('', 'timeout') after timeout."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-5", 2005, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=0.05)
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-5",
+        task_id="task-5",
+        thread_id=2005,
+        pane_id="pane_5",
+        kind="free_text",
+        prompt_body="Will timeout...",
+        timeout=0.05,
+    )
+
+    assert answer == ""
+    assert source == "timeout"
+    # Verify timeout notice was posted
+    posts = bot.get_post_calls()
+    assert any("timed out" in p.get("content", "") for p in posts)
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_request_tui_answer_cancelled(tmp_path):
+    """request_tui_answer returns ('', 'cancelled') when future is cancelled."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-6", 2006, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    async def cancel_future():
+        await asyncio.sleep(0.05)
+        # Find and cancel the pending future
+        pending_list = list(router._tui_pending.values())
+        if pending_list:
+            pending = pending_list[0]
+            if not pending.future.done():
+                pending.future.cancel()
+
+    task = asyncio.create_task(cancel_future())
+
+    answer, source = await router.request_tui_answer(
+        request_id="req-tui-6",
+        task_id="task-6",
+        thread_id=2006,
+        pane_id="pane_6",
+        kind="free_text",
+        prompt_body="Will be cancelled...",
+        timeout=10.0,
+    )
+
+    await task
+    assert answer == ""
+    assert source == "cancelled"
+    # Verify cancellation notice was posted
+    posts = bot.get_post_calls()
+    assert any("Answered in zellij" in p.get("content", "") for p in posts)
+
+    await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_cancel_thread_tui(tmp_path):
+    """cancel_thread_tui cancels all pending TUI prompts in a thread."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeBot()
+
+    await state.upsert_task(conn, "task-7", 2007, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, tui_timeout=10.0)
+
+    # Start two concurrent TUI requests
+    async def create_request(req_id: str):
+        answer, source = await router.request_tui_answer(
+            request_id=req_id,
+            task_id="task-7",
+            thread_id=2007,
+            pane_id="pane_7",
+            kind="free_text",
+            prompt_body="Waiting...",
+            timeout=10.0,
+        )
+        return answer, source
+
+    task1 = asyncio.create_task(create_request("req-tui-7a"))
+    task2 = asyncio.create_task(create_request("req-tui-7b"))
+
+    # Let them register
+    await asyncio.sleep(0.1)
+
+    # Cancel all in the thread
+    count = await router.cancel_thread_tui(2007)
+    assert count == 2
+
+    # Verify both get cancelled
+    results = await asyncio.gather(task1, task2)
+    assert results[0] == ("", "cancelled")
+    assert results[1] == ("", "cancelled")
+
+    await state.close_db(conn)
