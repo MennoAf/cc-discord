@@ -1009,6 +1009,10 @@ class TestTaskRegistry:
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db(reconcile_with_zellij=True)
 
+        # Notices are deferred until bot is ready; flush them now.
+        assert fake_bot.get_post_calls() == []
+        await registry.flush_startup_notices()
+
         # Task should be loaded and in memory
         task = registry.get_by_task_id("task-123")
         assert task is not None
@@ -1044,6 +1048,11 @@ class TestTaskRegistry:
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db(reconcile_with_zellij=True)
+
+        # Notices and archive are deferred until bot is ready; flush them now.
+        assert fake_bot.get_post_calls() == []
+        assert fake_bot.get_archive_calls() == []
+        await registry.flush_startup_notices()
 
         # Task should be loaded but marked crashed
         task = registry.get_by_task_id("task-123")
@@ -1141,6 +1150,61 @@ class TestTaskRegistry:
         task = registry.get_by_task_id("task-123")
         assert task is not None
         assert task.status == "running"  # Not crashed
+
+    async def test_load_from_db_does_not_touch_bot_when_unset(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """Reconciliation must not call self._bot during load_from_db — at server
+        startup the registry is constructed with bot=None and only wired up after
+        the bot logs in. flush_startup_notices() drains the queue once bot is set.
+        """
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-live",
+            900,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-live",
+            now=now,
+        )
+        await upsert_task(
+            in_memory_db,
+            "task-dead",
+            901,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_dead",
+            current_claude_session_id="sess-dead",
+            now=now,
+        )
+
+        async def mock_list_panes():
+            return [{"id": "terminal_1", "exited": False}]
+
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        # bot=None mirrors server.serve()'s startup ordering.
+        registry = TaskRegistry(in_memory_db, None, fake_zellij)  # type: ignore[arg-type]
+        await registry.load_from_db(reconcile_with_zellij=True)  # must not raise
+
+        # State changes still applied: dead task flipped to crashed.
+        assert registry.get_by_task_id("task-dead").status == "crashed"
+        assert registry.get_by_task_id("task-live").status == "running"
+
+        # Now wire up the bot and flush; deferred posts/archives land.
+        registry._bot = fake_bot
+        await registry.flush_startup_notices()
+
+        posts = fake_bot.get_post_calls()
+        assert any("💥 Bridge restarted" in p["content"] and p["thread_id"] == 901 for p in posts)
+        assert any("hook level" in p["content"] and p["thread_id"] == 900 for p in posts)
+        assert len(fake_bot.get_archive_calls()) == 1
+
+        # Second flush is a no-op (idempotent drain).
+        await registry.flush_startup_notices()
+        assert len(fake_bot.get_post_calls()) == len(posts)
 
 
 @dataclass
@@ -2587,6 +2651,9 @@ class TestTaskRegistryPhase3:
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        # Disable the Stop transcript-flush retry — this test verifies the
+        # empty-text branch and shouldn't pay the production retry budget.
+        registry._STOP_TRANSCRIPT_RETRY_SECS = 0.0
         await registry.load_from_db()
 
         # Call Stop with transcript_path

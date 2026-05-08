@@ -1,23 +1,41 @@
-"""Async wrapper around the zellij CLI for managing panes in a session."""
+"""Async wrapper around the zellij CLI for managing per-task tabs in a session.
+
+zellij 0.43+ removed `list-panes`, `--pane-id` targeting, and `send-keys`. We
+target each task by tab name (e.g. `cc-aa429dc4`), focus the tab via
+`go-to-tab-name` before issuing `write-chars`, and submit Enter via raw
+`action write 13`.
+"""
 
 import asyncio
-import json
 import logging
+import os
 import subprocess
-from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
-SESSION_NAME = "bridge"
-SPAWN_POLL_INTERVAL = 0.1  # seconds
-SPAWN_POLL_TIMEOUT = 5.0  # seconds
+# Session name is configurable via env var so users can colocate bridge tasks
+# with their existing zellij session (e.g. the one their SSH RemoteCommand
+# attaches to). Defaults to `meow` to match Hailey's typical setup.
+SESSION_NAME = os.environ.get("BRIDGE_ZELLIJ_SESSION", "meow")
 
 
 def _session_already_exists(stderr: str) -> bool:
-    """Check whether stderr from `zellij attach --create-background` indicates
-    the session is already alive (zellij ≥ 0.43 reports this as a non-zero exit)."""
+    """Whether stderr from `zellij attach --create-background` indicates the
+    session is already alive (zellij ≥ 0.43 reports this as a non-zero exit)."""
     s = stderr.lower()
     return "already exists" in s or "already running" in s
+
+
+def _running_inside_target_session() -> bool:
+    """Whether the current process is running inside the configured session.
+
+    zellij sets `ZELLIJ_SESSION_NAME` for processes spawned inside a session,
+    and refuses `zellij attach --create-background <name>` when <name> matches
+    the current session (panic at commands.rs: "trying to attach to the current
+    session"). When colocated, the session is alive by definition — skip the
+    attach call entirely.
+    """
+    return os.environ.get("ZELLIJ_SESSION_NAME") == SESSION_NAME
 
 
 class ZellijError(Exception):
@@ -29,40 +47,20 @@ class ZellijSessionMissing(ZellijError):
 
 
 class ZellijSpawnError(ZellijError):
-    """Raised when a new pane can't be created or its id can't be resolved within timeout."""
-
-
-class ZellijPaneInfo(TypedDict):
-    """Type definition for pane information returned by list-panes."""
-
-    id: str
-    title: str
-    pwd: str
-    terminal_command: str
-    exited: bool
+    """Raised when a new task tab can't be created or its claude pane can't run."""
 
 
 class ZellijManager:
-    """Async-friendly wrapper around zellij CLI."""
+    """Async-friendly wrapper around the zellij CLI.
 
-    def __init__(
-        self,
-        executable: str = "zellij",
-        *,
-        poll_timeout: float = SPAWN_POLL_TIMEOUT,
-        poll_interval: float = SPAWN_POLL_INTERVAL,
-    ) -> None:
-        """Initialize ZellijManager with optional injectable executable path.
+    Each bridge task is one named tab in the configured session. Tabs are named
+    `cc-<task_id_prefix>` and identified by that name throughout the API
+    surface (the legacy `pane_id` parameter names now carry tab names).
+    """
 
-        Args:
-            executable: Path to zellij binary (default: "zellij")
-            poll_timeout: Timeout in seconds for polling spawn results (default: 5.0)
-            poll_interval: Interval in seconds between spawn polls (default: 0.1)
-        """
+    def __init__(self, executable: str = "zellij") -> None:
         self._executable = executable
         self._session_lock = asyncio.Lock()
-        self._poll_timeout = poll_timeout
-        self._poll_interval = poll_interval
 
     async def _run_unlocked(
         self,
@@ -70,21 +68,8 @@ class ZellijManager:
         env: dict[str, str] | None = None,
         timeout: float = 10.0,
     ) -> tuple[int, str, str]:
-        """Run a subprocess command with timeout. Does NOT acquire the lock.
-
-        Internal helper for _run and spawn_task (which already holds the lock).
-
-        Args:
-            argv: Command arguments
-            env: Optional environment dict
-            timeout: Command timeout in seconds
-
-        Returns:
-            Tuple of (returncode, stdout_decoded, stderr_decoded)
-
-        Raises:
-            ZellijError: On timeout or other subprocess errors
-        """
+        """Run a subprocess command with timeout. Caller must hold _session_lock
+        if serialization is required."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -115,291 +100,146 @@ class ZellijManager:
         env: dict[str, str] | None = None,
         timeout: float = 10.0,
     ) -> tuple[int, str, str]:
-        """Run a subprocess command with timeout and return (returncode, stdout, stderr).
-
-        Public methods that need serialization call this. It acquires the session lock.
-        Methods that are already holding the lock should call _run_unlocked instead.
-
-        Args:
-            argv: Command arguments
-            env: Optional environment dict
-            timeout: Command timeout in seconds
-
-        Returns:
-            Tuple of (returncode, stdout_decoded, stderr_decoded)
-
-        Raises:
-            ZellijError: On timeout or other subprocess errors
-        """
+        """Run a subprocess command, acquiring _session_lock for serialization."""
         async with self._session_lock:
             return await self._run_unlocked(*argv, env=env, timeout=timeout)
 
     async def ensure_session_alive(self) -> None:
-        """Ensure the bridge session exists and is accessible.
+        """Idempotently ensure the configured zellij session exists.
 
-        Runs `zellij attach --create-background bridge`. Idempotent — safe to call
-        repeatedly. zellij ≥ 0.43 returns non-zero with stderr "Session already exists"
-        when the session is already running; treat that as success.
-
-        Raises:
-            ZellijSessionMissing: If session creation fails for any other reason
+        zellij ≥ 0.43 returns non-zero with stderr "Session already exists" when
+        the session is already running; treat that as success. If we're running
+        inside the target session itself, skip the attach (zellij panics on
+        self-attach).
         """
-        returncode, stdout, stderr = await self._run(
+        if _running_inside_target_session():
+            return
+        returncode, _, stderr = await self._run(
             self._executable, "attach", "--create-background", SESSION_NAME
         )
         if returncode != 0 and not _session_already_exists(stderr):
             raise ZellijSessionMissing(f"Failed to create/attach session: {stderr}")
 
-    async def list_panes(self) -> list[ZellijPaneInfo]:
-        """List all panes in the bridge session as JSON.
+    async def list_panes(self) -> list[dict]:
+        """List bridge-owned task tabs in the session.
 
-        Parses JSON from `zellij action list-panes --json`. The shape is nested:
-        `{"tabs": [{"panes": [...]}, ...]}`. Flattens panes from all tabs.
-
-        Zellij docs: https://zellij.dev/documentation/cli-actions
-
-        Returns:
-            List of pane info dicts
-
-        Raises:
-            ZellijError: On JSON parse error
+        Returns a list of dicts shaped `{"id": tab_name, "exited": False}` for
+        each tab whose name starts with `cc-`. The "id" field carries the tab
+        name (preserving the historical `pane_id` contract). "exited" is always
+        False because zellij 0.43 has no API to detect a dead pane in an
+        existing tab — we infer death only from the tab disappearing entirely.
         """
         returncode, stdout, stderr = await self._run(
-            self._executable,
-            "--session",
-            SESSION_NAME,
-            "action",
-            "list-panes",
-            "--json",
+            self._executable, "--session", SESSION_NAME, "action", "query-tab-names"
         )
         if returncode != 0:
-            raise ZellijError(f"list-panes failed: {stderr}")
+            raise ZellijError(f"query-tab-names failed: {stderr}")
 
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            raise ZellijError(f"malformed list-panes output: {stderr}")
-
-        # Flatten panes from all tabs
-        # Note: title is optional (may not be present in all zellij versions),
-        # so we default to empty string if missing.
-        panes: list[ZellijPaneInfo] = []
-        if isinstance(data, dict) and "tabs" in data:
-            for tab in data.get("tabs", []):
-                if isinstance(tab, dict) and "panes" in tab:
-                    for pane in tab.get("panes", []):
-                        if isinstance(pane, dict) and all(
-                            k in pane for k in ["id", "pwd", "terminal_command", "exited"]
-                        ):
-                            panes.append(
-                                {
-                                    "id": pane["id"],
-                                    "title": pane.get("title", ""),
-                                    "pwd": pane["pwd"],
-                                    "terminal_command": pane["terminal_command"],
-                                    "exited": pane["exited"],
-                                }
-                            )
-        return panes
+        names = [line.strip() for line in stdout.splitlines() if line.strip()]
+        return [{"id": n, "exited": False} for n in names if n.startswith("cc-")]
 
     async def write_to_pane(self, pane_id: str, text: str) -> None:
-        """Write text to a pane, handling multi-line input correctly.
+        """Type text into the task tab named `pane_id`.
 
-        Splits text on `\\n` boundaries:
-        - For each segment: `write-chars <segment>`
-        - After each `\\n`: `send-keys Enter`
-
-        This is the correct way to send multi-line input to TUI apps via zellij.
-
-        Args:
-            pane_id: The pane ID (e.g., "terminal_1")
-            text: Text to write (may contain `\\n`)
-
-        Raises:
-            ZellijError: If any subprocess call returns non-zero
-        """
-        segments = text.split("\n")
-        for i, segment in enumerate(segments):
-            # Write the segment
-            if segment:  # Only write non-empty segments
-                returncode, _, stderr = await self._run(
-                    self._executable,
-                    "--session",
-                    SESSION_NAME,
-                    "action",
-                    "write-chars",
-                    "--pane-id",
-                    pane_id,
-                    segment,
-                )
-                if returncode != 0:
-                    raise ZellijError(f"write-chars failed: {stderr}")
-
-            # Send Enter if this segment was followed by a newline (i.e., not the last segment)
-            if i < len(segments) - 1:
-                returncode, _, stderr = await self._run(
-                    self._executable,
-                    "--session",
-                    SESSION_NAME,
-                    "action",
-                    "send-keys",
-                    "--pane-id",
-                    pane_id,
-                    "--",
-                    "Enter",
-                )
-                if returncode != 0:
-                    raise ZellijError(f"send-keys failed: {stderr}")
-
-    async def close_pane(self, pane_id: str) -> None:
-        """Close a pane by ID.
-
-        Idempotent — if the pane is already gone, swallows the error and logs INFO.
-
-        Args:
-            pane_id: The pane ID to close
-        """
-        returncode, _, stderr = await self._run(
-            self._executable,
-            "--session",
-            SESSION_NAME,
-            "action",
-            "close-pane",
-            "--pane-id",
-            pane_id,
-        )
-        if returncode != 0:
-            logger.info(f"close-pane {pane_id}: {stderr}")
-
-    async def spawn_task(
-        self, cwd: str, env: dict[str, str], pane_name: str, *,
-        extra_argv: list[str] | None = None,
-    ) -> str:
-        """Spawn a new pane running `claude` and resolve its pane ID.
-
-        Acquires the session lock for the entire operation to serialize concurrent spawns.
-        This prevents two spawns from seeing each other's panes and binding to the wrong one.
-
-        Process:
-        1. Acquire session lock
-        2. Ensure session is alive
-        3. Snapshot existing pane ids
-        4. Spawn `claude` in a new pane
-        5. Poll list-panes until the new pane appears
-        6. Return the new pane id (lock is released)
-
-        Args:
-            cwd: Working directory for the new pane
-            env: Environment dict to pass to subprocess
-            pane_name: Name for the new pane (e.g., "cc-abc123")
-            extra_argv: Optional list of extra arguments to append after "claude" (e.g. ["--resume", "session_id"])
-
-        Returns:
-            The pane ID of the newly spawned pane (e.g., "terminal_1")
-
-        Raises:
-            ZellijSpawnError: If spawn fails or poll times out
+        Focuses the tab, then issues `write-chars` per non-empty segment with
+        `action write 13` between segments and after a trailing newline. The
+        legacy `send-keys Enter` is gone in zellij 0.43+; we use the raw byte
+        13 (CR) which Claude's TUI reads as an Enter keypress.
         """
         async with self._session_lock:
-            # Ensure session is alive (zellij ≥ 0.43 returns non-zero "Session
-            # already exists" when bridge is already running — treat as success).
-            returncode, _, stderr = await self._run_unlocked(
-                self._executable, "attach", "--create-background", SESSION_NAME
+            rc, _, stderr = await self._run_unlocked(
+                self._executable, "--session", SESSION_NAME,
+                "action", "go-to-tab-name", pane_id,
             )
-            if returncode != 0 and not _session_already_exists(stderr):
-                raise ZellijSpawnError(f"Failed to create/attach session: {stderr}")
+            if rc != 0:
+                raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")
 
-            # Snapshot existing pane ids
-            returncode, stdout, stderr = await self._run_unlocked(
-                self._executable,
-                "--session",
-                SESSION_NAME,
-                "action",
-                "list-panes",
-                "--json",
+            segments = text.split("\n")
+            for i, segment in enumerate(segments):
+                if segment:
+                    rc, _, stderr = await self._run_unlocked(
+                        self._executable, "--session", SESSION_NAME,
+                        "action", "write-chars", segment,
+                    )
+                    if rc != 0:
+                        raise ZellijError(f"write-chars failed: {stderr}")
+                if i < len(segments) - 1:
+                    rc, _, stderr = await self._run_unlocked(
+                        self._executable, "--session", SESSION_NAME,
+                        "action", "write", "13",
+                    )
+                    if rc != 0:
+                        raise ZellijError(f"write 13 (Enter) failed: {stderr}")
+
+    async def close_pane(self, pane_id: str) -> None:
+        """Close the task tab named `pane_id`. Idempotent — missing tab is a no-op."""
+        async with self._session_lock:
+            rc, _, stderr = await self._run_unlocked(
+                self._executable, "--session", SESSION_NAME,
+                "action", "go-to-tab-name", pane_id,
             )
-            if returncode != 0:
-                raise ZellijSpawnError(f"list-panes failed: {stderr}")
+            if rc != 0:
+                logger.info("close_pane %s: tab not found, treating as already closed", pane_id)
+                return
+            rc, _, stderr = await self._run_unlocked(
+                self._executable, "--session", SESSION_NAME,
+                "action", "close-tab",
+            )
+            if rc != 0:
+                logger.info("close-tab %s: %s", pane_id, stderr)
 
-            try:
-                data = json.loads(stdout)
-            except json.JSONDecodeError:
-                raise ZellijSpawnError(f"malformed list-panes output: {stderr}")
+    async def spawn_task(
+        self,
+        cwd: str,
+        env: dict[str, str],
+        pane_name: str,
+        *,
+        extra_argv: list[str] | None = None,
+    ) -> str:
+        """Spawn a new task tab named `pane_name` running claude in `cwd`.
 
-            before_ids = set()
-            if isinstance(data, dict) and "tabs" in data:
-                for tab in data.get("tabs", []):
-                    if isinstance(tab, dict) and "panes" in tab:
-                        for pane in tab.get("panes", []):
-                            if isinstance(pane, dict) and "id" in pane:
-                                before_ids.add(pane["id"])
+        Acquires the session lock for the entire operation so concurrent spawns
+        don't race on tab focus. Sequence:
+        1. Ensure session is alive (or skip if colocated).
+        2. `new-tab --name <pane_name> --cwd <cwd>` — creates and focuses the tab.
+        3. `run --close-on-exit --cwd <cwd> -- env K=V... claude [extra_argv...]`
+           — opens a pane in the just-focused tab running claude.
 
-            # Spawn the new pane
-            argv = [
-                self._executable,
-                "--session",
-                SESSION_NAME,
-                "run",
-                "--cwd",
-                cwd,
-                "--name",
-                pane_name,
-                "--",
+        The `env` dict is injected via the `env(1)` prefix because zellij is
+        client-server: the env we set on the `zellij run` subprocess is invisible
+        to the spawned process, which inherits the *server's* env. `env(1)` sets
+        the vars at exec time, which works regardless of who started the server.
+
+        Returns the tab name (which is `pane_name`).
+
+        Raises ZellijSpawnError on any failure.
+        """
+        async with self._session_lock:
+            if not _running_inside_target_session():
+                rc, _, stderr = await self._run_unlocked(
+                    self._executable, "attach", "--create-background", SESSION_NAME
+                )
+                if rc != 0 and not _session_already_exists(stderr):
+                    raise ZellijSpawnError(f"Failed to create/attach session: {stderr}")
+
+            rc, _, stderr = await self._run_unlocked(
+                self._executable, "--session", SESSION_NAME,
+                "action", "new-tab", "--name", pane_name, "--cwd", cwd,
+            )
+            if rc != 0:
+                raise ZellijSpawnError(f"new-tab {pane_name!r} failed: {stderr}")
+
+            run_argv = [
+                self._executable, "--session", SESSION_NAME, "run",
+                "--close-on-exit", "--cwd", cwd, "--",
+                "env",
+                *(f"{k}={v}" for k, v in env.items()),
                 "claude",
             ]
             if extra_argv:
-                argv.extend(extra_argv)
-            returncode, _, stderr = await self._run_unlocked(*argv, env=env)
-            if returncode != 0:
-                raise ZellijSpawnError(f"Failed to spawn pane: {stderr}")
+                run_argv.extend(extra_argv)
+            rc, _, stderr = await self._run_unlocked(*run_argv)
+            if rc != 0:
+                raise ZellijSpawnError(f"run claude failed: {stderr}")
 
-            # Poll for the new pane to appear
-            start = asyncio.get_event_loop().time()
-            while True:
-                try:
-                    returncode, stdout, stderr = await self._run_unlocked(
-                        self._executable,
-                        "--session",
-                        SESSION_NAME,
-                        "action",
-                        "list-panes",
-                        "--json",
-                    )
-                    if returncode != 0:
-                        raise ZellijSpawnError(f"list-panes failed: {stderr}")
-
-                    data = json.loads(stdout)
-                    panes = []
-                    if isinstance(data, dict) and "tabs" in data:
-                        for tab in data.get("tabs", []):
-                            if isinstance(tab, dict) and "panes" in tab:
-                                for pane in tab.get("panes", []):
-                                    if isinstance(pane, dict) and all(
-                                        k in pane for k in ["id", "pwd", "terminal_command", "exited"]
-                                    ):
-                                        panes.append(pane)
-
-                    for pane in panes:
-                        # Check if this is a new pane (not in before_ids)
-                        # and matches our criteria (claude command, matching cwd)
-                        if (
-                            pane["id"] not in before_ids
-                            and (
-                                pane["terminal_command"].endswith("claude")
-                                or "claude" in pane["terminal_command"]
-                            )
-                            and (pane["pwd"] == cwd or pane["pwd"].startswith(cwd))
-                        ):
-                            return pane["id"]
-
-                    # Check timeout
-                    elapsed = asyncio.get_event_loop().time() - start
-                    if elapsed > self._poll_timeout:
-                        raise ZellijSpawnError("pane not visible within 5s")
-
-                    # Wait before polling again
-                    await asyncio.sleep(self._poll_interval)
-                except ZellijSpawnError:
-                    raise
-                except Exception as e:
-                    raise ZellijSpawnError(f"Poll failed: {e}") from e
+            return pane_name

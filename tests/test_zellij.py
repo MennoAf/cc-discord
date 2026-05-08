@@ -1,15 +1,15 @@
-"""Tests for ZellijManager."""
+"""Tests for ZellijManager (tab-name-based addressing on zellij ≥ 0.43)."""
 
 import asyncio
-import json
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
+from bridge import zellij as zellij_module
 from bridge.zellij import (
-    ZellijManager,
     ZellijError,
+    ZellijManager,
     ZellijSessionMissing,
     ZellijSpawnError,
 )
@@ -24,448 +24,298 @@ class FakeProc:
     stderr_data: bytes
 
     async def wait(self) -> int:
-        """Return the exit code."""
         return self.returncode
 
     async def communicate(self) -> tuple[bytes, bytes]:
-        """Return stdout and stderr."""
         return (self.stdout_data, self.stderr_data)
 
 
 @pytest.fixture
 def patch_exec(monkeypatch):
-    """Monkeypatch asyncio.create_subprocess_exec to return queued fake procs.
-
-    Returns a list that can be populated with FakeProc instances.
-    Each call to _create_subprocess_exec pops from the front of the list.
-    """
+    """Monkeypatch asyncio.create_subprocess_exec with a FakeProc queue."""
     queue: list[FakeProc] = []
     call_log: list[tuple] = []
 
     async def _create_subprocess_exec(*argv: str, **kwargs: Any) -> FakeProc:
-        """Record the call and pop the next proc from queue."""
         call_log.append((argv, kwargs))
         if not queue:
             raise AssertionError(f"Unexpected zellij call: {argv}")
         return queue.pop(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _create_subprocess_exec)
-    # Make queue accessible to tests
     _create_subprocess_exec._queue = queue  # type: ignore
     _create_subprocess_exec._call_log = call_log  # type: ignore
     return _create_subprocess_exec
 
 
-@pytest.fixture
-def load_fixture():
-    """Load JSON fixture from tests/fixtures/zellij_list_panes.json."""
-    import json
-    from pathlib import Path
-
-    fixture_path = Path(__file__).parent / "fixtures" / "zellij_list_panes.json"
-    with open(fixture_path) as f:
-        return json.load(f)
+@pytest.fixture(autouse=True)
+def fixed_session_name(monkeypatch):
+    """Pin SESSION_NAME to 'bridge' and clear ZELLIJ_SESSION_NAME so tests don't
+    accidentally trigger the colocated-session shortcut when run from a shell
+    that's itself inside zellij."""
+    monkeypatch.setattr(zellij_module, "SESSION_NAME", "bridge")
+    monkeypatch.delenv("ZELLIJ_SESSION_NAME", raising=False)
 
 
 @pytest.mark.asyncio
 class TestZellijManager:
-    """Tests for ZellijManager."""
-
     async def test_ensure_session_alive_success(self, patch_exec):
-        """ensure_session_alive runs zellij attach --create-background bridge."""
-        proc = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc)
-
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
         mgr = ZellijManager()
         await mgr.ensure_session_alive()
-
-        # Check argv
-        assert len(patch_exec._call_log) == 1
-        argv, kwargs = patch_exec._call_log[0]
+        argv, _ = patch_exec._call_log[0]
         assert argv == ("zellij", "attach", "--create-background", "bridge")
 
     async def test_ensure_session_alive_idempotent(self, patch_exec):
-        """ensure_session_alive is idempotent on success."""
-        proc = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc)
-        patch_exec._queue.append(proc)
-
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
         mgr = ZellijManager()
         await mgr.ensure_session_alive()
         await mgr.ensure_session_alive()
-
-        # Both calls should succeed
         assert len(patch_exec._call_log) == 2
 
     async def test_ensure_session_alive_failure(self, patch_exec):
-        """ensure_session_alive raises ZellijSessionMissing on non-zero exit."""
-        proc = FakeProc(
-            returncode=1,
-            stdout_data=b"",
-            stderr_data=b"permission denied",
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"permission denied")
         )
-        patch_exec._queue.append(proc)
-
         mgr = ZellijManager()
         with pytest.raises(ZellijSessionMissing, match="permission denied"):
             await mgr.ensure_session_alive()
 
     async def test_ensure_session_alive_tolerates_already_exists(self, patch_exec):
-        """zellij ≥ 0.43 returns non-zero with 'Session already exists' on second
-        attach; treat as success and return without raising."""
-        proc = FakeProc(
-            returncode=2,
-            stdout_data=b"",
-            stderr_data=b"Session already exists",
+        """zellij ≥ 0.43 returns non-zero with 'Session already exists' on second attach."""
+        patch_exec._queue.append(
+            FakeProc(returncode=2, stdout_data=b"", stderr_data=b"Session already exists")
         )
-        patch_exec._queue.append(proc)
-
         mgr = ZellijManager()
         await mgr.ensure_session_alive()  # should not raise
 
-    async def test_list_panes_success(self, patch_exec, load_fixture):
-        """list_panes parses JSON and returns flattened pane list."""
-        json_output = json.dumps(load_fixture).encode()
-        proc = FakeProc(returncode=0, stdout_data=json_output, stderr_data=b"")
-        patch_exec._queue.append(proc)
+    async def test_ensure_session_alive_skips_attach_when_colocated(
+        self, patch_exec, monkeypatch
+    ):
+        """When ZELLIJ_SESSION_NAME matches the target session, skip attach
+        (zellij panics on self-attach in that case)."""
+        monkeypatch.setenv("ZELLIJ_SESSION_NAME", "bridge")
+        mgr = ZellijManager()
+        await mgr.ensure_session_alive()
+        assert patch_exec._call_log == []
 
+    async def test_list_panes_filters_cc_prefix(self, patch_exec):
+        """list_panes runs query-tab-names and returns only cc- prefixed tabs."""
+        patch_exec._queue.append(
+            FakeProc(
+                returncode=0,
+                stdout_data=b"Tab #1\ncc-aa429dc4\nTab #2\ncc-deadbeef\n",
+                stderr_data=b"",
+            )
+        )
         mgr = ZellijManager()
         panes = await mgr.list_panes()
+        assert panes == [
+            {"id": "cc-aa429dc4", "exited": False},
+            {"id": "cc-deadbeef", "exited": False},
+        ]
+        argv, _ = patch_exec._call_log[0]
+        assert argv == ("zellij", "--session", "bridge", "action", "query-tab-names")
 
-        # Should return a list of ZellijPaneInfo
-        assert isinstance(panes, list)
-        assert len(panes) > 0
-        for pane in panes:
-            assert isinstance(pane, dict)
-            assert "id" in pane
-            assert "pwd" in pane
-            assert "terminal_command" in pane
-            assert "exited" in pane
-
-    async def test_list_panes_malformed_json(self, patch_exec):
-        """list_panes raises ZellijError on malformed JSON."""
-        proc = FakeProc(
-            returncode=0,
-            stdout_data=b"not valid json",
-            stderr_data=b"",
+    async def test_list_panes_failure(self, patch_exec):
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"session not found")
         )
-        patch_exec._queue.append(proc)
-
         mgr = ZellijManager()
-        with pytest.raises(ZellijError, match="malformed"):
+        with pytest.raises(ZellijError, match="query-tab-names failed"):
             await mgr.list_panes()
 
     async def test_write_to_pane_single_line(self, patch_exec):
-        """write_to_pane with no newline issues only write-chars."""
-        proc1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc1)
+        """No newline → focus tab + one write-chars, no Enter."""
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # go-to-tab-name
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # write-chars
 
         mgr = ZellijManager()
-        await mgr.write_to_pane("pane-1", "hello")
+        await mgr.write_to_pane("cc-aa429dc4", "hello")
 
-        # Should have one call: write-chars
-        assert len(patch_exec._call_log) == 1
-        argv, _ = patch_exec._call_log[0]
-        assert argv == (
-            "zellij",
-            "--session",
-            "bridge",
-            "action",
-            "write-chars",
-            "--pane-id",
-            "pane-1",
-            "hello",
+        assert len(patch_exec._call_log) == 2
+        assert patch_exec._call_log[0][0] == (
+            "zellij", "--session", "bridge", "action", "go-to-tab-name", "cc-aa429dc4"
+        )
+        assert patch_exec._call_log[1][0] == (
+            "zellij", "--session", "bridge", "action", "write-chars", "hello"
         )
 
     async def test_write_to_pane_with_newline(self, patch_exec):
-        """write_to_pane with newline issues write-chars then send-keys."""
-        proc1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        proc2 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc1)
-        patch_exec._queue.append(proc2)
+        """Trailing newline → focus + write-chars + write 13 (Enter)."""
+        for _ in range(3):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        await mgr.write_to_pane("pane-1", "hello\n")
+        await mgr.write_to_pane("cc-aa429dc4", "hello\n")
 
-        # Should have two calls: write-chars, send-keys
-        assert len(patch_exec._call_log) == 2
-        argv1, _ = patch_exec._call_log[0]
-        argv2, _ = patch_exec._call_log[1]
-        assert argv1 == (
-            "zellij",
-            "--session",
-            "bridge",
-            "action",
-            "write-chars",
-            "--pane-id",
-            "pane-1",
-            "hello",
-        )
-        assert argv2 == (
-            "zellij",
-            "--session",
-            "bridge",
-            "action",
-            "send-keys",
-            "--pane-id",
-            "pane-1",
-            "--",
-            "Enter",
-        )
+        assert len(patch_exec._call_log) == 3
+        assert patch_exec._call_log[0][0][4:] == ("go-to-tab-name", "cc-aa429dc4")
+        assert patch_exec._call_log[1][0][4:] == ("write-chars", "hello")
+        assert patch_exec._call_log[2][0][4:] == ("write", "13")
 
     async def test_write_to_pane_multiple_lines(self, patch_exec):
-        """write_to_pane with multiple lines issues correct sequence."""
-        procs = [FakeProc(returncode=0, stdout_data=b"", stderr_data=b"") for _ in range(4)]
-        for p in procs:
-            patch_exec._queue.append(p)
+        """`hello\\nworld\\n` → focus + write-chars hello + Enter + write-chars world + Enter."""
+        for _ in range(5):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        await mgr.write_to_pane("pane-1", "hello\nworld\n")
+        await mgr.write_to_pane("cc-aa429dc4", "hello\nworld\n")
 
-        # Should have 4 calls: write-chars, send-keys, write-chars, send-keys
-        assert len(patch_exec._call_log) == 4
-        assert patch_exec._call_log[0][0][4] == "write-chars"
-        assert patch_exec._call_log[0][0][7] == "hello"
-        assert patch_exec._call_log[1][0][4] == "send-keys"
-        assert patch_exec._call_log[2][0][4] == "write-chars"
-        assert patch_exec._call_log[2][0][7] == "world"
-        assert patch_exec._call_log[3][0][4] == "send-keys"
+        assert len(patch_exec._call_log) == 5
+        assert patch_exec._call_log[0][0][4:] == ("go-to-tab-name", "cc-aa429dc4")
+        assert patch_exec._call_log[1][0][4:] == ("write-chars", "hello")
+        assert patch_exec._call_log[2][0][4:] == ("write", "13")
+        assert patch_exec._call_log[3][0][4:] == ("write-chars", "world")
+        assert patch_exec._call_log[4][0][4:] == ("write", "13")
+
+    async def test_write_to_pane_focus_failure_raises(self, patch_exec):
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"no such tab")
+        )
+        mgr = ZellijManager()
+        with pytest.raises(ZellijError, match="go-to-tab-name"):
+            await mgr.write_to_pane("cc-missing", "hello")
 
     async def test_close_pane_success(self, patch_exec):
-        """close_pane issues close-pane action."""
-        proc = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc)
+        """close_pane focuses the tab then issues close-tab."""
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # go-to-tab-name
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # close-tab
 
         mgr = ZellijManager()
-        await mgr.close_pane("pane-1")
+        await mgr.close_pane("cc-aa429dc4")
 
+        assert len(patch_exec._call_log) == 2
+        assert patch_exec._call_log[0][0][4:] == ("go-to-tab-name", "cc-aa429dc4")
+        assert patch_exec._call_log[1][0][4:] == ("close-tab",)
+
+    async def test_close_pane_idempotent_when_tab_missing(self, patch_exec):
+        """close_pane is silent when the tab is already gone."""
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"no such tab")
+        )
+        mgr = ZellijManager()
+        await mgr.close_pane("cc-aa429dc4")  # should not raise; only one call (no close-tab issued)
         assert len(patch_exec._call_log) == 1
-        argv, _ = patch_exec._call_log[0]
-        assert argv == (
-            "zellij",
-            "--session",
-            "bridge",
-            "action",
-            "close-pane",
-            "--pane-id",
-            "pane-1",
-        )
 
-    async def test_close_pane_idempotent(self, patch_exec):
-        """close_pane swallows non-zero exit (pane already gone)."""
-        proc = FakeProc(returncode=1, stdout_data=b"", stderr_data=b"pane not found")
-        patch_exec._queue.append(proc)
+    async def test_spawn_task_success(self, patch_exec):
+        """Three subprocess calls: attach, new-tab, run; returns the tab name.
+
+        env is injected via the `env(1)` prefix because zellij's client-server
+        model means the subprocess env we'd otherwise pass is invisible to the
+        spawned claude.
+        """
+        for _ in range(3):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        # Should not raise
-        await mgr.close_pane("pane-1")
+        tab = await mgr.spawn_task("/tmp", {"FOO": "bar"}, "cc-aa429dc4")
 
-    async def test_spawn_task_success(self, patch_exec, load_fixture):
-        """spawn_task snapshots, runs, polls, and returns new pane id."""
-        # First call: ensure_session_alive
-        proc_ensure = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_ensure)
-
-        # Second call: list-panes (before spawn)
-        list_panes_before = {
-            "tabs": [{"panes": [{"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False}]}]
-        }
-        proc_list_before = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_panes_before).encode(),
-            stderr_data=b"",
+        assert tab == "cc-aa429dc4"
+        assert len(patch_exec._call_log) == 3
+        assert patch_exec._call_log[0][0] == (
+            "zellij", "attach", "--create-background", "bridge"
         )
-        patch_exec._queue.append(proc_list_before)
-
-        # Third call: run (spawn)
-        proc_run = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_run)
-
-        # Fourth call: list-panes (poll) - now has new pane
-        list_panes_after = {
-            "tabs": [
-                {
-                    "panes": [
-                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
-                        {
-                            "id": "terminal_1",
-                            "pwd": "/tmp",
-                            "terminal_command": "claude",
-                            "exited": False,
-                        },
-                    ]
-                }
-            ]
-        }
-        proc_list_after = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_panes_after).encode(),
-            stderr_data=b"",
+        assert patch_exec._call_log[1][0] == (
+            "zellij", "--session", "bridge", "action", "new-tab",
+            "--name", "cc-aa429dc4", "--cwd", "/tmp",
         )
-        patch_exec._queue.append(proc_list_after)
+        run_argv, _ = patch_exec._call_log[2]
+        assert run_argv == (
+            "zellij", "--session", "bridge", "run",
+            "--close-on-exit", "--cwd", "/tmp", "--",
+            "env", "FOO=bar", "claude",
+        )
+
+    async def test_spawn_task_extra_argv(self, patch_exec):
+        """spawn_task appends extra_argv after `claude` (used for --resume)."""
+        for _ in range(3):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        pane_id = await mgr.spawn_task("/tmp", {"FOO": "bar"}, "cc-abc123")
-
-        # Should return the new pane id
-        assert pane_id == "terminal_1"
-
-        # Check calls
-        assert len(patch_exec._call_log) >= 4
-        # Third call should be the run command with env
-        argv_run, kwargs_run = patch_exec._call_log[2]
-        assert argv_run[0:4] == ("zellij", "--session", "bridge", "run")
-        assert "--cwd" in argv_run
-        assert "/tmp" in argv_run
-        assert "--name" in argv_run
-        assert "cc-abc123" in argv_run
-        assert "--" in argv_run
-        assert "claude" in argv_run
-        assert "env" in kwargs_run
-        assert kwargs_run["env"]["FOO"] == "bar"
-
-    async def test_spawn_task_timeout(self, patch_exec):
-        """spawn_task raises ZellijSpawnError on poll timeout."""
-        # First call: ensure_session_alive
-        proc_ensure = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_ensure)
-
-        # Second call: list-panes (before spawn)
-        list_panes_before = {
-            "tabs": [{"panes": [{"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False}]}]
-        }
-        proc_list_before = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_panes_before).encode(),
-            stderr_data=b"",
+        await mgr.spawn_task(
+            "/tmp", {}, "cc-aa429dc4", extra_argv=["--resume", "sess-xyz"]
         )
-        patch_exec._queue.append(proc_list_before)
 
-        # Third call: run (spawn)
-        proc_run = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_run)
+        run_argv, _ = patch_exec._call_log[2]
+        assert run_argv[-3:] == ("claude", "--resume", "sess-xyz")
+        # With empty env, the prefix is just `env claude ...`.
+        assert "env" in run_argv
+        assert run_argv.index("env") < run_argv.index("claude")
 
-        # Subsequent list-panes calls always return same (no new pane)
-        for _ in range(100):  # Many polls
-            proc_list = FakeProc(
-                returncode=0,
-                stdout_data=json.dumps(list_panes_before).encode(),
-                stderr_data=b"",
-            )
-            patch_exec._queue.append(proc_list)
+    async def test_spawn_task_session_already_exists_is_success(self, patch_exec):
+        """attach returning 'Session already exists' is treated as success."""
+        patch_exec._queue.append(
+            FakeProc(returncode=2, stdout_data=b"", stderr_data=b"Session already exists")
+        )
+        for _ in range(2):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
-        # Create manager with short poll timeout for this test
-        mgr = ZellijManager(poll_timeout=0.2)
-        with pytest.raises(ZellijSpawnError, match="pane not visible"):
-            await mgr.spawn_task("/tmp", {}, "cc-abc123")
+        mgr = ZellijManager()
+        tab = await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+        assert tab == "cc-aa429dc4"
+
+    async def test_spawn_task_skips_attach_when_colocated(self, patch_exec, monkeypatch):
+        """When running inside the target session, spawn_task skips the attach
+        call (only new-tab + run remain)."""
+        monkeypatch.setenv("ZELLIJ_SESSION_NAME", "bridge")
+        for _ in range(2):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+
+        mgr = ZellijManager()
+        tab = await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+
+        assert tab == "cc-aa429dc4"
+        assert len(patch_exec._call_log) == 2
+        assert patch_exec._call_log[0][0][4] == "new-tab"
+        assert patch_exec._call_log[1][0][3] == "run"
+
+    async def test_spawn_task_new_tab_failure(self, patch_exec):
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # attach
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"new-tab refused")
+        )
+        mgr = ZellijManager()
+        with pytest.raises(ZellijSpawnError, match="new-tab"):
+            await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+
+    async def test_spawn_task_run_failure(self, patch_exec):
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # attach
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # new-tab
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"command not found: claude")
+        )
+        mgr = ZellijManager()
+        with pytest.raises(ZellijSpawnError, match="run claude failed"):
+            await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
 
     async def test_spawn_task_concurrent_serialized(self, patch_exec):
-        """Concurrent spawn_task calls are serialized by the lock; each gets the right pane."""
-        # Setup for first spawn
-        proc_ensure1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_ensure1)
-
-        list_before1 = {
-            "tabs": [{"panes": [{"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False}]}]
-        }
-        proc_list_before1 = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_before1).encode(),
-            stderr_data=b"",
-        )
-        patch_exec._queue.append(proc_list_before1)
-
-        proc_run1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_run1)
-
-        list_after1 = {
-            "tabs": [
-                {
-                    "panes": [
-                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
-                        {
-                            "id": "terminal_1",
-                            "pwd": "/tmp",
-                            "terminal_command": "claude",
-                            "exited": False,
-                        },
-                    ]
-                }
-            ]
-        }
-        proc_list_after1 = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_after1).encode(),
-            stderr_data=b"",
-        )
-        patch_exec._queue.append(proc_list_after1)
-
-        # Setup for second spawn (sees terminal_1 as existing now)
-        proc_ensure2 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_ensure2)
-
-        list_before2 = {
-            "tabs": [
-                {
-                    "panes": [
-                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
-                        {
-                            "id": "terminal_1",
-                            "pwd": "/tmp",
-                            "terminal_command": "claude",
-                            "exited": False,
-                        },
-                    ]
-                }
-            ]
-        }
-        proc_list_before2 = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_before2).encode(),
-            stderr_data=b"",
-        )
-        patch_exec._queue.append(proc_list_before2)
-
-        proc_run2 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
-        patch_exec._queue.append(proc_run2)
-
-        list_after2 = {
-            "tabs": [
-                {
-                    "panes": [
-                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
-                        {
-                            "id": "terminal_1",
-                            "pwd": "/tmp",
-                            "terminal_command": "claude",
-                            "exited": False,
-                        },
-                        {
-                            "id": "terminal_2",
-                            "pwd": "/home",
-                            "terminal_command": "claude",
-                            "exited": False,
-                        },
-                    ]
-                }
-            ]
-        }
-        proc_list_after2 = FakeProc(
-            returncode=0,
-            stdout_data=json.dumps(list_after2).encode(),
-            stderr_data=b"",
-        )
-        patch_exec._queue.append(proc_list_after2)
+        """Concurrent spawn_task calls serialize on the session lock; each sees its own
+        attach/new-tab/run sequence ungaroupbled."""
+        # 3 calls per spawn × 2 spawns = 6 total
+        for _ in range(6):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-
-        # Fire both concurrently; the lock ensures they don't interleave badly
-        pane1, pane2 = await asyncio.gather(
+        tab1, tab2 = await asyncio.gather(
             mgr.spawn_task("/tmp", {}, "cc-spawn1"),
             mgr.spawn_task("/home", {}, "cc-spawn2"),
         )
+        assert {tab1, tab2} == {"cc-spawn1", "cc-spawn2"}
 
-        # Each should get its own pane
-        assert pane1 == "terminal_1"
-        assert pane2 == "terminal_2"
-        assert pane1 != pane2
+        # The 6 calls should appear as two interleaved-but-not-tangled groups.
+        # Check that within each spawn's group, attach precedes new-tab precedes run.
+        log = patch_exec._call_log
+        # Find the new-tab calls and verify each is preceded by an attach
+        # within the same lock-held window.
+        for i, (argv, _) in enumerate(log):
+            if "new-tab" in argv:
+                # Previous call in log should be attach
+                prev_argv = log[i - 1][0]
+                assert prev_argv[1] == "attach"
+                # Next call should be run for the same tab name
+                next_argv = log[i + 1][0]
+                assert "run" in next_argv
+                tab_name = argv[argv.index("--name") + 1]
+                assert tab_name in {"cc-spawn1", "cc-spawn2"}

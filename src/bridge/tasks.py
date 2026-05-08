@@ -245,6 +245,10 @@ class TaskRegistry:
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
+        # Discord-side reconciliation notices staged by load_from_db. Flushed by
+        # flush_startup_notices() once the bot is ready — load_from_db must run
+        # before the HTTP server accepts requests, but the bot logs in later.
+        self._pending_startup_notices: list[dict] = []
 
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.
@@ -293,41 +297,56 @@ class TaskRegistry:
                 logger.info("recovered task %s on pane %s", task.task_id[:8], task.zellij_pane_id)
                 continue
 
-            # Pane is gone — mark crashed
+            # Pane is gone — mark crashed. Defer discord-side notices to
+            # flush_startup_notices(); the bot isn't connected yet at startup.
             task.status = "crashed"
             task.last_activity = int(time.time())
             await self._index(task)
             await self._persist(task)
-            try:
-                await self._bot.post(
+            self._pending_startup_notices.append({
+                "task_id": task.task_id,
+                "thread_id": task.thread_id,
+                "messages": [
                     "💥 Bridge restarted; this task's pane is gone",
-                    thread_id=task.thread_id,
-                )
-            except Exception:
-                logger.exception("failed to post recovery-crash notice for task %s", task.task_id)
-            try:
-                await self._bot.post(
                     "🛡 ❌ Any pending approval was denied (bridge restarted)",
-                    thread_id=task.thread_id,
-                )
-            except Exception:
-                logger.exception("failed to post approval-denied notice for task %s", task.task_id)
-            try:
-                await self._archive_thread(task.thread_id)
-            except Exception:
-                logger.exception("failed to archive thread for task %s", task.task_id)
+                ],
+                "archive": True,
+            })
             _cleanup_task_settings(task.task_id)
 
-        # Post a generic notice to live recovered tasks (we don't have per-task pending-approval state,
-        # so we post unconditionally to live recovered tasks)
         for task in recovered_live_tasks:
-            try:
-                await self._bot.post(
+            self._pending_startup_notices.append({
+                "task_id": task.task_id,
+                "thread_id": task.thread_id,
+                "messages": [
                     "ℹ Bridge restarted; any pending approval was denied at the hook level",
-                    thread_id=task.thread_id,
-                )
-            except Exception:
-                logger.exception("failed to post bridge-restart notice for task %s", task.task_id)
+                ],
+                "archive": False,
+            })
+
+    async def flush_startup_notices(self) -> None:
+        """Post and archive notices staged during reconcile. Caller must invoke
+        only after the discord bot is ready (otherwise self._bot.post raises).
+        Idempotent: drains the queue once and then becomes a no-op.
+        """
+        if not self._pending_startup_notices:
+            return
+        notices, self._pending_startup_notices = self._pending_startup_notices, []
+        for notice in notices:
+            for msg in notice["messages"]:
+                try:
+                    await self._bot.post(msg, thread_id=notice["thread_id"])
+                except Exception:
+                    logger.exception(
+                        "failed to post startup notice for task %s", notice["task_id"]
+                    )
+            if notice["archive"]:
+                try:
+                    await self._archive_thread(notice["thread_id"])
+                except Exception:
+                    logger.exception(
+                        "failed to archive thread for task %s", notice["task_id"]
+                    )
 
     def get_by_task_id(self, task_id: str) -> Task | None:
         """Get task by task_id."""
@@ -378,15 +397,16 @@ class TaskRegistry:
         )
 
     def _build_spawn_env(self, task_id: str) -> dict[str, str]:
-        """Build environment dict for spawning a claude process.
+        """Bridge-specific env vars to inject into a spawned claude.
 
-        Returns os.environ.copy() with CC_DISCORD_TASK_ID and BRIDGE_URL added.
+        Only the bridge-owned keys: zellij injects these at exec time via
+        `env(1)`, on top of whatever env the zellij server was started with
+        (which already carries PATH, HOME, etc).
         """
-        env = os.environ.copy()
-        env["CC_DISCORD_TASK_ID"] = task_id
-        if "BRIDGE_URL" not in env:
-            env["BRIDGE_URL"] = "http://127.0.0.1:8787"
-        return env
+        return {
+            "CC_DISCORD_TASK_ID": task_id,
+            "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
+        }
 
     async def _is_pane_alive(self, pane_id: str) -> bool:
         """Check if a pane is still running (returns False if exited)."""
@@ -604,6 +624,14 @@ class TaskRegistry:
 
     async def handle_event(self, hook_event_name: str, body: dict) -> None:
         """Dispatch event to appropriate handler by name."""
+        session_id = body.get("session_id")
+        bound = bool(session_id and self.get_by_session_id(session_id))
+        logger.info(
+            "hook event: %s session_id=%s bound=%s",
+            hook_event_name,
+            (session_id[:8] + "…") if session_id else "<missing>",
+            bound,
+        )
         handler_name = self._HANDLERS.get(hook_event_name)
         if handler_name is None:
             logger.info(f"Unknown hook event: {hook_event_name}")
@@ -771,15 +799,46 @@ class TaskRegistry:
         if agg is not None:
             await agg.flush_now()
 
-        # Read transcript and post the final assistant turn
+        # Read transcript and post the final assistant turn. The Stop hook
+        # fires before Claude's transcript writer flushes the final assistant
+        # entry — retry briefly to absorb that race.
         transcript_path = body.get("transcript_path") or task.current_transcript_path
         if transcript_path:
-            text = transcript.extract_final_assistant_text(Path(transcript_path))
+            text = await self._read_final_assistant_text_with_retry(Path(transcript_path))
             if text:
                 try:
                     await self._bot.post(text, thread_id=task.thread_id)
                 except Exception:
                     logger.exception("failed to post final assistant turn for task %s", task.task_id)
+            else:
+                logger.info("Stop: no assistant text within retry deadline for task %s", task.task_id)
+        else:
+            logger.info("Stop: no transcript_path in body or task; skipping post")
+
+    # Retry budget for the Stop transcript-flush race. Tests override to 0 to
+    # skip the retry loop when they're verifying the empty-text branches.
+    _STOP_TRANSCRIPT_RETRY_SECS: float = 2.0
+
+    async def _read_final_assistant_text_with_retry(self, path: Path) -> str:
+        """Extract final assistant text with bounded retry for the post-Stop write race.
+
+        Claude flushes the final assistant entry around Stop time, sometimes
+        slightly after the hook fires. Retry with exponential backoff until we
+        get non-empty text or hit the deadline. Returns immediately if the
+        transcript file doesn't exist — no point waiting on a write that will
+        never come.
+        """
+        if not path.is_file():
+            return ""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._STOP_TRANSCRIPT_RETRY_SECS
+        delay = 0.05
+        while True:
+            text = transcript.extract_final_assistant_text(path)
+            if text or loop.time() >= deadline:
+                return text
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.4)
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes."""

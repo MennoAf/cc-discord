@@ -498,6 +498,8 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     # Wait for bot to be ready before syncing commands
     while not bot.is_ready:
         await asyncio.sleep(0.1)
+    # Bot is ready — drain any reconciliation notices staged by load_from_db.
+    await task_registry.flush_startup_notices()
     guild_id = bot.channel.guild.id  # type: ignore[union-attr]
     guild = discord.Object(id=guild_id)
     tree.copy_global_to(guild=guild)  # registers globally to this guild for instant sync
