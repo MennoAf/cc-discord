@@ -139,7 +139,6 @@ class TaskRegistry:
     async def _on_session_start(self, body: dict) -> None:
         """Handle SessionStart event."""
         session_id = body.get("session_id")
-        cwd = body.get("cwd")
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
         task_id = env_passthrough.get("CC_DISCORD_TASK_ID")
