@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from bridge.state import TaskRow, upsert_task
-from bridge.tasks import Task, TaskRegistry, TaskSpawnError
+from bridge.tasks import Task, TaskRegistry, TaskSpawnError, _ToolSummaryAggregator
 from bridge.zellij import ZellijManager
 from tests.fakes import FakeBot, FakeZellij
 
@@ -1419,3 +1419,308 @@ class TestTaskRegistryPhase3:
         assert task is not None
         assert task.last_activity > old_activity
 
+
+    async def test_on_user_prompt_submit_starts_typing(self, in_memory_db) -> None:
+        """_on_user_prompt_submit starts typing indicator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Dispatch UserPromptSubmit
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+
+        # Verify typing task was created
+        assert "task-123" in registry._typing_tasks
+        task_obj = registry._typing_tasks["task-123"]
+        assert not task_obj.done()
+
+        # Clean up
+        await registry._stop_typing("task-123")
+        await asyncio.sleep(0.01)
+
+    async def test_on_stop_cancels_typing(self, in_memory_db) -> None:
+        """_on_stop cancels the typing indicator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        assert "task-123" in registry._typing_tasks
+        assert not registry._typing_tasks["task-123"].done()
+
+        # Stop
+        await registry._on_stop({"session_id": "sess-abc"})
+        await asyncio.sleep(0.01)
+
+        # Verify typing was cancelled
+        assert "task-123" not in registry._typing_tasks
+
+    async def test_on_notification_cancels_typing(self, in_memory_db) -> None:
+        """_on_notification cancels the typing indicator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        assert "task-123" in registry._typing_tasks
+
+        # Notification
+        await registry._on_notification({"session_id": "sess-abc"})
+        await asyncio.sleep(0.01)
+
+        # Verify typing was cancelled
+        assert "task-123" not in registry._typing_tasks
+
+    async def test_on_session_end_cancels_typing(self, in_memory_db) -> None:
+        """_on_session_end cancels the typing indicator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        assert "task-123" in registry._typing_tasks
+
+        # SessionEnd
+        await registry._on_session_end({"session_id": "sess-abc"})
+        await asyncio.sleep(0.01)
+
+        # Verify typing was cancelled
+        assert "task-123" not in registry._typing_tasks
+
+    async def test_on_user_prompt_submit_unknown_session_is_noop(self, in_memory_db) -> None:
+        """_on_user_prompt_submit silently drops unknown session IDs."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Dispatch for unknown session
+        await registry._on_user_prompt_submit({"session_id": "unknown"})
+
+        # No crash, no typing task created
+        assert len(registry._typing_tasks) == 0
+
+    async def test_on_user_prompt_submit_twice_replaces_typing_task(
+        self, in_memory_db
+    ) -> None:
+        """Calling _on_user_prompt_submit twice cancels the first typing task."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # First submit
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        first_task = registry._typing_tasks["task-123"]
+        assert not first_task.done()
+
+        # Second submit (should cancel first)
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await asyncio.sleep(0.01)
+
+        # First task should be done/cancelled
+        assert first_task.done()
+
+        # New task should exist
+        second_task = registry._typing_tasks["task-123"]
+        assert not second_task.done()
+        assert second_task is not first_task
+
+        # Clean up
+        await registry._stop_typing("task-123")
+
+    async def test_on_post_tool_use_appends_to_aggregator(self, in_memory_db) -> None:
+        """_on_post_tool_use appends formatted summary to aggregator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Dispatch PostToolUse
+        await registry._on_post_tool_use({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        # Verify aggregator has the line
+        agg = registry._aggregators.get("task-123")
+        assert agg is not None
+        assert len(agg._lines) == 1
+        assert "Bash" in agg._lines[0]
+        assert "pytest" in agg._lines[0]
+
+    async def test_aggregator_coalesces_within_window(self, in_memory_db) -> None:
+        """Multiple PostToolUse events within 1s window produce one post."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        # Override the aggregator flush window to be very short for testing
+        _ToolSummaryAggregator.FLUSH_WINDOW = 0.05
+        await registry.load_from_db()
+
+        # Dispatch two PostToolUse within the window
+        await registry._on_post_tool_use({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cmd1"},
+            "tool_response": {"exit_code": 0},
+        })
+        await registry._on_post_tool_use({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cmd2"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        # Wait for flush window to pass
+        await asyncio.sleep(0.1)
+
+        # Verify only one post was made (two lines in it)
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        post_body = posts[0]["content"]
+        assert "cmd1" in post_body
+        assert "cmd2" in post_body
+        # Should have two lines separated by newline
+        lines = post_body.split("\n")
+        assert len(lines) >= 2
+
+        # Reset for future tests
+        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
+
+    async def test_on_stop_flushes_aggregator(self, in_memory_db) -> None:
+        """_on_stop immediately flushes the aggregator."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        _ToolSummaryAggregator.FLUSH_WINDOW = 10.0  # Very long window
+        await registry.load_from_db()
+
+        # Add a tool summary
+        await registry._on_post_tool_use({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "test"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        # At this point, the flush should be pending (hasn't fired yet)
+        agg = registry._aggregators["task-123"]
+        assert len(agg._lines) == 1
+
+        # Now call Stop, which should flush immediately
+        await registry._on_stop({"session_id": "sess-abc"})
+
+        # Verify the post was made immediately
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "test" in posts[0]["content"]
+
+        # Reset
+        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0

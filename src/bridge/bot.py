@@ -200,6 +200,12 @@ class Bot:
         except discord.NotFound:
             return False
 
+    async def fetch_messageable(self, thread_id: int) -> discord.abc.Messageable:
+        """Resolve a thread id to a Messageable (caches via _client.fetch_channel)."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        return await self._client.fetch_channel(thread_id)
+
     async def archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread by ID.
 

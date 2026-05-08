@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from bridge import tool_summary
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
@@ -35,6 +37,51 @@ class TaskRestartError(Exception):
     """Raised when a task cannot be restarted (e.g., no session to resume)."""
 
     pass
+
+
+class _ToolSummaryAggregator:
+    """Collects PostToolUse summaries within a 1s window and flushes as one Discord message."""
+
+    FLUSH_WINDOW = 1.0  # seconds
+
+    def __init__(self, bot, thread_id: int) -> None:
+        self._bot = bot
+        self._thread_id = thread_id
+        self._lines: list[str] = []
+        self._flush_task: asyncio.Task | None = None
+
+    def append(self, line: str) -> None:
+        self._lines.append(line)
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_after_window())
+
+    async def _flush_after_window(self) -> None:
+        try:
+            await asyncio.sleep(self.FLUSH_WINDOW)
+        except asyncio.CancelledError:
+            return
+        if not self._lines:
+            return
+        body = "\n".join(self._lines)
+        self._lines.clear()
+        try:
+            await self._bot.post(body, thread_id=self._thread_id)
+        except Exception:
+            logger.exception("failed to post tool summary chunk")
+
+    async def flush_now(self) -> None:
+        """Force flush (called on Stop / SessionEnd to avoid orphaned summaries)."""
+        if self._flush_task is not None and not self._flush_task.done():
+            self._flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._flush_task
+        if self._lines:
+            body = "\n".join(self._lines)
+            self._lines.clear()
+            try:
+                await self._bot.post(body, thread_id=self._thread_id)
+            except Exception:
+                logger.exception("failed to flush final tool summary chunk")
 
 
 @dataclass
@@ -91,6 +138,8 @@ class TaskRegistry:
         self._by_thread_id: dict[int, Task] = {}
         self._by_session_id: dict[str, Task] = {}
         self._stop_futures: dict[str, asyncio.Future] = {}
+        self._typing_tasks: dict[str, asyncio.Task] = {}
+        self._aggregators: dict[str, _ToolSummaryAggregator] = {}
 
     async def load_from_db(self) -> None:
         """Load active tasks from database into memory maps."""
@@ -188,6 +237,44 @@ class TaskRegistry:
             await self._bot.archive_thread(thread_id)
         except Exception:
             logger.exception("Failed to archive thread %d", thread_id)
+
+    async def _start_typing(self, task: Task) -> None:
+        """Start a typing indicator for a task. Cancels any prior typing task."""
+        prev = self._typing_tasks.pop(task.task_id, None)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        self._typing_tasks[task.task_id] = asyncio.create_task(
+            self._run_typing(task), name=f"typing-{task.task_id[:8]}"
+        )
+
+    async def _run_typing(self, task: Task) -> None:
+        """Run typing indicator in background. Lives until cancelled."""
+        try:
+            channel = await self._bot.fetch_messageable(task.thread_id)
+            async with channel.typing():
+                # Sleep until cancelled (Stop/Notification cancels us). Discord.py auto-renews
+                # the indicator every 5s under the hood; we just need the context to stay open.
+                await asyncio.Future()  # never resolves; we live until cancelled
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("typing indicator failed for task %s", task.task_id)
+
+    async def _stop_typing(self, task_id: str) -> None:
+        """Cancel and await a typing task."""
+        t = self._typing_tasks.pop(task_id, None)
+        if t is not None and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+
+    def _agg_for(self, task: Task) -> _ToolSummaryAggregator:
+        """Lookup or create aggregator for a task."""
+        agg = self._aggregators.get(task.task_id)
+        if agg is None:
+            agg = _ToolSummaryAggregator(self._bot, task.thread_id)
+            self._aggregators[task.task_id] = agg
+        return agg
 
     async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
         """Spawn a new claude session in a Discord-bound task.
@@ -387,78 +474,97 @@ class TaskRegistry:
         )
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
-        """Handle UserPromptSubmit event."""
+        """Handle UserPromptSubmit event. Start typing indicator."""
         session_id = body.get("session_id")
-        logger.info(f"UserPromptSubmit: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            await self._bot.post(
-                "💬 UserPromptSubmit received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        await self._start_typing(task)
 
     async def _on_post_tool_use(self, body: dict) -> None:
-        """Handle PostToolUse event."""
+        """Handle PostToolUse event. Append tool summary to aggregator."""
         session_id = body.get("session_id")
-        logger.info(f"PostToolUse: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            await self._bot.post(
-                "🔧 PostToolUse received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
+        line = tool_summary.summarize(
+            body.get("tool_name", "?"),
+            body.get("tool_input", {}) or {},
+            body.get("tool_response", {}) or {},
+        )
+        self._agg_for(task).append(line)
 
     async def _on_post_tool_use_failure(self, body: dict) -> None:
-        """Handle PostToolUseFailure event."""
+        """Handle PostToolUseFailure event. Force-failure summary."""
         session_id = body.get("session_id")
-        logger.info(f"PostToolUseFailure: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            await self._bot.post(
-                "❌ PostToolUseFailure received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        # Force-failure: synthesize a tool_response.is_error=True if missing.
+        tool_response = (body.get("tool_response") or {}).copy()
+        tool_response["is_error"] = True
+        line = tool_summary.summarize(
+            body.get("tool_name", "?"),
+            body.get("tool_input", {}) or {},
+            tool_response,
+        )
+        self._agg_for(task).append(line)
 
     async def _on_stop(self, body: dict) -> None:
-        """Handle Stop event."""
+        """Handle Stop event. Stop typing indicator and flush tool summaries."""
         session_id = body.get("session_id")
-        logger.info(f"Stop: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            await self._bot.post(
-                "⏹️ Stop received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        await self._stop_typing(task.task_id)
+
+        # Flush pending tool summaries
+        agg = self._aggregators.get(task.task_id)
+        if agg is not None:
+            await agg.flush_now()
 
     async def _on_notification(self, body: dict) -> None:
-        """Handle Notification event."""
+        """Handle Notification event. Stop typing indicator."""
         session_id = body.get("session_id")
-        logger.info(f"Notification: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            await self._bot.post(
-                "🔔 Notification received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        task.last_activity = int(time.time())
+        await self._persist(task)
+        await self._stop_typing(task.task_id)
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
 
-        Resolves any pending stop_future for the task so stop_task can proceed.
-        Also posts a notification to the thread.
+        Stops typing indicator, resolves any pending stop_future for the task so stop_task can proceed.
         """
         session_id = body.get("session_id")
-        logger.info(f"SessionEnd: session_id={session_id}")
-        task = self.get_by_session_id(session_id) if session_id else None
-        if task:
-            # Resolve the stop future if one exists (allows graceful stop to complete)
-            fut = self._stop_futures.get(task.task_id)
-            if fut is not None and not fut.done():
-                fut.set_result(None)
-            await self._bot.post(
-                "🏁 SessionEnd received",
-                thread_id=task.thread_id,
-            )
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        await self._stop_typing(task.task_id)
+        fut = self._stop_futures.get(task.task_id)
+        if fut is not None and not fut.done():
+            fut.set_result(None)
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event (no-op in Phase 1)."""

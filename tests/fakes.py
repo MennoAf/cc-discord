@@ -7,10 +7,30 @@ from typing import Any
 
 
 @dataclass
+class FakeTypingContext:
+    """Fake typing context manager."""
+
+    entered: bool = False
+    exited: bool = False
+
+    async def __aenter__(self) -> "FakeTypingContext":
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        self.exited = True
+
+
+@dataclass
 class FakeBotChannel:
     """Fake channel object from bot."""
 
     id: int = 1000
+    typing_context: FakeTypingContext = field(default_factory=FakeTypingContext)
+
+    def typing(self) -> FakeTypingContext:
+        """Return a fake typing context manager."""
+        return self.typing_context
 
 
 @dataclass
@@ -43,6 +63,8 @@ class FakeBot:
     _post_calls: list[dict] = field(default_factory=list)
     _thread_calls: list[dict] = field(default_factory=list)
     _archive_calls: list[dict] = field(default_factory=list)
+    _fake_channels: dict[int, FakeBotChannel] = field(default_factory=dict)
+    is_ready: bool = True
 
     @property
     def client(self) -> Any:
@@ -66,6 +88,12 @@ class FakeBot:
     async def archive_thread(self, thread_id: int) -> None:
         """Fake archive_thread: record the call."""
         self._archive_calls.append({"thread_id": thread_id})
+
+    async def fetch_messageable(self, thread_id: int) -> FakeBotChannel:
+        """Fake fetch_messageable: return a FakeBotChannel."""
+        if thread_id not in self._fake_channels:
+            self._fake_channels[thread_id] = FakeBotChannel(id=thread_id)
+        return self._fake_channels[thread_id]
 
     def get_post_calls(self) -> list[dict]:
         return self._post_calls
