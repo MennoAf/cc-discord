@@ -20,6 +20,7 @@ from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
+    from bridge.approvals import ApprovalRouter
     from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
@@ -139,11 +140,12 @@ class TaskRegistry:
         "PreCompact": "_on_pre_compact",
     }
 
-    def __init__(self, conn: aiosqlite.Connection, bot, zellij: ZellijManager) -> None:
-        """Initialize with database connection, bot, and zellij manager."""
+    def __init__(self, conn: aiosqlite.Connection, bot, zellij: ZellijManager, approval_router: "ApprovalRouter | None" = None) -> None:
+        """Initialize with database connection, bot, zellij manager, and optional approval router."""
         self._conn = conn
         self._bot = bot
         self._zellij = zellij
+        self._approval_router = approval_router
         self._by_task_id: dict[str, Task] = {}
         self._by_thread_id: dict[int, Task] = {}
         self._by_session_id: dict[str, Task] = {}
@@ -489,13 +491,18 @@ class TaskRegistry:
         )
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
-        """Handle UserPromptSubmit event. Start typing indicator."""
+        """Handle UserPromptSubmit event. Start typing indicator and cancel pending TUI prompts."""
         session_id = body.get("session_id")
         if not session_id:
             return
         task = self.get_by_session_id(session_id)
         if task is None:
             return
+        # Cancel any pending TUI prompts for this thread — user typed in zellij.
+        if self._approval_router:
+            cancelled = await self._approval_router.cancel_thread_tui(task.thread_id)
+            if cancelled > 0:
+                logger.info("cancelled %d pending TUI prompts for task %s (answered in zellij)", cancelled, task.task_id)
         task.last_activity = int(time.time())
         await self._persist(task)
         await self._start_typing(task)
@@ -539,13 +546,16 @@ class TaskRegistry:
         self._agg_for(task).append(line)
 
     async def _on_stop(self, body: dict) -> None:
-        """Handle Stop event. Stop typing indicator, flush tool summaries, and post final assistant turn."""
+        """Handle Stop event. Cancel pending TUI, stop typing, flush summaries, and post final turn."""
         session_id = body.get("session_id")
         if not session_id:
             return
         task = self.get_by_session_id(session_id)
         if task is None:
             return
+        # Defensively cancel any pending TUI prompts when Stop fires
+        if self._approval_router:
+            await self._approval_router.cancel_thread_tui(task.thread_id)
         task.last_activity = int(time.time())
         await self._persist(task)
         await self._stop_typing(task.task_id)
@@ -566,7 +576,7 @@ class TaskRegistry:
                     logger.exception("failed to post final assistant turn for task %s", task.task_id)
 
     async def _on_notification(self, body: dict) -> None:
-        """Handle Notification event. Stop typing indicator."""
+        """Handle Notification event. Stop typing indicator and dispatch TUI prompts if pending."""
         session_id = body.get("session_id")
         if not session_id:
             return
@@ -576,6 +586,30 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
         await self._stop_typing(task.task_id)
+
+        # Cancel any pending tool-summary aggregator (no harm; flush_now is idempotent)
+        agg = self._aggregators.get(task.task_id)
+        if agg is not None:
+            await agg.flush_now()
+
+        transcript_path = body.get("transcript_path") or task.current_transcript_path
+        if not transcript_path:
+            # Generic stall — post a simple notice
+            await self._bot.post(
+                "🟡 Claude is waiting for input. Reply in this thread or type in zellij.",
+                thread_id=task.thread_id,
+            )
+            return
+
+        pending = transcript.find_latest_unresolved_tool_use(Path(transcript_path))
+
+        if pending and pending["name"] == "AskUserQuestion":
+            await self._handle_ask_user_question(task, pending)
+        elif pending and pending["name"] == "ExitPlanMode":
+            await self._handle_exit_plan_mode(task, pending)
+        else:
+            # Generic free-text stall
+            await self._handle_free_text_stall(task)
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
@@ -600,6 +634,90 @@ class TaskRegistry:
     async def _on_pre_compact(self, body: dict) -> None:
         """Handle PreCompact event (no-op in Phase 1)."""
         logger.debug("PreCompact received")
+
+    async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
+        """Handle AskUserQuestion prompt: post to Discord with option reactions."""
+        if not self._approval_router:
+            return
+        questions = pending["input"].get("questions") or []
+        if not questions:
+            return await self._handle_free_text_stall(task)
+        q = questions[0]  # Phase 6 supports the first question only — multi-question is rare
+        options = [opt.get("label", "") for opt in (q.get("options") or [])]
+        if not options:
+            return await self._handle_free_text_stall(task)
+        # Build the Discord message body
+        lines = [f"❓ **{q.get('question', '?')}**"]
+        for i, opt in enumerate(q.get("options") or [], start=1):
+            emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"][i - 1] if i <= 4 else f"{i}."
+            label = opt.get("label", "")
+            desc = opt.get("description", "")
+            if desc:
+                lines.append(f"{emoji} **{label}** — {desc}")
+            else:
+                lines.append(f"{emoji} {label}")
+        body = "\n".join(lines)
+
+        request_id = str(uuid.uuid4())
+        answer, source = await self._approval_router.request_tui_answer(
+            request_id=request_id,
+            task_id=task.task_id,
+            thread_id=task.thread_id,
+            pane_id=task.zellij_pane_id or "",
+            kind="ask_question",
+            prompt_body=body,
+            options=options,
+        )
+        await self._inject_to_pane(task, answer, source)
+
+    async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
+        """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
+        if not self._approval_router:
+            return
+        plan = pending["input"].get("plan") or "(empty plan)"
+        body = (
+            f"📋 **Plan ready for review**\n\n{plan}\n\n"
+            f"React ✅ to approve, ❌ to reject, or reply in this thread to leave feedback."
+        )
+        request_id = str(uuid.uuid4())
+        answer, source = await self._approval_router.request_tui_answer(
+            request_id=request_id,
+            task_id=task.task_id,
+            thread_id=task.thread_id,
+            pane_id=task.zellij_pane_id or "",
+            kind="exit_plan",
+            prompt_body=body,
+        )
+        await self._inject_to_pane(task, answer, source)
+
+    async def _handle_free_text_stall(self, task: Task) -> None:
+        """Handle free-text stall: post generic waiting notice."""
+        if not self._approval_router:
+            return
+        request_id = str(uuid.uuid4())
+        body = "🟡 Claude is waiting for input. Reply in this thread or type in zellij."
+        answer, source = await self._approval_router.request_tui_answer(
+            request_id=request_id,
+            task_id=task.task_id,
+            thread_id=task.thread_id,
+            pane_id=task.zellij_pane_id or "",
+            kind="free_text",
+            prompt_body=body,
+        )
+        await self._inject_to_pane(task, answer, source)
+
+    async def _inject_to_pane(self, task: Task, answer: str, source: str) -> None:
+        """Inject the answer to the pane. Short-circuit if cancelled/timed out/post failed."""
+        if source in ("cancelled", "timeout", "post_failed"):
+            return
+        if not answer:
+            return
+        if not task.zellij_pane_id:
+            return
+        try:
+            await self._zellij.write_to_pane(task.zellij_pane_id, answer + "\n")
+        except Exception:
+            logger.exception("failed to inject TUI answer into pane for task %s", task.task_id)
 
     async def write_initial_prompt(self, task_id: str, prompt: str) -> None:
         """Write initial prompt to a task's zellij pane after session bind.

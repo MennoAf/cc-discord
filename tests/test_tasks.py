@@ -2195,3 +2195,238 @@ class TestTaskRegistryPhase3:
         # Should not crash and should not post
         posts = fake_bot.get_post_calls()
         assert len(posts) == 0
+
+
+@pytest.mark.asyncio
+async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
+    """_on_notification dispatches AskUserQuestion via approval_router."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=0.05)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_ask",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Which option?",
+                                    "options": [
+                                        {"label": "A", "description": "Option A"},
+                                        {"label": "B", "description": "Option B"},
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        }
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-1",
+        3001,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_1",
+        current_claude_session_id="sess-tui-1",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    # Trigger notification
+    await registry._on_notification({
+        "session_id": "sess-tui-1",
+        "transcript_path": str(transcript_path),
+    })
+
+    # Verify approval_router.request_tui_answer was called (check bot posts)
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    # First post should be the question
+    assert "Which option?" in posts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
+    """_on_notification dispatches ExitPlanMode via approval_router."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=0.05)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_exit",
+                        "name": "ExitPlanMode",
+                        "input": {
+                            "plan": "## Step 1\n## Step 2",
+                        },
+                    }
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        }
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-2",
+        3002,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_2",
+        current_claude_session_id="sess-tui-2",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    # Trigger notification
+    await registry._on_notification({
+        "session_id": "sess-tui-2",
+        "transcript_path": str(transcript_path),
+    })
+
+    # Verify post contains plan body
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    assert "Plan ready for review" in posts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
+    """_on_notification posts generic waiting notice for free-text stall."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=0.05)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Waiting..."}
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        }
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-3",
+        3003,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_3",
+        current_claude_session_id="sess-tui-3",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    # Trigger notification
+    await registry._on_notification({
+        "session_id": "sess-tui-3",
+        "transcript_path": str(transcript_path),
+    })
+
+    # Verify generic waiting notice was posted
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    assert "waiting for input" in posts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
+    """_on_user_prompt_submit cancels pending TUI prompts."""
+    from bridge.approvals import ApprovalRouter
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-4",
+        3004,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_4",
+        current_claude_session_id="sess-tui-4",
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    # Start a pending TUI request
+    async def create_tui_request():
+        answer, source = await approval_router.request_tui_answer(
+            request_id="req-tui-test",
+            task_id="task-tui-4",
+            thread_id=3004,
+            pane_id="pane_4",
+            kind="free_text",
+            prompt_body="Waiting...",
+            timeout=10.0,
+        )
+        return answer, source
+
+    tui_task = asyncio.create_task(create_tui_request())
+
+    # Let it register
+    await asyncio.sleep(0.05)
+
+    # Call _on_user_prompt_submit
+    await registry._on_user_prompt_submit({
+        "session_id": "sess-tui-4",
+    })
+
+    # The TUI request should be cancelled
+    result = await tui_task
+    assert result == ("", "cancelled")
