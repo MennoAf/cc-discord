@@ -202,19 +202,41 @@ class ZellijManager:
             raise ZellijError(f"write {byte_vals!r} failed: {stderr}")
 
     async def close_pane(self, pane_id: str) -> None:
-        """Close the task tab named `pane_id`. Idempotent — missing tab is a no-op."""
+        """Close the task tab named `pane_id`. Best-effort: idempotent on
+        missing tab, swallows timeouts/errors so callers (e.g. /kill) can
+        still complete bridge-side cleanup when zellij is unresponsive.
+        """
         async with self._session_lock:
-            rc, _, stderr = await self._run_unlocked(
-                self._executable, "--session", SESSION_NAME,
-                "action", "go-to-tab-name", pane_id,
-            )
-            if rc != 0:
-                logger.info("close_pane %s: tab not found, treating as already closed", pane_id)
+            try:
+                rc, _, stderr = await self._run_unlocked(
+                    self._executable, "--session", SESSION_NAME,
+                    "action", "go-to-tab-name", pane_id,
+                    timeout=3.0,
+                )
+            except ZellijError as e:
+                logger.warning(
+                    "close_pane %s: go-to-tab-name failed (%s); continuing",
+                    pane_id, e,
+                )
                 return
-            rc, _, stderr = await self._run_unlocked(
-                self._executable, "--session", SESSION_NAME,
-                "action", "close-tab",
-            )
+            if rc != 0:
+                logger.info(
+                    "close_pane %s: tab not found, treating as already closed",
+                    pane_id,
+                )
+                return
+            try:
+                rc, _, stderr = await self._run_unlocked(
+                    self._executable, "--session", SESSION_NAME,
+                    "action", "close-tab",
+                    timeout=3.0,
+                )
+            except ZellijError as e:
+                logger.warning(
+                    "close_pane %s: close-tab failed (%s); continuing",
+                    pane_id, e,
+                )
+                return
             if rc != 0:
                 logger.info("close-tab %s: %s", pane_id, stderr)
 
