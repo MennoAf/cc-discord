@@ -12,7 +12,6 @@ from bridge.zellij import (
     ZellijError,
     ZellijSessionMissing,
     ZellijSpawnError,
-    ZellijPaneInfo,
 )
 
 

@@ -1,7 +1,11 @@
 """Task and TaskRegistry for managing discord-driven sessions."""
 
 import logging
+import os
+import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import aiosqlite
 
@@ -9,6 +13,12 @@ from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijManager
 
 logger = logging.getLogger(__name__)
+
+
+class TaskSpawnError(Exception):
+    """Raised when a task cannot be spawned."""
+
+    pass
 
 
 @dataclass
@@ -121,6 +131,91 @@ class TaskRegistry:
             current_transcript_path=task.current_transcript_path,
         )
 
+    async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
+        """Spawn a new claude session in a Discord-bound task.
+
+        1. Validates cwd is a directory.
+        2. Generates a task_id UUID.
+        3. Creates a Discord thread.
+        4. Persists a row with status='spawning'.
+        5. Builds env with CC_DISCORD_TASK_ID and BRIDGE_URL.
+        6. Spawns claude in zellij via ZellijManager.
+        7. Updates row with zellij_pane_id.
+        8. Indexes the task in memory.
+        9. Returns the Task.
+
+        The `prompt` parameter is accepted for forward compatibility but ignored
+        in Phase 2 — Phase 3 will call write_to_pane after SessionStart binding.
+
+        Raises TaskSpawnError if cwd is not a directory or zellij spawn fails.
+        """
+        # Validate cwd
+        if not Path(cwd).is_dir():
+            raise TaskSpawnError(f"cwd does not exist: {cwd}")
+
+        # Generate task_id
+        task_id = str(uuid.uuid4())
+
+        # Create Discord thread
+        thread_name = f"cc · {Path(cwd).name} · {task_id[:8]}"
+        thread_id = await self._bot.create_thread(name=thread_name)
+
+        # Persist row with status='spawning'
+        now = int(time.time())
+        await upsert_task(
+            self._conn,
+            task_id,
+            thread_id,
+            cwd,
+            "spawning",
+            zellij_pane_id=None,
+            current_claude_session_id=None,
+            current_transcript_path=None,
+            now=now,
+        )
+
+        # Build env for spawned claude
+        env = os.environ.copy()
+        env["CC_DISCORD_TASK_ID"] = task_id
+        if "BRIDGE_URL" not in env:
+            env["BRIDGE_URL"] = "http://127.0.0.1:8787"
+
+        # Spawn via zellij
+        pane_id = await self._zellij.spawn_task(
+            cwd=cwd,
+            env=env,
+            pane_name=f"cc-{task_id[:8]}",
+        )
+
+        # Update row with zellij_pane_id
+        await upsert_task(
+            self._conn,
+            task_id,
+            thread_id,
+            cwd,
+            "spawning",
+            zellij_pane_id=pane_id,
+            current_claude_session_id=None,
+            current_transcript_path=None,
+            now=now,
+        )
+
+        # Construct and index the Task
+        task = Task(
+            task_id=task_id,
+            thread_id=thread_id,
+            zellij_pane_id=pane_id,
+            cwd=cwd,
+            status="spawning",
+            current_claude_session_id=None,
+            current_transcript_path=None,
+            created_at=now,
+            last_activity=now,
+        )
+        await self._index(task)
+
+        return task
+
     async def handle_event(self, hook_event_name: str, body: dict) -> None:
         """Dispatch event to appropriate handler by name."""
         handler_name = self._HANDLERS.get(hook_event_name)
@@ -139,7 +234,13 @@ class TaskRegistry:
             logger.exception(f"Error handling {hook_event_name}")
 
     async def _on_session_start(self, body: dict) -> None:
-        """Handle SessionStart event."""
+        """Handle SessionStart event.
+
+        Updates task status from 'spawning' to 'running', binds session_id +
+        transcript_path, and posts a bind notice to the Discord thread.
+
+        Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
+        """
         session_id = body.get("session_id")
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
@@ -147,18 +248,35 @@ class TaskRegistry:
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}")
 
-        if task_id and session_id:
-            task = self.get_by_task_id(task_id)
-            if task:
-                prev_session_id = task.current_claude_session_id
-                task.current_claude_session_id = session_id
-                task.current_transcript_path = transcript_path
-                await self._index(task, prev_session_id=prev_session_id)
-                await self._persist(task)
-                await self._bot.post(
-                    f"🟢 SessionStart received (task={task_id[:8]})",
-                    thread_id=task.thread_id,
-                )
+        # AC2.4: drop SessionStart without task_id
+        if not task_id:
+            return
+
+        task = self.get_by_task_id(task_id)
+        if not task:
+            logger.warning(f"SessionStart: task_id {task_id} not found in registry")
+            return
+
+        # Update task fields
+        prev_session_id = task.current_claude_session_id
+        task.current_claude_session_id = session_id
+        task.current_transcript_path = transcript_path
+        task.status = "running"
+        task.last_activity = int(time.time())
+
+        # Re-index (re-keys _by_session_id)
+        await self._index(task, prev_session_id=prev_session_id)
+
+        # Persist
+        await self._persist(task)
+
+        # Post bind notice
+        short_session_id = session_id[:8] if session_id else "?"
+        bind_notice = f"🟢 Task started — claude session `{short_session_id}`"
+        await self._bot.post(
+            bind_notice,
+            thread_id=task.thread_id,
+        )
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
         """Handle UserPromptSubmit event."""
