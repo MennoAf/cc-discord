@@ -147,12 +147,14 @@ class TestInitCommand:
                 return self._is_ready
 
             async def start(self) -> None:
-                # Simulate connection that never completes
-                await asyncio.sleep(10)
+                # Return immediately (like the real Bot.start() which create_task()s the gateway connect)
+                pass
 
             async def close(self) -> None:
                 pass
 
+        # Monkeypatch the timeout to fail quickly instead of waiting 15s
+        monkeypatch.setattr("bridge.cli._TOKEN_VALIDATION_TIMEOUT", 0.1)
         monkeypatch.setattr("bridge.cli.Bot", FakeBot)
 
         runner = CliRunner()

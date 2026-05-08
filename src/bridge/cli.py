@@ -19,6 +19,9 @@ from bridge.server import serve as serve_server
 
 logger = logging.getLogger(__name__)
 
+# Token validation timeout in seconds (extracted as constant for test monkeypatching)
+_TOKEN_VALIDATION_TIMEOUT = 15
+
 
 async def _validate_token_and_post_test(secrets: Secrets) -> bool:
     """Validate token by starting bot and posting a test message.
@@ -30,10 +33,9 @@ async def _validate_token_and_post_test(secrets: Secrets) -> bool:
     try:
         await bot.start()
 
-        # Wait up to 15 seconds for bot to become ready
-        start_time = asyncio.get_event_loop().time()
-        timeout = 15
-        while asyncio.get_event_loop().time() - start_time < timeout:
+        # Wait up to _TOKEN_VALIDATION_TIMEOUT seconds for bot to become ready
+        start_time = asyncio.get_running_loop().time()
+        while asyncio.get_running_loop().time() - start_time < _TOKEN_VALIDATION_TIMEOUT:
             if bot.is_ready:
                 # Post confirmation message to channel root (no thread)
                 await bot.post("✅ claude-discord-bridge init succeeded — you'll see future notifications here.")
