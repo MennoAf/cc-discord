@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pytest
 from aiohttp import test_utils
 
+from bridge import state
 from bridge.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
@@ -91,6 +92,12 @@ class FakeBot:
         self._thread_alive_map[thread_id] = True
         return thread_id
 
+    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+        """Fake add_reactions: do nothing for testing."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        # Just do nothing for testing
+
     async def thread_alive(self, thread_id: int) -> bool:
         """Fake thread_alive: check the map."""
         return self._thread_alive_map.get(thread_id, True)
@@ -130,12 +137,14 @@ async def client(fake_bot, in_memory_db, monkeypatch):
     task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
     await task_registry.load_from_db()
     # Wire in listener and ask_locks for /v1/ask testing
-    from bridge.server import AskLockMap
+    from bridge.server import AskLockMap, APPROVAL_ROUTER_KEY
+    from bridge.approvals import ApprovalRouter
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = Listener()
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
     app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db)
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
@@ -1415,3 +1424,83 @@ class TestDispatcher:
         assert len(listener_calls) == 1
         assert listener_calls[0] is msg
         assert len(zellij_calls) == 0
+
+
+# Tests for POST /v1/hook/pretooluse endpoint
+
+@pytest.mark.asyncio
+async def test_pretooluse_valid_request(client, in_memory_db, fake_bot):
+    """POST /v1/hook/pretooluse with valid body and known task returns approval decision."""
+    # Set bot to ready state
+    fake_bot.set_ready(True)
+
+    # Create a task in the DB and in the TaskRegistry cache
+    from bridge.server import TASK_REGISTRY_KEY
+    await state.upsert_task(in_memory_db, "task-1", 1001, "/tmp", "running")
+    task_registry = client.server.app[TASK_REGISTRY_KEY]
+    # Reload from DB to populate cache
+    await task_registry.load_from_db()
+
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "task-1",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "ls"}
+        }
+    )
+
+    assert resp.status == 200
+    body = await resp.json()
+    # The default behavior is deny (timeout since there's no input to the future)
+    # That's the correct behavior - without user response, it times out and denies
+    assert body["decision"] == "deny"
+    assert body["reason"] == "approval timed out"
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_missing_field(client):
+    """POST /v1/hook/pretooluse missing required field returns 400."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "task-1",
+            # missing tool_name and tool_input
+        }
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_invalid_json(client):
+    """POST /v1/hook/pretooluse with invalid JSON returns 400."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        data="not json",
+        headers={"Content-Type": "application/json"}
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_unknown_task_id(client, in_memory_db):
+    """POST /v1/hook/pretooluse with unknown task_id returns deny decision."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "unknown-task",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "ls"}
+        }
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["decision"] == "deny"
+    assert "unknown" in body["reason"].lower()

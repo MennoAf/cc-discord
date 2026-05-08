@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import discord
 from aiohttp import web
 
+from bridge.approvals import ApprovalRouter
 from bridge.bot import Bot, BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.secrets import Secrets
@@ -83,6 +84,7 @@ LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
 ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
 TASK_REGISTRY_KEY: web.AppKey[TaskRegistry] = web.AppKey("task_registry", TaskRegistry)
 ZELLIJ_KEY: web.AppKey[ZellijManager] = web.AppKey("zellij", ZellijManager)
+APPROVAL_ROUTER_KEY: web.AppKey[ApprovalRouter] = web.AppKey("approval_router", ApprovalRouter)
 
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
 
@@ -341,6 +343,55 @@ async def _handle_hook_event(request: web.Request) -> web.Response:
         )
 
 
+async def _handle_pretooluse(request: web.Request) -> web.Response:
+    """Handle POST /v1/hook/pretooluse — register Future, post approval prompt, await decision."""
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "invalid json"}),
+            content_type="application/json",
+        )
+
+    required = ("request_id", "task_id", "tool_name", "tool_input")
+    if not all(k in body for k in required):
+        missing = [k for k in required if k not in body]
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": f"missing: {missing}"}),
+            content_type="application/json",
+        )
+
+    try:
+        registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+        router: ApprovalRouter = request.app[APPROVAL_ROUTER_KEY]
+
+        task = registry.get_by_task_id(body["task_id"])
+        if task is None:
+            # Fail-closed at the daemon level too: deny if we don't know this task
+            return web.json_response({
+                "decision": "deny",
+                "reason": f"unknown task_id {body['task_id']}",
+            }, status=200)
+
+        decision, reason = await router.request_permission(
+            request_id=body["request_id"],
+            task_id=body["task_id"],
+            thread_id=task.thread_id,
+            tool_name=body["tool_name"],
+            tool_input=body.get("tool_input") or {},
+        )
+        return web.json_response({"decision": decision, "reason": reason}, status=200)
+    except Exception:
+        logger.exception("pretooluse handler failed")
+        return web.Response(
+            status=500,
+            text=json.dumps({"error": "internal"}),
+            content_type="application/json",
+        )
+
+
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
@@ -350,6 +401,7 @@ async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Applica
     app.router.add_post("/v1/ask", _handle_ask)
     app.router.add_get("/v1/health", _handle_health)
     app.router.add_post("/v1/hook/event", _handle_hook_event)
+    app.router.add_post("/v1/hook/pretooluse", _handle_pretooluse)
     return app
 
 
@@ -363,19 +415,36 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     zellij = ZellijManager()
     await zellij.ensure_session_alive()
 
-    # Forward-declare task_registry for the dispatcher closure
+    # Forward-declare task_registry and approval_router for the dispatcher closures
     task_registry: TaskRegistry
+    approval_router: ApprovalRouter
 
     async def _dispatch_message(msg):
-        """Dispatch incoming messages: check task threads first, then fall back to listener."""
+        """Dispatch incoming messages.
+
+        Order matters: pending approval takes precedence over task-pane routing. When the user
+        types a deny-with-reason reply to an approval prompt, we resolve it here and don't also
+        write the same text to the zellij pane.
+        """
+        # First, try to resolve any pending approval via text reply
+        if await approval_router.resolve_by_text(msg.channel.id, msg.content or "", msg.author.bot):
+            return
+        # Then, check task threads for tool output routing
         if await task_registry.maybe_route_message(msg):
             return
+        # Finally, fall back to the general listener
         await listener.deliver(msg)
 
-    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message)
+    async def _on_reaction_dispatch(payload):
+        """Dispatch raw reaction events to the approval router."""
+        user_is_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
+        await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_bot)
+
+    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
     conn = await state.open_db()
     task_registry = TaskRegistry(conn, bot, zellij)
     await task_registry.load_from_db()
+    approval_router = ApprovalRouter(bot, conn)
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry
@@ -383,6 +452,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
     app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = approval_router
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
