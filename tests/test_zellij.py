@@ -110,6 +110,19 @@ class TestZellijManager:
         with pytest.raises(ZellijSessionMissing, match="permission denied"):
             await mgr.ensure_session_alive()
 
+    async def test_ensure_session_alive_tolerates_already_exists(self, patch_exec):
+        """zellij ≥ 0.43 returns non-zero with 'Session already exists' on second
+        attach; treat as success and return without raising."""
+        proc = FakeProc(
+            returncode=2,
+            stdout_data=b"",
+            stderr_data=b"Session already exists",
+        )
+        patch_exec._queue.append(proc)
+
+        mgr = ZellijManager()
+        await mgr.ensure_session_alive()  # should not raise
+
     async def test_list_panes_success(self, patch_exec, load_fixture):
         """list_panes parses JSON and returns flattened pane list."""
         json_output = json.dumps(load_fixture).encode()

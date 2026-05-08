@@ -13,6 +13,13 @@ SPAWN_POLL_INTERVAL = 0.1  # seconds
 SPAWN_POLL_TIMEOUT = 5.0  # seconds
 
 
+def _session_already_exists(stderr: str) -> bool:
+    """Check whether stderr from `zellij attach --create-background` indicates
+    the session is already alive (zellij ≥ 0.43 reports this as a non-zero exit)."""
+    s = stderr.lower()
+    return "already exists" in s or "already running" in s
+
+
 class ZellijError(Exception):
     """Base for all zellij-wrapper errors."""
 
@@ -131,16 +138,16 @@ class ZellijManager:
         """Ensure the bridge session exists and is accessible.
 
         Runs `zellij attach --create-background bridge`. Idempotent — safe to call
-        repeatedly. If exit code != 0 and stderr does not indicate success,
-        raises ZellijSessionMissing.
+        repeatedly. zellij ≥ 0.43 returns non-zero with stderr "Session already exists"
+        when the session is already running; treat that as success.
 
         Raises:
-            ZellijSessionMissing: If session creation fails
+            ZellijSessionMissing: If session creation fails for any other reason
         """
         returncode, stdout, stderr = await self._run(
             self._executable, "attach", "--create-background", SESSION_NAME
         )
-        if returncode != 0:
+        if returncode != 0 and not _session_already_exists(stderr):
             raise ZellijSessionMissing(f"Failed to create/attach session: {stderr}")
 
     async def list_panes(self) -> list[ZellijPaneInfo]:
@@ -294,11 +301,12 @@ class ZellijManager:
             ZellijSpawnError: If spawn fails or poll times out
         """
         async with self._session_lock:
-            # Ensure session is alive
+            # Ensure session is alive (zellij ≥ 0.43 returns non-zero "Session
+            # already exists" when bridge is already running — treat as success).
             returncode, _, stderr = await self._run_unlocked(
                 self._executable, "attach", "--create-background", SESSION_NAME
             )
-            if returncode != 0:
+            if returncode != 0 and not _session_already_exists(stderr):
                 raise ZellijSpawnError(f"Failed to create/attach session: {stderr}")
 
             # Snapshot existing pane ids
