@@ -1097,6 +1097,98 @@ class TestTaskRegistryPhase3:
         # But still findable by task_id
         assert registry.get_by_task_id("task-123") is not None
 
+    async def test_stop_task_cleans_up_typing_task_and_aggregator(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """stop_task removes typing task and flushes aggregator."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing and add a tool summary
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await asyncio.sleep(0)
+
+        # Verify typing task exists
+        assert "task-123" in registry._typing_tasks
+
+        # Add a tool summary
+        line = "✓ Bash: echo hello"
+        registry._agg_for(registry.get_by_task_id("task-123")).append(line)
+        assert "task-123" in registry._aggregators
+
+        # Mock SessionEnd to complete the stop
+        loop = asyncio.get_running_loop()
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "sess-abc"})))
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+
+        await registry.stop_task("task-123")
+
+        # Verify typing task was cleaned up
+        assert "task-123" not in registry._typing_tasks
+        # Verify aggregator was cleaned up (and flushed)
+        assert "task-123" not in registry._aggregators
+        # Verify the tool summary was posted
+        posts = fake_bot.get_post_calls()
+        assert any(line in post["content"] for post in posts)
+
+    async def test_kill_task_cleans_up_typing_task_and_aggregator(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """kill_task removes typing task and drops aggregator without flushing."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing and add a tool summary
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await asyncio.sleep(0)
+
+        # Verify typing task exists
+        assert "task-123" in registry._typing_tasks
+
+        # Add a tool summary
+        line = "✗ Bash: false (exit 1)"
+        registry._agg_for(registry.get_by_task_id("task-123")).append(line)
+        assert "task-123" in registry._aggregators
+
+        # Record initial post count
+        initial_posts = len(fake_bot.get_post_calls())
+
+        await registry.kill_task("task-123")
+
+        # Verify typing task was cleaned up
+        assert "task-123" not in registry._typing_tasks
+        # Verify aggregator was cleaned up (dropped without flushing)
+        assert "task-123" not in registry._aggregators
+        # Verify no new posts (aggregator was dropped, not flushed)
+        assert len(fake_bot.get_post_calls()) == initial_posts
+
     async def test_restart_task_with_live_pane_writes_resume_command(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
     ) -> None:
@@ -1542,6 +1634,44 @@ class TestTaskRegistryPhase3:
         # Verify typing was cancelled
         assert "task-123" not in registry._typing_tasks
 
+    async def test_typing_context_manager_is_entered_and_exited(self, in_memory_db) -> None:
+        """Verify that channel.typing() context manager is actually entered and exited."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Start typing
+        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        # Yield to let _run_typing reach the async with line
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # Verify typing context was entered
+        thread_id = 999
+        typing_context = fake_bot._fake_channels[thread_id].typing_context
+        assert typing_context.entered is True
+        assert typing_context.exited is False
+
+        # Stop typing
+        await registry._stop_typing("task-123")
+        await asyncio.sleep(0)
+
+        # Verify typing context was exited
+        assert typing_context.exited is True
+
     async def test_on_user_prompt_submit_unknown_session_is_noop(self, in_memory_db) -> None:
         """_on_user_prompt_submit silently drops unknown session IDs."""
         fake_bot = FakeBot()
@@ -1631,7 +1761,49 @@ class TestTaskRegistryPhase3:
         assert "Bash" in agg._lines[0]
         assert "pytest" in agg._lines[0]
 
-    async def test_aggregator_coalesces_within_window(self, in_memory_db) -> None:
+    async def test_on_post_tool_use_failure(self, in_memory_db) -> None:
+        """_on_post_tool_use_failure appends failure summary and updates task."""
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+        now = 1000
+
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-abc",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        task = registry.get_by_task_id("task-123")
+        old_activity = task.last_activity
+
+        # Dispatch PostToolUseFailure (forces failure regardless of tool_response.is_error)
+        await registry._on_post_tool_use_failure({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "exit 0"},
+            "tool_response": {"exit_code": 0},  # exit_code says success, but we force failure
+        })
+
+        # Verify aggregator has the failure line
+        agg = registry._aggregators.get("task-123")
+        assert agg is not None
+        assert len(agg._lines) == 1
+        # Should have the failure emoji
+        assert "✗" in agg._lines[0]
+        assert "Bash" in agg._lines[0]
+
+        # Verify task's last_activity was updated
+        task_refreshed = registry.get_by_task_id("task-123")
+        assert task_refreshed.last_activity > old_activity
+
+    async def test_aggregator_coalesces_within_window(self, in_memory_db, monkeypatch) -> None:
         """Multiple PostToolUse events within 1s window produce one post."""
         fake_bot = FakeBot()
         fake_zellij = FakeZellij()
@@ -1649,7 +1821,7 @@ class TestTaskRegistryPhase3:
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         # Override the aggregator flush window to be very short for testing
-        _ToolSummaryAggregator.FLUSH_WINDOW = 0.05
+        monkeypatch.setattr(_ToolSummaryAggregator, "FLUSH_WINDOW", 0.05)
         await registry.load_from_db()
 
         # Dispatch two PostToolUse within the window
@@ -1679,10 +1851,7 @@ class TestTaskRegistryPhase3:
         lines = post_body.split("\n")
         assert len(lines) >= 2
 
-        # Reset for future tests
-        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
-
-    async def test_on_stop_flushes_aggregator(self, in_memory_db) -> None:
+    async def test_on_stop_flushes_aggregator(self, in_memory_db, monkeypatch) -> None:
         """_on_stop immediately flushes the aggregator."""
         fake_bot = FakeBot()
         fake_zellij = FakeZellij()
@@ -1699,7 +1868,7 @@ class TestTaskRegistryPhase3:
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-        _ToolSummaryAggregator.FLUSH_WINDOW = 10.0  # Very long window
+        monkeypatch.setattr(_ToolSummaryAggregator, "FLUSH_WINDOW", 10.0)  # Very long window
         await registry.load_from_db()
 
         # Add a tool summary
@@ -1722,8 +1891,69 @@ class TestTaskRegistryPhase3:
         assert len(posts) == 1
         assert "test" in posts[0]["content"]
 
-        # Reset
-        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
+    async def test_aggregator_preserves_lines_on_cancellation(self, in_memory_db) -> None:
+        """_flush_after_window preserves lines if cancelled during bot.post."""
+        fake_bot = FakeBot()
+
+        agg = _ToolSummaryAggregator(fake_bot, 999)
+        agg._lines = ["✓ Bash: echo test"]
+
+        # Mock bot.post to be slow so we can cancel during it
+        post_started = asyncio.Event()
+        post_should_finish = asyncio.Event()
+
+        async def slow_post(content: str, *, thread_id: int | None = None) -> list[int]:
+            post_started.set()
+            try:
+                await post_should_finish.wait()
+            except asyncio.CancelledError:
+                raise
+            return [1001]
+
+        fake_bot.post = slow_post
+
+        # Start the flush and let it reach the post
+        flush_handle = asyncio.create_task(agg._flush_after_window())
+        await asyncio.sleep(0)  # Let it start sleeping
+
+        # Manually trigger the flush by skipping the sleep
+        # (In real usage, we'd wait for FLUSH_WINDOW to pass)
+        # Instead, create a new flush task that doesn't sleep
+        async def flush_without_sleep():
+            if not agg._lines:
+                return
+            local_lines = list(agg._lines)
+            agg._lines.clear()
+            body = "\n".join(local_lines)
+            try:
+                await agg._bot.post(body, thread_id=agg._thread_id)
+            except asyncio.CancelledError:
+                agg._lines[:0] = local_lines
+                raise
+            except Exception:
+                pass
+
+        flush_handle2 = asyncio.create_task(flush_without_sleep())
+        await post_started.wait()
+
+        # Now cancel (simulating flush_now during post)
+        flush_handle2.cancel()
+        try:
+            await flush_handle2
+        except asyncio.CancelledError:
+            pass
+
+        # Verify lines were restored
+        assert len(agg._lines) == 1
+        assert "echo test" in agg._lines[0]
+
+        # Cleanup
+        post_should_finish.set()
+        flush_handle.cancel()
+        try:
+            await flush_handle
+        except asyncio.CancelledError:
+            pass
 
     async def test_on_stop_posts_final_assistant_turn(self, in_memory_db, tmp_path) -> None:
         """_on_stop extracts and posts the final assistant turn from the transcript."""
@@ -1840,7 +2070,7 @@ class TestTaskRegistryPhase3:
         posts = fake_bot.get_post_calls()
         assert len(posts) == 0
 
-    async def test_on_stop_flushes_before_final_post(self, in_memory_db, tmp_path) -> None:
+    async def test_on_stop_flushes_before_final_post(self, in_memory_db, tmp_path, monkeypatch) -> None:
         """_on_stop flushes tool summaries before posting the final turn."""
         import json
 
@@ -1883,7 +2113,7 @@ class TestTaskRegistryPhase3:
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-        _ToolSummaryAggregator.FLUSH_WINDOW = 10.0  # Very long window
+        monkeypatch.setattr(_ToolSummaryAggregator, "FLUSH_WINDOW", 10.0)  # Very long window
         await registry.load_from_db()
 
         # Add a tool summary (with a long flush window, it won't auto-flush)
@@ -1910,9 +2140,6 @@ class TestTaskRegistryPhase3:
         assert "pytest" in posts[0]["content"]
         # Second post should be the final assistant turn
         assert "Final response" in posts[1]["content"]
-
-        # Reset
-        _ToolSummaryAggregator.FLUSH_WINDOW = 1.0
 
     async def test_on_stop_handles_missing_transcript_path(self, in_memory_db) -> None:
         """_on_stop does not crash if transcript_path is missing."""

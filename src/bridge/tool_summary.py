@@ -3,7 +3,6 @@
 from typing import Any
 
 # Emoji map. Pick distinct glyphs for at-a-glance scanning.
-_EMOJI_OK = "✓"
 _EMOJI_FAIL = "✗"
 _EMOJI_EDIT = "✏"
 _EMOJI_WRITE = "📝"

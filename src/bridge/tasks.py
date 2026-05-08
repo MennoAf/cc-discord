@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
@@ -17,6 +18,9 @@ from bridge import tool_summary, transcript
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
+
+if TYPE_CHECKING:
+    from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,7 @@ class _ToolSummaryAggregator:
 
     FLUSH_WINDOW = 1.0  # seconds
 
-    def __init__(self, bot, thread_id: int) -> None:
+    def __init__(self, bot: Bot, thread_id: int) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []
@@ -62,10 +66,16 @@ class _ToolSummaryAggregator:
             return
         if not self._lines:
             return
-        body = "\n".join(self._lines)
+        # Snapshot lines before clearing so we can restore if the post is cancelled
+        local_lines = list(self._lines)
         self._lines.clear()
+        body = "\n".join(local_lines)
         try:
             await self._bot.post(body, thread_id=self._thread_id)
+        except asyncio.CancelledError:
+            # Restore lines so flush_now can re-emit them
+            self._lines[:0] = local_lines
+            raise
         except Exception:
             logger.exception("failed to post tool summary chunk")
 
@@ -230,6 +240,11 @@ class TaskRegistry:
         self._by_thread_id.pop(task.thread_id, None)
         if task.current_claude_session_id is not None:
             self._by_session_id.pop(task.current_claude_session_id, None)
+        # Clean up typing task and aggregator
+        await self._stop_typing(task.task_id)
+        agg = self._aggregators.pop(task.task_id, None)
+        if agg is not None:
+            await agg.flush_now()
 
     async def _archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
@@ -511,6 +526,8 @@ class TaskRegistry:
         task = self.get_by_session_id(session_id)
         if task is None:
             return
+        task.last_activity = int(time.time())
+        await self._persist(task)
         # Force-failure: synthesize a tool_response.is_error=True if missing.
         tool_response = (body.get("tool_response") or {}).copy()
         tool_response["is_error"] = True
@@ -676,6 +693,9 @@ class TaskRegistry:
         self._by_thread_id.pop(task.thread_id, None)
         if task.current_claude_session_id is not None:
             self._by_session_id.pop(task.current_claude_session_id, None)
+        # Clean up typing task (cancel without waiting for graceful stop) and drop aggregator without flushing
+        await self._stop_typing(task.task_id)
+        self._aggregators.pop(task.task_id, None)
 
     async def restart_task(self, task_id: str) -> Task:
         """Resume a task by spawning a new claude with --resume <session_id>.
