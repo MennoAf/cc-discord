@@ -1327,6 +1327,7 @@ class TaskRegistry:
                 started_at=now,
                 last_entry_uuid=last_uuid,
                 last_edit_at=now,
+                finished_at=now if finished else None,
             )
             task.subagent_blocks[agent_id] = block
             embed = self._render_subagent_embed(
@@ -1340,8 +1341,6 @@ class TaskRegistry:
                 logger.exception(
                     "failed to post initial subagent block for %s", agent_id
                 )
-            if finished:
-                block.finished_at = now
             return
 
         if block.last_entry_uuid == last_uuid and block.finished_at is not None:
@@ -1419,7 +1418,9 @@ class TaskRegistry:
         import discord  # local import to avoid widening the module's surface
 
         status = "finished" if finished else "running"
-        end = block.finished_at if finished else time.time()
+        # finished_at may not have been set yet on the first observed-finished
+        # refresh; fall back to now to avoid a None subtraction.
+        end = (block.finished_at if finished else None) or time.time()
         elapsed = end - block.started_at
         dur = (
             f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"

@@ -505,7 +505,29 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     guild_id = bot.channel.guild.id  # type: ignore[union-attr]
     guild = discord.Object(id=guild_id)
     tree.copy_global_to(guild=guild)  # registers globally to this guild for instant sync
-    synced = await tree.sync(guild=guild)
+    # Slash-command sync hits the Discord HTTP API and can transiently 503
+    # during incidents; bounded retry so a single 503 doesn't crash startup.
+    sync_attempts = 0
+    while True:
+        try:
+            synced = await tree.sync(guild=guild)
+            break
+        except discord.DiscordServerError as e:
+            sync_attempts += 1
+            if sync_attempts >= 4:
+                logger.warning(
+                    "slash command sync failed after %d attempts (%s); "
+                    "continuing without resync",
+                    sync_attempts, e,
+                )
+                synced = []
+                break
+            backoff = 0.5 * (2 ** (sync_attempts - 1))
+            logger.warning(
+                "slash command sync got %s; retrying in %.1fs (attempt %d/4)",
+                e, backoff, sync_attempts,
+            )
+            await asyncio.sleep(backoff)
     logger.info("synced %d slash commands to guild %d", len(synced), guild_id)
 
     # Sweep stale attachments at startup, then schedule hourly background
