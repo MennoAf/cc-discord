@@ -140,7 +140,13 @@ class TaskRegistry:
         "PreCompact": "_on_pre_compact",
     }
 
-    def __init__(self, conn: aiosqlite.Connection, bot, zellij: ZellijManager, approval_router: "ApprovalRouter | None" = None) -> None:
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        bot: "Bot",
+        zellij: ZellijManager,
+        approval_router: "ApprovalRouter | None" = None,
+    ) -> None:
         """Initialize with database connection, bot, zellij manager, and optional approval router."""
         self._conn = conn
         self._bot = bot
@@ -152,6 +158,7 @@ class TaskRegistry:
         self._stop_futures: dict[str, asyncio.Future] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
+        self._tui_handler_tasks: dict[str, asyncio.Task] = {}
 
     async def load_from_db(self) -> None:
         """Load active tasks from database into memory maps."""
@@ -242,11 +249,16 @@ class TaskRegistry:
         self._by_thread_id.pop(task.thread_id, None)
         if task.current_claude_session_id is not None:
             self._by_session_id.pop(task.current_claude_session_id, None)
-        # Clean up typing task and aggregator
+        # Clean up typing task, aggregator, and any pending TUI handler task
         await self._stop_typing(task.task_id)
         agg = self._aggregators.pop(task.task_id, None)
         if agg is not None:
             await agg.flush_now()
+        handler_task = self._tui_handler_tasks.pop(task.task_id, None)
+        if handler_task is not None and not handler_task.done():
+            handler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler_task
 
     async def _archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
@@ -576,7 +588,11 @@ class TaskRegistry:
                     logger.exception("failed to post final assistant turn for task %s", task.task_id)
 
     async def _on_notification(self, body: dict) -> None:
-        """Handle Notification event. Stop typing indicator and dispatch TUI prompts if pending."""
+        """Handle Notification event. Stop typing indicator and spawn TUI handlers asynchronously.
+
+        Spawns TUI handler tasks fire-and-forget so the HTTP request returns immediately.
+        Handlers are tracked in _tui_handler_tasks for cancellation on stop_task/kill_task.
+        """
         session_id = body.get("session_id")
         if not session_id:
             return
@@ -594,22 +610,35 @@ class TaskRegistry:
 
         transcript_path = body.get("transcript_path") or task.current_transcript_path
         if not transcript_path:
-            # Generic stall — post a simple notice
-            await self._bot.post(
-                "🟡 Claude is waiting for input. Reply in this thread or type in zellij.",
-                thread_id=task.thread_id,
+            # Generic stall — spawn handler task
+            handler_task = asyncio.create_task(
+                self._handle_free_text_stall(task),
+                name=f"tui-free_text-{task.task_id[:8]}",
             )
+            self._tui_handler_tasks[task.task_id] = handler_task
             return
 
         pending = transcript.find_latest_unresolved_tool_use(Path(transcript_path))
 
         if pending and pending["name"] == "AskUserQuestion":
-            await self._handle_ask_user_question(task, pending)
+            handler_task = asyncio.create_task(
+                self._handle_ask_user_question(task, pending),
+                name=f"tui-ask_question-{task.task_id[:8]}",
+            )
+            self._tui_handler_tasks[task.task_id] = handler_task
         elif pending and pending["name"] == "ExitPlanMode":
-            await self._handle_exit_plan_mode(task, pending)
+            handler_task = asyncio.create_task(
+                self._handle_exit_plan_mode(task, pending),
+                name=f"tui-exit_plan-{task.task_id[:8]}",
+            )
+            self._tui_handler_tasks[task.task_id] = handler_task
         else:
             # Generic free-text stall
-            await self._handle_free_text_stall(task)
+            handler_task = asyncio.create_task(
+                self._handle_free_text_stall(task),
+                name=f"tui-free_text-{task.task_id[:8]}",
+            )
+            self._tui_handler_tasks[task.task_id] = handler_task
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
@@ -638,6 +667,7 @@ class TaskRegistry:
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
         """Handle AskUserQuestion prompt: post to Discord with option reactions."""
         if not self._approval_router:
+            logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         questions = pending["input"].get("questions") or []
         if not questions:
@@ -673,6 +703,7 @@ class TaskRegistry:
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
         """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
         if not self._approval_router:
+            logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         plan = pending["input"].get("plan") or "(empty plan)"
         body = (
@@ -693,6 +724,7 @@ class TaskRegistry:
     async def _handle_free_text_stall(self, task: Task) -> None:
         """Handle free-text stall: post generic waiting notice."""
         if not self._approval_router:
+            logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         request_id = str(uuid.uuid4())
         body = "🟡 Claude is waiting for input. Reply in this thread or type in zellij."
@@ -811,9 +843,14 @@ class TaskRegistry:
         self._by_thread_id.pop(task.thread_id, None)
         if task.current_claude_session_id is not None:
             self._by_session_id.pop(task.current_claude_session_id, None)
-        # Clean up typing task (cancel without waiting for graceful stop) and drop aggregator without flushing
+        # Clean up typing task (cancel without waiting for graceful stop), aggregator, and TUI handler task
         await self._stop_typing(task.task_id)
         self._aggregators.pop(task.task_id, None)
+        handler_task = self._tui_handler_tasks.pop(task.task_id, None)
+        if handler_task is not None and not handler_task.done():
+            handler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handler_task
 
     async def restart_task(self, task_id: str) -> Task:
         """Resume a task by spawning a new claude with --resume <session_id>.

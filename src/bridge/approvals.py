@@ -36,12 +36,8 @@ _NUMERIC_REACTIONS = {
 }
 
 _PLAN_REACTIONS = {
-    "✅": ("approve", "approve plan via reaction"),
-    "❌": ("reject", "reject plan via reaction"),
-    # 💬 has no entry — the user is expected to type their feedback as a thread reply,
-    # which `resolve_tui_by_text` already handles. Adding 💬 to the reaction set would
-    # introduce dead state (an "awaiting comment" flag with no semantic difference from
-    # the default behavior, since text replies always resolve).
+    "✅": "1",
+    "❌": "2",
 }
 
 # Reaction emoji -> decision
@@ -94,6 +90,7 @@ class ApprovalRouter:
         self._tui_pending: dict[str, _PendingTuiAnswer] = {}
         self._tui_by_message_id: dict[int, _PendingTuiAnswer] = {}
         self._tui_by_thread_id: dict[int, list[_PendingTuiAnswer]] = {}
+        self._recently_cancelled_threads: dict[int, float] = {}  # thread_id -> cancel_timestamp
         self._lock = asyncio.Lock()
 
     async def request_permission(
@@ -251,7 +248,7 @@ class ApprovalRouter:
     ) -> tuple[str, str]:
         """Post the prompt, await user response, return (answer_text_to_inject, source).
 
-        Returns ("", "cancelled") if the future is cancelled (e.g., user answered in zellij).
+        Returns ("", "cancelled") if the user answered in zellij (UserPromptSubmit fired).
         """
         if timeout is None:
             timeout = self._tui_timeout
@@ -270,6 +267,15 @@ class ApprovalRouter:
         async with self._lock:
             self._tui_pending[request_id] = pending
             self._tui_by_thread_id.setdefault(thread_id, []).append(pending)
+
+            # Check if this thread was recently cancelled (race condition)
+            # If cancel_thread_tui ran before we registered, resolve immediately
+            recent_cancel_time = self._recently_cancelled_threads.get(thread_id)
+            if recent_cancel_time is not None and recent_cancel_time > pending.created_at - 1.0:
+                # This request arrived after cancellation; resolve immediately
+                pending.future.set_result(("", "cancelled"))
+                await self._cleanup_tui(request_id)
+                return ("", "cancelled")
 
         try:
             message_ids = await self._bot.post(prompt_body, thread_id=thread_id)
@@ -299,14 +305,15 @@ class ApprovalRouter:
                 await self._bot.post("⏱ TUI prompt timed out", thread_id=thread_id)
             except Exception:
                 logger.exception("failed to post timeout notice")
-        except asyncio.CancelledError:
-            answer, source = ("", "cancelled")
+        finally:
+            await self._cleanup_tui(request_id)
+
+        # Post notice if cancelled (answered in zellij)
+        if source == "cancelled":
             try:
                 await self._bot.post("(Answered in zellij)", thread_id=thread_id)
             except Exception:
                 logger.exception("failed to post cancel notice")
-        finally:
-            await self._cleanup_tui(request_id)
 
         return (answer, source)
 
@@ -335,17 +342,11 @@ class ApprovalRouter:
         if pending.kind == "exit_plan":
             if emoji not in _PLAN_REACTIONS:
                 return False
-            answer, _reason = _PLAN_REACTIONS[emoji]
-            if answer == "approve":
-                # ExitPlanMode in TUI is typically resolved via choosing "Yes, proceed" — we
-                # inject "1" (the first option) per Claude Code's convention. Verify the
-                # injection mapping during smoke. If "1" doesn't work, fall back to the
-                # literal label "Yes, proceed" via write-chars.
-                pending.future.set_result(("1", "reaction"))
-                return True
-            if answer == "reject":
-                pending.future.set_result(("2", "reaction"))
-                return True
+            answer = _PLAN_REACTIONS[emoji]
+            # ExitPlanMode in TUI is resolved via choosing "Yes, proceed" (1) or "No, go back" (2).
+            # _PLAN_REACTIONS maps ✅→1 and ❌→2.
+            pending.future.set_result((answer, "reaction"))
+            return True
         return False
 
     async def resolve_tui_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
@@ -367,13 +368,22 @@ class ApprovalRouter:
 
     async def cancel_thread_tui(self, thread_id: int) -> int:
         """Cancel all pending TUI prompts in this thread (used when zellij UserPromptSubmit
-        fires while a Discord prompt is still pending). Returns count cancelled."""
+        fires while a Discord prompt is still pending). Returns count cancelled.
+
+        Uses sentinel approach: resolves with ("", "cancelled") instead of calling .cancel(),
+        so request_tui_answer doesn't raise CancelledError.
+
+        Records the thread_id and timestamp to handle race where cancel_thread_tui is called
+        before request_tui_answer registers the pending.
+        """
         async with self._lock:
             pendings = self._tui_by_thread_id.get(thread_id, [])
             to_cancel = [p for p in pendings if not p.future.done()]
+            # Record this cancellation for late-arriving requests
+            self._recently_cancelled_threads[thread_id] = time.time()
         for p in to_cancel:
             if not p.future.done():
-                p.future.cancel()
+                p.future.set_result(("", "cancelled"))
         return len(to_cancel)
 
     async def _cleanup_tui(self, request_id: str) -> None:
@@ -387,6 +397,14 @@ class ApprovalRouter:
             tlist[:] = [p for p in tlist if p.request_id != request_id]
             if not tlist:
                 self._tui_by_thread_id.pop(pending.thread_id, None)
+
+            # Garbage-collect _recently_cancelled_threads entries older than 5s
+            now = time.time()
+            self._recently_cancelled_threads = {
+                tid: ts
+                for tid, ts in self._recently_cancelled_threads.items()
+                if now - ts < 5.0
+            }
 
     async def _cleanup(self, request_id: str) -> None:
         async with self._lock:
