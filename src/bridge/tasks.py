@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Task-scoped settings directory
 TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+# Per-task attachment directory for files relayed from Discord.
+ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
 
 # Hook scripts directory — resolved at import time for test monkeypatch support
 HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
@@ -595,6 +597,10 @@ class TaskRegistry:
     async def maybe_route_message(self, msg: MessageLike) -> bool:
         """If msg is in a task-bound thread, write to its zellij pane and return True.
         Otherwise return False so the caller falls through to the existing /v1/ask listener.
+
+        Attachments are downloaded to ~/.local/state/claude-discord-bridge/attachments/<task>/
+        and their absolute paths are appended to the relayed text so Claude can read them
+        with the Read tool (handles images, PDFs, JSON, plain text, etc.).
         """
         thread_id = msg.channel.id
         task = self.get_by_thread_id(thread_id)
@@ -607,18 +613,54 @@ class TaskRegistry:
         if task.status not in ("running", "spawning"):
             # task is stopped/crashed — silent ignore per AC3.6 spirit
             return True
-        text = msg.content or ""
-        if not text.strip():
-            # Discord empty message (likely image-only). Phase 3 doesn't relay images;
-            # surface "(image attachment)" placeholder if attachments exist, else swallow.
-            if msg.attachments:
-                text = "(image attached — image relay not yet supported)"
-            else:
-                return True  # consumed silently
+
+        text = (msg.content or "").rstrip()
+        attachment_paths: list[Path] = []
+        if msg.attachments:
+            attachment_paths = await self._save_attachments(task.task_id, msg)
+
+        if not text and not attachment_paths:
+            return True  # consumed silently — empty message
+
+        if attachment_paths:
+            attached_block = "attached files (use the Read tool to view):\n" + "\n".join(
+                f"- {p}" for p in attachment_paths
+            )
+            text = f"{text}\n\n{attached_block}" if text else attached_block
+
         await self._zellij.write_to_pane(task.zellij_pane_id, text + "\n")
         task.last_activity = int(time.time())
         await self._persist(task)
         return True
+
+    async def _save_attachments(self, task_id: str, msg: MessageLike) -> list[Path]:
+        """Download Discord attachments to disk under ATTACHMENTS_DIR/<task_id>/.
+
+        Filenames are sanitized to the basename and prefixed with the message id
+        to avoid collisions when the same name is attached multiple times.
+        Returns absolute paths in attachment order. Failures are logged and
+        skipped (caller still relays whatever succeeded).
+        """
+        out_dir = ATTACHMENTS_DIR / task_id
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("failed to create attachments dir %s", out_dir)
+            return []
+
+        msg_id = getattr(msg, "id", None) or int(time.time() * 1000)
+        saved: list[Path] = []
+        for i, att in enumerate(msg.attachments or []):
+            raw_name = getattr(att, "filename", None) or f"att-{i}"
+            safe_name = Path(raw_name).name or f"att-{i}"
+            local = out_dir / f"{msg_id}-{safe_name}"
+            try:
+                data = await att.read()
+                local.write_bytes(data)
+                saved.append(local)
+            except Exception:
+                logger.exception("failed to save attachment %s", raw_name)
+        return saved
 
     async def handle_event(self, hook_event_name: str, body: dict) -> None:
         """Dispatch event to appropriate handler by name."""
