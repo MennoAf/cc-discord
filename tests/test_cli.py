@@ -390,3 +390,266 @@ class TestServeCommand:
         assert result.exit_code == 0
         assert "--host" in result.output
         assert "--port" in result.output
+
+    def test_doctor_zellij_installed(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor checks if zellij is installed and reports version."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[ok] zellij CLI" in result.output
+
+    def test_doctor_zellij_not_found(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor warns if zellij is not installed."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij":
+                raise FileNotFoundError("zellij not found")
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[fail] zellij CLI" in result.output
+        assert result.exit_code == 1
+
+    def test_doctor_bridge_session_running(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor reports ok when bridge zellij session is running."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij" and "list-sessions" in cmd:
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "bridge\nother\n"
+                return result
+            elif cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[ok] bridge zellij session" in result.output
+
+    def test_doctor_bridge_session_not_running(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor warns when bridge zellij session is not running."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij" and "list-sessions" in cmd:
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "other\n"
+                return result
+            elif cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[warn] bridge zellij session" in result.output
+
+    def test_doctor_task_settings_dir_writable(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor reports ok when task-settings dir is writable."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\nbridge\n"
+                return result
+            elif cmd[0] == "which":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "/usr/local/bin/claude\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[ok] task-settings dir" in result.output
+
+    def test_doctor_hook_scripts_present(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor reports ok when hook scripts are present and executable."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\nbridge\n"
+                return result
+            elif cmd[0] == "which":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "/usr/local/bin/claude\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        # The real repo has these scripts, so they should be found
+        assert "[ok] hook script — event.py" in result.output
+        assert "[ok] hook script — pretooluse-approve.py" in result.output
+
+    def test_doctor_claude_on_path(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor reports ok when claude is on PATH."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "which" and "claude" in cmd:
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "/usr/local/bin/claude\n"
+                return result
+            elif cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\nbridge\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[ok] claude CLI" in result.output
+
+    def test_doctor_claude_not_on_path(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor warns when claude is not on PATH."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if cmd[0] == "which" and "claude" in cmd:
+                result = MagicMock()
+                result.returncode = 1
+                result.stdout = ""
+                return result
+            elif cmd[0] == "zellij":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "zellij 0.40.1\nbridge\n"
+                return result
+            return None
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            with patch("subprocess.run", side_effect=mock_run):
+                runner = CliRunner()
+                result = runner.invoke(cli, ["doctor"])
+
+        assert "[warn] claude CLI" in result.output
+        assert result.exit_code == 0
