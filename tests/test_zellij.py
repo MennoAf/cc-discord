@@ -156,19 +156,42 @@ class TestZellijManager:
         assert patch_exec._call_log[2][0][4:] == ("write", "13")
 
     async def test_write_to_pane_multiple_lines(self, patch_exec):
-        """`hello\\nworld\\n` → focus + write-chars hello + Enter + write-chars world + Enter."""
-        for _ in range(5):
+        """Multi-line input is wrapped in bracketed paste so embedded newlines
+        don't submit early. Trailing newline still submits at the end."""
+        for _ in range(7):
             patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
         await mgr.write_to_pane("cc-aa429dc4", "hello\nworld\n")
 
-        assert len(patch_exec._call_log) == 5
+        assert len(patch_exec._call_log) == 7
         assert patch_exec._call_log[0][0][4:] == ("go-to-tab-name", "cc-aa429dc4")
-        assert patch_exec._call_log[1][0][4:] == ("write-chars", "hello")
-        assert patch_exec._call_log[2][0][4:] == ("write", "13")
-        assert patch_exec._call_log[3][0][4:] == ("write-chars", "world")
-        assert patch_exec._call_log[4][0][4:] == ("write", "13")
+        # ESC [ 2 0 0 ~  — begin bracketed paste
+        assert patch_exec._call_log[1][0][4:] == ("write", "27", "91", "50", "48", "48", "126")
+        assert patch_exec._call_log[2][0][4:] == ("write-chars", "hello")
+        # LF between segments, inside the paste block (becomes content newline)
+        assert patch_exec._call_log[3][0][4:] == ("write", "10")
+        assert patch_exec._call_log[4][0][4:] == ("write-chars", "world")
+        # ESC [ 2 0 1 ~  — end bracketed paste
+        assert patch_exec._call_log[5][0][4:] == ("write", "27", "91", "50", "48", "49", "126")
+        # Trailing CR submits the prompt
+        assert patch_exec._call_log[6][0][4:] == ("write", "13")
+
+    async def test_write_to_pane_multi_line_no_trailing_newline(self, patch_exec):
+        """Multi-line without trailing newline: paste block, no final submit."""
+        for _ in range(6):
+            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+
+        mgr = ZellijManager()
+        await mgr.write_to_pane("cc-aa429dc4", "hello\nworld")
+
+        assert len(patch_exec._call_log) == 6
+        assert patch_exec._call_log[0][0][4:] == ("go-to-tab-name", "cc-aa429dc4")
+        assert patch_exec._call_log[1][0][4:] == ("write", "27", "91", "50", "48", "48", "126")
+        assert patch_exec._call_log[2][0][4:] == ("write-chars", "hello")
+        assert patch_exec._call_log[3][0][4:] == ("write", "10")
+        assert patch_exec._call_log[4][0][4:] == ("write-chars", "world")
+        assert patch_exec._call_log[5][0][4:] == ("write", "27", "91", "50", "48", "49", "126")
 
     async def test_write_to_pane_focus_failure_raises(self, patch_exec):
         patch_exec._queue.append(

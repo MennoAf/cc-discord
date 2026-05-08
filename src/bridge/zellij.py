@@ -141,11 +141,19 @@ class ZellijManager:
     async def write_to_pane(self, pane_id: str, text: str) -> None:
         """Type text into the task tab named `pane_id`.
 
-        Focuses the tab, then issues `write-chars` per non-empty segment with
-        `action write 13` between segments and after a trailing newline. The
-        legacy `send-keys Enter` is gone in zellij 0.43+; we use the raw byte
-        13 (CR) which Claude's TUI reads as an Enter keypress.
+        Single-line text is typed with `write-chars`. Multi-line text is
+        wrapped in bracketed-paste markers (ESC[200~ ... ESC[201~) so Claude's
+        TUI treats embedded newlines as content rather than Enter; a bare CR
+        between segments would otherwise submit each line as its own prompt.
+        Inside the paste block we use LF (byte 10) between segments. A
+        trailing newline on the input always submits the buffered prompt via
+        a final `action write 13` (CR).
         """
+        submit = text.endswith("\n")
+        body = text[:-1] if submit else text
+        segments = body.split("\n")
+        multiline = len(segments) > 1
+
         async with self._session_lock:
             rc, _, stderr = await self._run_unlocked(
                 self._executable, "--session", SESSION_NAME,
@@ -154,22 +162,44 @@ class ZellijManager:
             if rc != 0:
                 raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")
 
-            segments = text.split("\n")
-            for i, segment in enumerate(segments):
-                if segment:
-                    rc, _, stderr = await self._run_unlocked(
-                        self._executable, "--session", SESSION_NAME,
-                        "action", "write-chars", segment,
-                    )
-                    if rc != 0:
-                        raise ZellijError(f"write-chars failed: {stderr}")
-                if i < len(segments) - 1:
-                    rc, _, stderr = await self._run_unlocked(
-                        self._executable, "--session", SESSION_NAME,
-                        "action", "write", "13",
-                    )
-                    if rc != 0:
-                        raise ZellijError(f"write 13 (Enter) failed: {stderr}")
+            if multiline:
+                # ESC [ 2 0 0 ~  — begin bracketed paste
+                await self._action_write_bytes(27, 91, 50, 48, 48, 126)
+                for i, segment in enumerate(segments):
+                    if segment:
+                        rc, _, stderr = await self._run_unlocked(
+                            self._executable, "--session", SESSION_NAME,
+                            "action", "write-chars", segment,
+                        )
+                        if rc != 0:
+                            raise ZellijError(f"write-chars failed: {stderr}")
+                    if i < len(segments) - 1:
+                        await self._action_write_bytes(10)
+                # ESC [ 2 0 1 ~  — end bracketed paste
+                await self._action_write_bytes(27, 91, 50, 48, 49, 126)
+            elif body:
+                rc, _, stderr = await self._run_unlocked(
+                    self._executable, "--session", SESSION_NAME,
+                    "action", "write-chars", body,
+                )
+                if rc != 0:
+                    raise ZellijError(f"write-chars failed: {stderr}")
+
+            if submit:
+                await self._action_write_bytes(13)
+
+    async def _action_write_bytes(self, *byte_vals: int) -> None:
+        """Send raw bytes to the focused pane via `zellij action write`.
+
+        `action write` accepts space-separated decimal byte values and emits
+        them as a single contiguous write to the pane's stdin.
+        """
+        rc, _, stderr = await self._run_unlocked(
+            self._executable, "--session", SESSION_NAME,
+            "action", "write", *(str(b) for b in byte_vals),
+        )
+        if rc != 0:
+            raise ZellijError(f"write {byte_vals!r} failed: {stderr}")
 
     async def close_pane(self, pane_id: str) -> None:
         """Close the task tab named `pane_id`. Idempotent — missing tab is a no-op."""
