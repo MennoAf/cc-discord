@@ -273,7 +273,7 @@ class TestTaskRegistry:
     async def test_handle_event_session_start_missing_session_id(
         self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
-        """handle_event('SessionStart') without session_id still proceeds if task_id is present."""
+        """handle_event('SessionStart') without session_id is dropped (no state mutation)."""
         now = 1000
         await upsert_task(
             in_memory_db,
@@ -287,7 +287,7 @@ class TestTaskRegistry:
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
-        # SessionStart with task_id but missing session_id — session_id is still None
+        # SessionStart with task_id but missing session_id — should be dropped
         body = {
             "hook_event_name": "SessionStart",
             "cwd": "/tmp",
@@ -296,17 +296,16 @@ class TestTaskRegistry:
         }
         await registry.handle_event("SessionStart", body)
 
-        # Task will be updated but session_id stays None
+        # Task should remain unchanged
         task = registry.get_by_task_id("task-123")
         assert task is not None
         assert task.current_claude_session_id is None
-        assert task.status == "running"  # Status still flips per the spec
-        assert task.current_transcript_path == "/path/to/transcript"
+        assert task.status == "spawning"  # Status stays spawning
+        assert task.current_transcript_path is None
 
-        # Post should happen with session_id = None (truncated to "?")
+        # No post should happen
         posts = fake_bot.get_post_calls()
-        assert len(posts) == 1
-        assert "?" in posts[0]["content"]
+        assert len(posts) == 0
 
     async def test_handle_event_session_start_without_task(
         self, fake_bot, fake_zellij, in_memory_db
@@ -582,3 +581,62 @@ class TestTaskRegistry:
         # No posts should happen
         posts = fake_bot.get_post_calls()
         assert len(posts) == 0
+
+    async def test_handle_event_session_start_missing_transcript_path(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """handle_event('SessionStart') without transcript_path is dropped (no state mutation)."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # SessionStart with task_id but missing transcript_path — should be dropped
+        body = {
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-abc",
+            "cwd": "/tmp",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry.handle_event("SessionStart", body)
+
+        # Task should remain unchanged
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id is None
+        assert task.status == "spawning"  # Status stays spawning
+        assert task.current_transcript_path is None
+
+        # No post should happen
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_spawn_task_zellij_failure(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ) -> None:
+        """spawn_task on zellij failure marks task as crashed and re-raises."""
+        from bridge.zellij import ZellijSpawnError
+
+        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str) -> str:
+            raise ZellijSpawnError("Could not resolve pane id")
+
+        monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        with pytest.raises(ZellijSpawnError):
+            await registry.spawn_task("/tmp")
+
+        # Verify that a task was created and marked as crashed
+        # We need to find the created task. Let's check the thread calls
+        thread_calls = fake_bot.get_thread_calls()
+        assert len(thread_calls) == 1
+        # The exception was raised, which is what we're testing

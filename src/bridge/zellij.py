@@ -38,15 +38,69 @@ class ZellijPaneInfo(TypedDict):
 class ZellijManager:
     """Async-friendly wrapper around zellij CLI."""
 
-    def __init__(self, executable: str = "zellij") -> None:
+    def __init__(
+        self,
+        executable: str = "zellij",
+        *,
+        poll_timeout: float = SPAWN_POLL_TIMEOUT,
+        poll_interval: float = SPAWN_POLL_INTERVAL,
+    ) -> None:
         """Initialize ZellijManager with optional injectable executable path.
 
         Args:
             executable: Path to zellij binary (default: "zellij")
+            poll_timeout: Timeout in seconds for polling spawn results (default: 5.0)
+            poll_interval: Interval in seconds between spawn polls (default: 0.1)
         """
         self._executable = executable
         self._session_lock = asyncio.Lock()
-        self.SPAWN_POLL_TIMEOUT = SPAWN_POLL_TIMEOUT  # Allow overriding in tests
+        self._poll_timeout = poll_timeout
+        self._poll_interval = poll_interval
+
+    async def _run_unlocked(
+        self,
+        *argv: str,
+        env: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ) -> tuple[int, str, str]:
+        """Run a subprocess command with timeout. Does NOT acquire the lock.
+
+        Internal helper for _run and spawn_task (which already holds the lock).
+
+        Args:
+            argv: Command arguments
+            env: Optional environment dict
+            timeout: Command timeout in seconds
+
+        Returns:
+            Tuple of (returncode, stdout_decoded, stderr_decoded)
+
+        Raises:
+            ZellijError: On timeout or other subprocess errors
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                raise ZellijError(f"Command timed out: {' '.join(argv)}")
+
+            stdout, stderr = await proc.communicate()
+            return (proc.returncode, stdout.decode(), stderr.decode())
+        except ZellijError:
+            raise
+        except Exception as e:
+            raise ZellijError(f"Subprocess error: {e}") from e
 
     async def _run(
         self,
@@ -56,8 +110,8 @@ class ZellijManager:
     ) -> tuple[int, str, str]:
         """Run a subprocess command with timeout and return (returncode, stdout, stderr).
 
-        All public methods funnel through this to ensure consistent subprocess behavior.
-        Acquires the session lock around the call.
+        Public methods that need serialization call this. It acquires the session lock.
+        Methods that are already holding the lock should call _run_unlocked instead.
 
         Args:
             argv: Command arguments
@@ -71,33 +125,7 @@ class ZellijManager:
             ZellijError: On timeout or other subprocess errors
         """
         async with self._session_lock:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    raise ZellijError(f"Command timed out: {' '.join(argv)}")
-
-                # For mocked procs in tests, return the stdout/stderr directly
-                if hasattr(proc, "stdout_data") and hasattr(proc, "stderr_data"):
-                    return (
-                        proc.returncode,
-                        proc.stdout_data.decode(),
-                        proc.stderr_data.decode(),
-                    )
-
-                stdout, stderr = await proc.communicate()
-                return (proc.returncode, stdout.decode(), stderr.decode())
-            except ZellijError:
-                raise
-            except Exception as e:
-                raise ZellijError(f"Subprocess error: {e}")
+            return await self._run_unlocked(*argv, env=env, timeout=timeout)
 
     async def ensure_session_alive(self) -> None:
         """Ensure the bridge session exists and is accessible.
@@ -146,6 +174,8 @@ class ZellijManager:
             raise ZellijError(f"malformed list-panes output: {stderr}")
 
         # Flatten panes from all tabs
+        # Note: title is optional (may not be present in all zellij versions),
+        # so we default to empty string if missing.
         panes: list[ZellijPaneInfo] = []
         if isinstance(data, dict) and "tabs" in data:
             for tab in data.get("tabs", []):
@@ -239,12 +269,16 @@ class ZellijManager:
     ) -> str:
         """Spawn a new pane running `claude` and resolve its pane ID.
 
+        Acquires the session lock for the entire operation to serialize concurrent spawns.
+        This prevents two spawns from seeing each other's panes and binding to the wrong one.
+
         Process:
-        1. Ensure session is alive
-        2. Snapshot existing pane ids
-        3. Spawn `claude` in a new pane
-        4. Poll list-panes until the new pane appears
-        5. Return the new pane id
+        1. Acquire session lock
+        2. Ensure session is alive
+        3. Snapshot existing pane ids
+        4. Spawn `claude` in a new pane
+        5. Poll list-panes until the new pane appears
+        6. Return the new pane id (lock is released)
 
         Args:
             cwd: Working directory for the new pane
@@ -257,56 +291,103 @@ class ZellijManager:
         Raises:
             ZellijSpawnError: If spawn fails or poll times out
         """
-        # Ensure session is alive
-        await self.ensure_session_alive()
+        async with self._session_lock:
+            # Ensure session is alive
+            returncode, _, stderr = await self._run_unlocked(
+                self._executable, "attach", "--create-background", SESSION_NAME
+            )
+            if returncode != 0:
+                raise ZellijSpawnError(f"Failed to create/attach session: {stderr}")
 
-        # Snapshot existing pane ids
-        before_panes = await self.list_panes()
-        before_ids = {p["id"] for p in before_panes}
+            # Snapshot existing pane ids
+            returncode, stdout, stderr = await self._run_unlocked(
+                self._executable,
+                "--session",
+                SESSION_NAME,
+                "action",
+                "list-panes",
+                "--json",
+            )
+            if returncode != 0:
+                raise ZellijSpawnError(f"list-panes failed: {stderr}")
 
-        # Spawn the new pane
-        argv = [
-            self._executable,
-            "--session",
-            SESSION_NAME,
-            "run",
-            "--cwd",
-            cwd,
-            "--name",
-            pane_name,
-            "--",
-            "claude",
-        ]
-        returncode, _, stderr = await self._run(*argv, env=env)
-        if returncode != 0:
-            raise ZellijSpawnError(f"Failed to spawn pane: {stderr}")
-
-        # Poll for the new pane to appear
-        start = asyncio.get_event_loop().time()
-        while True:
             try:
-                panes = await self.list_panes()
-                for pane in panes:
-                    # Check if this is a new pane (not in before_ids)
-                    # and matches our criteria (claude command, matching cwd)
-                    if (
-                        pane["id"] not in before_ids
-                        and (
-                            pane["terminal_command"].endswith("claude")
-                            or "claude" in pane["terminal_command"]
-                        )
-                        and (pane["pwd"] == cwd or pane["pwd"].startswith(cwd))
-                    ):
-                        return pane["id"]
+                data = json.loads(stdout)
+            except json.JSONDecodeError:
+                raise ZellijSpawnError(f"malformed list-panes output: {stderr}")
 
-                # Check timeout
-                elapsed = asyncio.get_event_loop().time() - start
-                if elapsed > self.SPAWN_POLL_TIMEOUT:
-                    raise ZellijSpawnError("pane not visible within 5s")
+            before_ids = set()
+            if isinstance(data, dict) and "tabs" in data:
+                for tab in data.get("tabs", []):
+                    if isinstance(tab, dict) and "panes" in tab:
+                        for pane in tab.get("panes", []):
+                            if isinstance(pane, dict) and "id" in pane:
+                                before_ids.add(pane["id"])
 
-                # Wait before polling again
-                await asyncio.sleep(SPAWN_POLL_INTERVAL)
-            except ZellijSpawnError:
-                raise
-            except Exception as e:
-                raise ZellijSpawnError(f"Poll failed: {e}")
+            # Spawn the new pane
+            argv = [
+                self._executable,
+                "--session",
+                SESSION_NAME,
+                "run",
+                "--cwd",
+                cwd,
+                "--name",
+                pane_name,
+                "--",
+                "claude",
+            ]
+            returncode, _, stderr = await self._run_unlocked(*argv, env=env)
+            if returncode != 0:
+                raise ZellijSpawnError(f"Failed to spawn pane: {stderr}")
+
+            # Poll for the new pane to appear
+            start = asyncio.get_event_loop().time()
+            while True:
+                try:
+                    returncode, stdout, stderr = await self._run_unlocked(
+                        self._executable,
+                        "--session",
+                        SESSION_NAME,
+                        "action",
+                        "list-panes",
+                        "--json",
+                    )
+                    if returncode != 0:
+                        raise ZellijSpawnError(f"list-panes failed: {stderr}")
+
+                    data = json.loads(stdout)
+                    panes = []
+                    if isinstance(data, dict) and "tabs" in data:
+                        for tab in data.get("tabs", []):
+                            if isinstance(tab, dict) and "panes" in tab:
+                                for pane in tab.get("panes", []):
+                                    if isinstance(pane, dict) and all(
+                                        k in pane for k in ["id", "pwd", "terminal_command", "exited"]
+                                    ):
+                                        panes.append(pane)
+
+                    for pane in panes:
+                        # Check if this is a new pane (not in before_ids)
+                        # and matches our criteria (claude command, matching cwd)
+                        if (
+                            pane["id"] not in before_ids
+                            and (
+                                pane["terminal_command"].endswith("claude")
+                                or "claude" in pane["terminal_command"]
+                            )
+                            and (pane["pwd"] == cwd or pane["pwd"].startswith(cwd))
+                        ):
+                            return pane["id"]
+
+                    # Check timeout
+                    elapsed = asyncio.get_event_loop().time() - start
+                    if elapsed > self._poll_timeout:
+                        raise ZellijSpawnError("pane not visible within 5s")
+
+                    # Wait before polling again
+                    await asyncio.sleep(self._poll_interval)
+                except ZellijSpawnError:
+                    raise
+                except Exception as e:
+                    raise ZellijSpawnError(f"Poll failed: {e}") from e

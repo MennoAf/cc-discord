@@ -10,7 +10,7 @@ from pathlib import Path
 import aiosqlite
 
 from bridge.state import TaskRow, list_active_tasks, upsert_task
-from bridge.zellij import ZellijManager
+from bridge.zellij import ZellijError, ZellijManager
 
 logger = logging.getLogger(__name__)
 
@@ -180,14 +180,32 @@ class TaskRegistry:
         if "BRIDGE_URL" not in env:
             env["BRIDGE_URL"] = "http://127.0.0.1:8787"
 
-        # Spawn via zellij
-        pane_id = await self._zellij.spawn_task(
-            cwd=cwd,
-            env=env,
-            pane_name=f"cc-{task_id[:8]}",
-        )
+        # Spawn via zellij; on failure, mark the task as crashed and re-raise
+        try:
+            pane_id = await self._zellij.spawn_task(
+                cwd=cwd,
+                env=env,
+                pane_name=f"cc-{task_id[:8]}",
+            )
+        except ZellijError:
+            logger.exception(f"spawn_task failed for task_id {task_id}")
+            # Mark the task as crashed in the database
+            await upsert_task(
+                self._conn,
+                task_id,
+                thread_id,
+                cwd,
+                "crashed",
+                zellij_pane_id=None,
+                current_claude_session_id=None,
+                current_transcript_path=None,
+            )
+            # Phase 3 slash-command handler will see this crashed status.
+            # TODO: Phase 3 should clean up the Discord thread on failure.
+            raise
 
-        # Update row with zellij_pane_id
+        # Update row with zellij_pane_id (bump last_activity)
+        now2 = int(time.time())
         await upsert_task(
             self._conn,
             task_id,
@@ -197,7 +215,7 @@ class TaskRegistry:
             zellij_pane_id=pane_id,
             current_claude_session_id=None,
             current_transcript_path=None,
-            now=now,
+            now=now2,
         )
 
         # Construct and index the Task
@@ -240,6 +258,7 @@ class TaskRegistry:
         transcript_path, and posts a bind notice to the Discord thread.
 
         Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
+        Also drops if session_id or transcript_path is missing.
         """
         session_id = body.get("session_id")
         transcript_path = body.get("transcript_path")
@@ -248,8 +267,14 @@ class TaskRegistry:
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}")
 
-        # AC2.4: drop SessionStart without task_id
-        if not task_id:
+        # AC2.4: drop SessionStart without task_id, session_id, or transcript_path
+        if not task_id or not session_id or not transcript_path:
+            if not task_id:
+                logger.debug("SessionStart: no CC_DISCORD_TASK_ID in env_passthrough")
+            elif not session_id:
+                logger.warning("SessionStart: no session_id in body")
+            elif not transcript_path:
+                logger.warning("SessionStart: no transcript_path in body")
             return
 
         task = self.get_by_task_id(task_id)

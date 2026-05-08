@@ -341,8 +341,118 @@ class TestZellijManager:
             )
             patch_exec._queue.append(proc_list)
 
-        mgr = ZellijManager()
+        # Create manager with short poll timeout for this test
+        mgr = ZellijManager(poll_timeout=0.2)
         with pytest.raises(ZellijSpawnError, match="pane not visible"):
-            # Set a short timeout for testing
-            mgr.SPAWN_POLL_TIMEOUT = 0.2
             await mgr.spawn_task("/tmp", {}, "cc-abc123")
+
+    async def test_spawn_task_concurrent_serialized(self, patch_exec):
+        """Concurrent spawn_task calls are serialized by the lock; each gets the right pane."""
+        # Setup for first spawn
+        proc_ensure1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
+        patch_exec._queue.append(proc_ensure1)
+
+        list_before1 = {
+            "tabs": [{"panes": [{"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False}]}]
+        }
+        proc_list_before1 = FakeProc(
+            returncode=0,
+            stdout_data=json.dumps(list_before1).encode(),
+            stderr_data=b"",
+        )
+        patch_exec._queue.append(proc_list_before1)
+
+        proc_run1 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
+        patch_exec._queue.append(proc_run1)
+
+        list_after1 = {
+            "tabs": [
+                {
+                    "panes": [
+                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
+                        {
+                            "id": "terminal_1",
+                            "pwd": "/tmp",
+                            "terminal_command": "claude",
+                            "exited": False,
+                        },
+                    ]
+                }
+            ]
+        }
+        proc_list_after1 = FakeProc(
+            returncode=0,
+            stdout_data=json.dumps(list_after1).encode(),
+            stderr_data=b"",
+        )
+        patch_exec._queue.append(proc_list_after1)
+
+        # Setup for second spawn (sees terminal_1 as existing now)
+        proc_ensure2 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
+        patch_exec._queue.append(proc_ensure2)
+
+        list_before2 = {
+            "tabs": [
+                {
+                    "panes": [
+                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
+                        {
+                            "id": "terminal_1",
+                            "pwd": "/tmp",
+                            "terminal_command": "claude",
+                            "exited": False,
+                        },
+                    ]
+                }
+            ]
+        }
+        proc_list_before2 = FakeProc(
+            returncode=0,
+            stdout_data=json.dumps(list_before2).encode(),
+            stderr_data=b"",
+        )
+        patch_exec._queue.append(proc_list_before2)
+
+        proc_run2 = FakeProc(returncode=0, stdout_data=b"", stderr_data=b"")
+        patch_exec._queue.append(proc_run2)
+
+        list_after2 = {
+            "tabs": [
+                {
+                    "panes": [
+                        {"id": "terminal_0", "pwd": "/", "terminal_command": "zsh", "exited": False},
+                        {
+                            "id": "terminal_1",
+                            "pwd": "/tmp",
+                            "terminal_command": "claude",
+                            "exited": False,
+                        },
+                        {
+                            "id": "terminal_2",
+                            "pwd": "/home",
+                            "terminal_command": "claude",
+                            "exited": False,
+                        },
+                    ]
+                }
+            ]
+        }
+        proc_list_after2 = FakeProc(
+            returncode=0,
+            stdout_data=json.dumps(list_after2).encode(),
+            stderr_data=b"",
+        )
+        patch_exec._queue.append(proc_list_after2)
+
+        mgr = ZellijManager()
+
+        # Fire both concurrently; the lock ensures they don't interleave badly
+        pane1, pane2 = await asyncio.gather(
+            mgr.spawn_task("/tmp", {}, "cc-spawn1"),
+            mgr.spawn_task("/home", {}, "cc-spawn2"),
+        )
+
+        # Each should get its own pane
+        assert pane1 == "terminal_1"
+        assert pane2 == "terminal_2"
+        assert pane1 != pane2
