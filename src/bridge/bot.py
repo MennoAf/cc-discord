@@ -293,10 +293,16 @@ class Bot:
         return await self._client.fetch_channel(thread_id)
 
     async def edit_message(
-        self, thread_id: int, message_id: int, content: str
+        self,
+        thread_id: int,
+        message_id: int,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
     ) -> None:
-        """Edit an existing message. Used for the live-updating subagent
-        blocks. Discord limits the body to 2000 chars; caller must truncate.
+        """Edit an existing message. Pass either `content` or `embed` (or
+        both, but typically one). Used by the live-updating subagent blocks.
+        Discord limits each field; caller must truncate.
         """
         if not self.is_ready or self._channel is None:
             raise BotNotReady("bot not connected to Discord")
@@ -310,8 +316,26 @@ class Bot:
         )
         await _with_retry(
             f"edit({message_id})",
-            lambda: msg.edit(content=content),
+            lambda: msg.edit(content=content, embed=embed),
         )
+
+    async def post_embed(
+        self, embed: discord.Embed, *, thread_id: int | None = None
+    ) -> int:
+        """Send a single embed to the channel/thread; return the message id."""
+        if not self.is_ready or self._channel is None:
+            raise BotNotReady("bot not connected to Discord")
+        target: discord.abc.Messageable = self._channel
+        if thread_id is not None:
+            target = await _with_retry(
+                f"fetch_channel({thread_id})",
+                lambda: self._client.fetch_channel(thread_id),
+            )
+        msg = await _with_retry(
+            f"send-embed(thread={thread_id})",
+            lambda: target.send(embed=embed),
+        )
+        return msg.id
 
     async def rename_thread(self, thread_id: int, name: str) -> None:
         """Rename a Discord thread. Discord enforces 1–100 chars; caller should sanitize."""

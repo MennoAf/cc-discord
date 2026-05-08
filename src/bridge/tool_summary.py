@@ -86,6 +86,14 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
         return f"{emoji} Skill: {name}"
 
+    if tool_name == "TodoWrite":
+        todos = tool_input.get("todos") or []
+        emoji = _EMOJI_FAIL if failed else "📋"
+        if not isinstance(todos, list):
+            return f"{emoji} TodoWrite"
+        done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+        return f"{emoji} TodoWrite: {done}/{len(todos)} done"
+
     # Generic fallback
     emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
     return f"{emoji} {tool_name}"
@@ -124,7 +132,7 @@ _DIFF_BUDGET = _DISCORD_LIMIT - 80
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
     """Return a fenced Discord-renderable diff/content block for Edit / MultiEdit
-    / Write, or None for tools that don't have a block to emit.
+    / Write / TodoWrite, or None for tools that don't have a block to emit.
 
     Truncates at ~_DISCORD_LIMIT to fit a single Discord message.
     """
@@ -151,7 +159,39 @@ def diff_block(tool_name: str, tool_input: dict) -> str | None:
         path = tool_input.get("file_path") or "?"
         content = tool_input.get("content") or ""
         return _wrap_code(content, path)
+    if tool_name == "TodoWrite":
+        todos = tool_input.get("todos") or []
+        if not isinstance(todos, list) or not todos:
+            return None
+        return _format_todo_checklist(todos)
     return None
+
+
+def _format_todo_checklist(todos: list) -> str:
+    """Render a Claude TodoWrite payload as a Discord-friendly checklist.
+
+    Each todo has `content`, `status` (pending|in_progress|completed), and
+    `activeForm`. Use ▶ for in_progress, [x] for completed, [ ] otherwise.
+    """
+    lines = ["**Todos:**"]
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        status = t.get("status") or ""
+        content = t.get("content") or ""
+        active = t.get("activeForm") or ""
+        if status == "completed":
+            mark = "✅"
+        elif status == "in_progress":
+            mark = "▶️"
+            content = active or content
+        else:
+            mark = "⬜"
+        lines.append(f"{mark} {content}")
+    body = "\n".join(lines)
+    if len(body) > _DISCORD_LIMIT - 50:
+        body = body[: _DISCORD_LIMIT - 50] + "\n…"
+    return body
 
 
 def _format_edit_diff(path: str, old: str, new: str) -> str:

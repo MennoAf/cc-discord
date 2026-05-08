@@ -1329,13 +1329,13 @@ class TaskRegistry:
                 last_edit_at=now,
             )
             task.subagent_blocks[agent_id] = block
-            body = self._render_subagent_block(
+            embed = self._render_subagent_embed(
                 block, last_actions, total_actions, finished
             )
             try:
-                ids = await self._bot.post(body, thread_id=task.thread_id)
-                if ids:
-                    block.message_id = ids[0]
+                block.message_id = await self._bot.post_embed(
+                    embed, thread_id=task.thread_id
+                )
             except Exception:
                 logger.exception(
                     "failed to post initial subagent block for %s", agent_id
@@ -1358,12 +1358,12 @@ class TaskRegistry:
 
         if block.message_id is None:
             return  # initial post failed; nothing to edit
-        body = self._render_subagent_block(
+        embed = self._render_subagent_embed(
             block, last_actions, total_actions, finished
         )
         try:
             await self._bot.edit_message(
-                task.thread_id, block.message_id, body
+                task.thread_id, block.message_id, embed=embed
             )
         except Exception:
             logger.exception(
@@ -1409,29 +1409,36 @@ class TaskRegistry:
             )
         return False
 
-    def _render_subagent_block(
+    def _render_subagent_embed(
         self,
         block: SubagentBlock,
         last_actions: list[str],
         total_actions: int,
         finished: bool,
-    ) -> str:
+    ) -> "discord.Embed":
+        import discord  # local import to avoid widening the module's surface
+
         status = "finished" if finished else "running"
         end = block.finished_at if finished else time.time()
         elapsed = end - block.started_at
         dur = (
             f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
         )
-        header = (
-            f"🤖 `{block.attribution}` · {status} · "
-            f"{total_actions} actions · {dur}"
+        # Color cues: yellow while running, green when finished cleanly.
+        color = 0x57F287 if finished else 0xFEE75C  # discord brand yellow/green
+
+        # Discord embed.description hard cap is 4096; truncate safely.
+        description = "\n".join(last_actions)
+        if len(description) > 3900:
+            description = description[:3897] + "…"
+
+        embed = discord.Embed(
+            title=f"🤖 {block.attribution}",
+            description=description or "_(no actions yet)_",
+            color=color,
         )
-        body = "\n".join(last_actions)
-        out = f"{header}\nlast {len(last_actions)}:\n{body}"
-        # Discord per-message hard limit; truncate aggressively if long.
-        if len(out) > 1900:
-            out = out[:1897] + "…"
-        return out
+        embed.set_footer(text=f"{status} · {total_actions} actions · {dur}")
+        return embed
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes."""
