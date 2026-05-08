@@ -201,61 +201,6 @@ class ZellijManager:
         if rc != 0:
             raise ZellijError(f"write {byte_vals!r} failed: {stderr}")
 
-    async def dump_pane_screen(self, pane_id: str) -> str | None:
-        """Capture the visible content of the tab named `pane_id` via
-        `zellij action dump-screen`. Returns the file contents (best-effort
-        decoded UTF-8), or None if focus or dump fails. Used to surface
-        AskUserQuestion / ExitPlanMode prompts whose content isn't carried
-        in hook bodies and isn't yet flushed to the transcript file.
-        """
-        import tempfile
-
-        async with self._session_lock:
-            try:
-                rc, _, stderr = await self._run_unlocked(
-                    self._executable, "--session", SESSION_NAME,
-                    "action", "go-to-tab-name", pane_id,
-                    timeout=3.0,
-                )
-            except ZellijError as e:
-                logger.warning("dump_pane_screen: focus failed (%s)", e)
-                return None
-            if rc != 0:
-                logger.info(
-                    "dump_pane_screen: tab %s not found: %s", pane_id, stderr
-                )
-                return None
-
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".dump", delete=False
-            )
-            tmp_path = tmp.name
-            tmp.close()
-            try:
-                try:
-                    rc, _, stderr = await self._run_unlocked(
-                        self._executable, "--session", SESSION_NAME,
-                        "action", "dump-screen", tmp_path,
-                        timeout=3.0,
-                    )
-                except ZellijError as e:
-                    logger.warning("dump-screen failed (%s)", e)
-                    return None
-                if rc != 0:
-                    logger.info("dump-screen rc=%d: %s", rc, stderr)
-                    return None
-                try:
-                    with open(tmp_path, "rb") as f:
-                        return f.read().decode("utf-8", errors="replace")
-                except OSError:
-                    logger.exception("failed to read dump-screen output")
-                    return None
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
     async def close_pane(self, pane_id: str) -> None:
         """Close the task tab named `pane_id`. Best-effort: idempotent on
         missing tab, swallows timeouts/errors so callers (e.g. /kill) can

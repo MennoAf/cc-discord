@@ -89,10 +89,13 @@ def _write_task_settings(
     """Generate the task-scoped settings JSON. Returns the absolute path written.
 
     Registers `event.py` for the observability events. PreToolUse is
-    deliberately *not* registered: that lets the user's permission mode
-    (typically `defaultMode: "auto"`) drive approvals via Claude Code's own
-    classifier. Risky prompts surface as Notification events and route to
-    Discord through the existing `_on_notification` path.
+    registered ONLY for `AskUserQuestion` and `ExitPlanMode` so the bridge
+    can intercept those interactive prompts (the hook body carries the
+    full structured `tool_input`, which we can post to Discord with proper
+    options/reactions before the tool blocks for TUI input). All other
+    PreToolUse traffic is left unhooked so the user's permission mode
+    (typically `defaultMode: "auto"`) drives approvals via Claude Code's
+    own classifier.
     """
     settings_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings_dir / f"{task_id}.json"
@@ -100,6 +103,16 @@ def _write_task_settings(
 
     settings = {
         "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{"type": "command", "command": event_script}],
+                },
+                {
+                    "matcher": "ExitPlanMode",
+                    "hooks": [{"type": "command", "command": event_script}],
+                },
+            ],
             "SessionStart": [
                 {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
             ],
@@ -330,6 +343,7 @@ class TaskRegistry:
     _HANDLERS: dict[str, str] = {
         "SessionStart": "_on_session_start",
         "UserPromptSubmit": "_on_user_prompt_submit",
+        "PreToolUse": "_on_pre_tool_use",
         "PostToolUse": "_on_post_tool_use",
         "PostToolUseFailure": "_on_post_tool_use_failure",
         "Stop": "_on_stop",
@@ -933,6 +947,51 @@ class TaskRegistry:
         await self._persist(task)
         await self._start_typing(task)
 
+    async def _on_pre_tool_use(self, body: dict) -> None:
+        """Handle PreToolUse for `AskUserQuestion` / `ExitPlanMode` only —
+        those are the matchers we register in `_write_task_settings`. The
+        body carries the full structured `tool_input`, so we can post a
+        proper Discord embed with the question and option reactions
+        BEFORE the tool blocks for TUI input. The user's reaction reply
+        gets typed into the pane via the existing TUI handler flow.
+
+        Other PreToolUse events would only arrive if a stale settings
+        file still has wider matchers; for those we no-op so claude's
+        permission mode keeps driving approvals.
+        """
+        tool_name = body.get("tool_name")
+        if tool_name not in ("AskUserQuestion", "ExitPlanMode"):
+            return
+        session_id = body.get("session_id")
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+
+        existing = self._tui_handler_tasks.get(task.task_id)
+        if existing is not None and not existing.done():
+            # Already being handled (probably from an earlier PreToolUse for
+            # the same call). Don't double-post.
+            return
+
+        pending = {
+            "id": body.get("tool_use_id") or str(uuid.uuid4()),
+            "name": tool_name,
+            "input": body.get("tool_input") or {},
+        }
+        if tool_name == "AskUserQuestion":
+            handler_task = asyncio.create_task(
+                self._handle_ask_user_question(task, pending),
+                name=f"tui-ask_question-{task.task_id[:8]}",
+            )
+        else:  # ExitPlanMode
+            handler_task = asyncio.create_task(
+                self._handle_exit_plan_mode(task, pending),
+                name=f"tui-exit_plan-{task.task_id[:8]}",
+            )
+        self._track_tui_handler_task(task.task_id, handler_task)
+
     async def _on_post_tool_use(self, body: dict) -> None:
         """Handle PostToolUse event. Stream pending main-agent prose, append
         the tool summary to the main aggregator, and post a diff/content
@@ -1467,132 +1526,23 @@ class TaskRegistry:
         if agg is not None:
             await agg.flush_now()
 
-        transcript_path = body.get("transcript_path") or task.current_transcript_path
-        # Dump the full body so we can see what fields claude provides for
-        # AskUserQuestion / ExitPlanMode / permission prompts. Truncate so a
-        # huge payload doesn't blow up the log.
-        try:
-            body_dump = json.dumps(body)[:1500]
-        except Exception:
-            body_dump = repr(body)[:1500]
-        logger.info(
-            "Notification: session=%s transcript=%s body=%s",
-            session_id[:8] if session_id else "?",
-            transcript_path,
-            body_dump,
-        )
-        if not transcript_path:
-            handler_task = asyncio.create_task(
-                self._handle_free_text_stall(task),
-                name=f"tui-free_text-{task.task_id[:8]}",
-            )
-            self._track_tui_handler_task(task.task_id, handler_task)
+        # If a TUI handler is already in flight (most likely dispatched by
+        # `_on_pre_tool_use` for AskUserQuestion / ExitPlanMode just before
+        # this Notification arrived), don't double-post. The Notification's
+        # role is just to confirm claude is blocking; the structured
+        # prompt has already been sent.
+        existing = self._tui_handler_tasks.get(task.task_id)
+        if existing is not None and not existing.done():
             return
 
-        # Walk the main transcript first; if nothing pending, also walk
-        # subagent files for this session — AskUserQuestion / ExitPlanMode
-        # in modern CC live in `<session>/subagents/agent-*.jsonl` for
-        # subagent-driven prompts.
-        main_path = Path(transcript_path)
-        pending = transcript.find_latest_unresolved_tool_use(main_path)
-        if pending is None:
-            pending = self._find_unresolved_tool_use_in_subagents(main_path)
-        logger.info(
-            "Notification: pending=%s",
-            pending["name"] if pending else None,
+        # Otherwise it's a generic stall (free-text input expected). Spawn
+        # the standard free-text-stall handler.
+        handler_task = asyncio.create_task(
+            self._handle_free_text_stall(task),
+            name=f"tui-free_text-{task.task_id[:8]}",
         )
+        self._track_tui_handler_task(task.task_id, handler_task)
 
-        if pending and pending["name"] == "AskUserQuestion":
-            handler_task = asyncio.create_task(
-                self._handle_ask_user_question(task, pending),
-                name=f"tui-ask_question-{task.task_id[:8]}",
-            )
-            self._track_tui_handler_task(task.task_id, handler_task)
-        elif pending and pending["name"] == "ExitPlanMode":
-            handler_task = asyncio.create_task(
-                self._handle_exit_plan_mode(task, pending),
-                name=f"tui-exit_plan-{task.task_id[:8]}",
-            )
-            self._track_tui_handler_task(task.task_id, handler_task)
-        else:
-            # No tool_use yet — claude blocks rendering AskUserQuestion /
-            # similar before the tool_use is flushed to JSONL. Capture the
-            # actual rendered prompt from the pane and forward it.
-            handler_task = asyncio.create_task(
-                self._handle_pane_dump_stall(task),
-                name=f"tui-pane_dump-{task.task_id[:8]}",
-            )
-            self._track_tui_handler_task(task.task_id, handler_task)
-
-    async def _handle_pane_dump_stall(self, task: Task) -> None:
-        """Fallback for AskUserQuestion / permission-prompt notifications
-        whose content isn't in the hook body or transcript: dump the
-        focused pane via `zellij action dump-screen`, extract the
-        question + options snippet, post it to Discord, then await a
-        reply via the standard free-text TUI flow.
-        """
-        snippet = None
-        if task.zellij_pane_id:
-            screen = await self._zellij.dump_pane_screen(task.zellij_pane_id)
-            if screen:
-                snippet = self._extract_prompt_snippet(screen)
-        if snippet:
-            try:
-                truncated = snippet[:1700]
-                await self._bot.post(
-                    f"🟡 Claude is asking:\n```\n{truncated}\n```\n"
-                    "Reply in this thread to answer (e.g. type the option "
-                    "number or your free-text response).",
-                    thread_id=task.thread_id,
-                )
-            except Exception:
-                logger.exception("failed to post pane-dump prompt")
-        # Fall through to the standard free-text wait so a Discord reply
-        # gets typed back into the pane.
-        await self._handle_free_text_stall(task)
-
-    @staticmethod
-    def _extract_prompt_snippet(screen: str) -> str:
-        """Pull the rendered AskUserQuestion area out of a dump-screen blob.
-
-        Heuristic: keep the last block of consecutive non-empty / option-y
-        lines. Works for AskUserQuestion (question + numbered options),
-        ExitPlanMode, and permission prompts.
-        """
-        lines = [ln.rstrip() for ln in screen.splitlines()]
-        # Drop trailing blank lines.
-        while lines and not lines[-1].strip():
-            lines.pop()
-        # Take the last ~25 non-trivial lines so we don't dump the whole
-        # session, but still grab the question + options.
-        tail = lines[-25:]
-        return "\n".join(tail).strip()
-
-    def _find_unresolved_tool_use_in_subagents(
-        self, main_transcript_path: Path
-    ) -> dict | None:
-        """Scan `<session>/subagents/agent-*.jsonl` (most-recently-modified
-        first) and return the latest unresolved tool_use found. Mirrors the
-        shape of `transcript.find_latest_unresolved_tool_use`."""
-        subagents_dir = main_transcript_path.parent / main_transcript_path.stem / "subagents"
-        if not subagents_dir.is_dir():
-            return None
-        try:
-            files = sorted(
-                subagents_dir.glob("agent-*.jsonl"),
-                key=lambda f: -f.stat().st_mtime,
-            )
-        except OSError:
-            return None
-        for f in files:
-            try:
-                pending = transcript.find_latest_unresolved_tool_use(f)
-            except Exception:
-                logger.exception("subagent unresolved scan failed for %s", f)
-                continue
-            if pending is not None:
-                return pending
-        return None
 
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.

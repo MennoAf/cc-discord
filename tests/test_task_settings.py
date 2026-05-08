@@ -25,10 +25,11 @@ class TestWriteTaskSettings:
         assert out_path.exists()
 
     def test_write_task_settings_json_structure(self, tmp_path: Path) -> None:
-        """_write_task_settings registers the 7 observability events but NOT PreToolUse.
+        """_write_task_settings registers the observability events plus
+        PreToolUse scoped to AskUserQuestion / ExitPlanMode.
 
-        PreToolUse is intentionally omitted so the user's auto-mode classifier
-        drives approvals natively. See `_write_task_settings` docstring.
+        Wider PreToolUse matchers are intentionally omitted so the user's
+        auto-mode classifier drives approvals for everything else.
         """
         settings_dir = tmp_path / "settings"
         hooks_dir = tmp_path / "hooks"
@@ -44,6 +45,7 @@ class TestWriteTaskSettings:
         hooks = data.get("hooks", {})
 
         expected_events = [
+            "PreToolUse",
             "SessionStart",
             "UserPromptSubmit",
             "PostToolUse",
@@ -54,7 +56,9 @@ class TestWriteTaskSettings:
         ]
         for event in expected_events:
             assert event in hooks, f"Missing event: {event}"
-        assert "PreToolUse" not in hooks, "PreToolUse must NOT be registered (auto-mode owns approvals)"
+        # PreToolUse only matches AskUserQuestion + ExitPlanMode, NOT *.
+        matchers = {m.get("matcher") for m in hooks["PreToolUse"]}
+        assert matchers == {"AskUserQuestion", "ExitPlanMode"}, matchers
 
     def test_write_task_settings_hook_paths_absolute(self, tmp_path: Path) -> None:
         """_write_task_settings uses absolute paths for hook scripts."""
@@ -94,7 +98,8 @@ class TestWriteTaskSettings:
         assert out_path.exists()
 
     def test_write_task_settings_each_event_one_matcher(self, tmp_path: Path) -> None:
-        """_write_task_settings creates exactly one matcher per event."""
+        """Observability events use a `*` matcher; PreToolUse has narrow
+        matchers for the two interactive tools we intercept."""
         settings_dir = tmp_path / "settings"
         hooks_dir = tmp_path / "hooks"
         hooks_dir.mkdir()
@@ -109,9 +114,16 @@ class TestWriteTaskSettings:
         hooks = data["hooks"]
 
         for event, matchers in hooks.items():
-            assert len(matchers) == 1, f"Event {event} should have exactly 1 matcher"
-            assert matchers[0]["matcher"] == "*"
-            assert len(matchers[0]["hooks"]) == 1
+            for entry in matchers:
+                assert len(entry["hooks"]) == 1
+            if event == "PreToolUse":
+                assert {m["matcher"] for m in matchers} == {
+                    "AskUserQuestion",
+                    "ExitPlanMode",
+                }
+            else:
+                assert len(matchers) == 1, f"Event {event} should have exactly 1 matcher"
+                assert matchers[0]["matcher"] == "*"
 
 
 class TestCleanupTaskSettings:
