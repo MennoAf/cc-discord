@@ -1515,11 +1515,58 @@ class TaskRegistry:
             )
             self._track_tui_handler_task(task.task_id, handler_task)
         else:
+            # No tool_use yet — claude blocks rendering AskUserQuestion /
+            # similar before the tool_use is flushed to JSONL. Capture the
+            # actual rendered prompt from the pane and forward it.
             handler_task = asyncio.create_task(
-                self._handle_free_text_stall(task),
-                name=f"tui-free_text-{task.task_id[:8]}",
+                self._handle_pane_dump_stall(task),
+                name=f"tui-pane_dump-{task.task_id[:8]}",
             )
             self._track_tui_handler_task(task.task_id, handler_task)
+
+    async def _handle_pane_dump_stall(self, task: Task) -> None:
+        """Fallback for AskUserQuestion / permission-prompt notifications
+        whose content isn't in the hook body or transcript: dump the
+        focused pane via `zellij action dump-screen`, extract the
+        question + options snippet, post it to Discord, then await a
+        reply via the standard free-text TUI flow.
+        """
+        snippet = None
+        if task.zellij_pane_id:
+            screen = await self._zellij.dump_pane_screen(task.zellij_pane_id)
+            if screen:
+                snippet = self._extract_prompt_snippet(screen)
+        if snippet:
+            try:
+                truncated = snippet[:1700]
+                await self._bot.post(
+                    f"🟡 Claude is asking:\n```\n{truncated}\n```\n"
+                    "Reply in this thread to answer (e.g. type the option "
+                    "number or your free-text response).",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post pane-dump prompt")
+        # Fall through to the standard free-text wait so a Discord reply
+        # gets typed back into the pane.
+        await self._handle_free_text_stall(task)
+
+    @staticmethod
+    def _extract_prompt_snippet(screen: str) -> str:
+        """Pull the rendered AskUserQuestion area out of a dump-screen blob.
+
+        Heuristic: keep the last block of consecutive non-empty / option-y
+        lines. Works for AskUserQuestion (question + numbered options),
+        ExitPlanMode, and permission prompts.
+        """
+        lines = [ln.rstrip() for ln in screen.splitlines()]
+        # Drop trailing blank lines.
+        while lines and not lines[-1].strip():
+            lines.pop()
+        # Take the last ~25 non-trivial lines so we don't dump the whole
+        # session, but still grab the question + options.
+        tail = lines[-25:]
+        return "\n".join(tail).strip()
 
     def _find_unresolved_tool_use_in_subagents(
         self, main_transcript_path: Path
