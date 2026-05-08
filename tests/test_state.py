@@ -309,3 +309,418 @@ class TestSessionPersistence:
             assert row.last_activity == now
         finally:
             await conn2.close()
+
+
+@pytest.mark.asyncio
+class TestTasks:
+    """Tests for task table and CRUD operations."""
+
+    async def test_open_db_creates_tasks_table(self, tmp_path: Path) -> None:
+        """open_db creates tasks table."""
+        from bridge.state import TaskRow
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
+            )
+            result = await cursor.fetchone()
+            assert result is not None
+            assert result[0] == "tasks"
+        finally:
+            await conn.close()
+
+    async def test_open_db_tasks_table_schema(self, tmp_path: Path) -> None:
+        """Tasks table has correct columns."""
+        from bridge.state import TaskRow
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            cursor = await conn.execute("PRAGMA table_info(tasks)")
+            columns = await cursor.fetchall()
+            col_names = {col[1] for col in columns}
+            expected = {
+                "task_id",
+                "thread_id",
+                "zellij_pane_id",
+                "cwd",
+                "status",
+                "current_claude_session_id",
+                "current_transcript_path",
+                "created_at",
+                "last_activity",
+            }
+            assert col_names == expected
+        finally:
+            await conn.close()
+
+    async def test_upsert_task_inserts_new_row(self, tmp_path: Path) -> None:
+        """upsert_task inserts a new task row."""
+        from bridge.state import upsert_task, get_task
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="spawning",
+                now=now,
+            )
+            row = await get_task(conn, "task-123")
+            assert row is not None
+            assert row.task_id == "task-123"
+            assert row.thread_id == 999
+            assert row.cwd == "/tmp/test"
+            assert row.status == "spawning"
+            assert row.zellij_pane_id is None
+            assert row.current_claude_session_id is None
+            assert row.current_transcript_path is None
+            assert row.created_at == now
+            assert row.last_activity == now
+        finally:
+            await conn.close()
+
+    async def test_upsert_task_bumps_last_activity(self, tmp_path: Path) -> None:
+        """upsert_task updates status/pane and bumps last_activity, preserves created_at."""
+        from bridge.state import upsert_task, get_task
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            t0 = int(time.time())
+            await upsert_task(
+                conn,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="spawning",
+                now=t0,
+            )
+            row1 = await get_task(conn, "task-123")
+            assert row1 is not None
+            assert row1.created_at == t0
+            assert row1.last_activity == t0
+
+            t1 = t0 + 100
+            await upsert_task(
+                conn,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="running",
+                zellij_pane_id="terminal_1",
+                now=t1,
+            )
+            row2 = await get_task(conn, "task-123")
+            assert row2 is not None
+            assert row2.task_id == "task-123"
+            assert row2.status == "running"
+            assert row2.zellij_pane_id == "terminal_1"
+            assert row2.created_at == t0  # Preserved
+            assert row2.last_activity == t1  # Bumped
+        finally:
+            await conn.close()
+
+    async def test_get_task_by_thread_id(self, tmp_path: Path) -> None:
+        """get_task_by_thread_id returns correct row."""
+        from bridge.state import upsert_task, get_task_by_thread_id
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="running",
+                now=now,
+            )
+            row = await get_task_by_thread_id(conn, 999)
+            assert row is not None
+            assert row.task_id == "task-123"
+            assert row.thread_id == 999
+
+            # Non-existent thread
+            row = await get_task_by_thread_id(conn, 888)
+            assert row is None
+        finally:
+            await conn.close()
+
+    async def test_get_task_by_session_id(self, tmp_path: Path) -> None:
+        """get_task_by_session_id returns correct row when session_id is set."""
+        from bridge.state import upsert_task, get_task_by_session_id
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="running",
+                current_claude_session_id="sess-abc",
+                now=now,
+            )
+            row = await get_task_by_session_id(conn, "sess-abc")
+            assert row is not None
+            assert row.task_id == "task-123"
+            assert row.current_claude_session_id == "sess-abc"
+
+            # Non-existent session
+            row = await get_task_by_session_id(conn, "sess-unknown")
+            assert row is None
+        finally:
+            await conn.close()
+
+    async def test_list_active_tasks(self, tmp_path: Path) -> None:
+        """list_active_tasks returns only spawning/running tasks, ordered by last_activity DESC."""
+        from bridge.state import upsert_task, list_active_tasks
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            # Insert tasks with different statuses
+            await upsert_task(
+                conn, "task-1", 1001, "/a", "spawning", now=now
+            )
+            await upsert_task(
+                conn, "task-2", 1002, "/b", "running", now=now + 10
+            )
+            await upsert_task(
+                conn, "task-3", 1003, "/c", "stopped", now=now + 20
+            )
+            await upsert_task(
+                conn, "task-4", 1004, "/d", "crashed", now=now + 30
+            )
+
+            rows = await list_active_tasks(conn)
+            assert len(rows) == 2  # Only spawning and running
+            # Should be ordered by last_activity DESC
+            assert rows[0].task_id == "task-2"  # running, last_activity = now+10
+            assert rows[1].task_id == "task-1"  # spawning, last_activity = now
+        finally:
+            await conn.close()
+
+    async def test_delete_task_cascade(self, tmp_path: Path) -> None:
+        """delete_task removes row and cascades to approval_log."""
+        from bridge.state import (
+            upsert_task,
+            delete_task,
+            get_task,
+            log_approval,
+            list_approvals_for_task,
+        )
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn, "task-123", 999, "/tmp", "running", now=now
+            )
+            await log_approval(
+                conn,
+                "req-1",
+                "task-123",
+                "tool_exec",
+                '{"cmd": "ls"}',
+                "allow",
+                "user approved",
+                now=now,
+            )
+
+            # Verify approval logged
+            approvals = await list_approvals_for_task(conn, "task-123")
+            assert len(approvals) == 1
+
+            # Delete task
+            await delete_task(conn, "task-123")
+
+            # Task gone
+            row = await get_task(conn, "task-123")
+            assert row is None
+
+            # Approvals also gone
+            approvals = await list_approvals_for_task(conn, "task-123")
+            assert len(approvals) == 0
+        finally:
+            await conn.close()
+
+    async def test_task_persistence_across_restart(self, tmp_path: Path) -> None:
+        """Task rows survive database restart."""
+        from bridge.state import upsert_task, get_task
+        db_path = tmp_path / "state.db"
+        now = int(time.time())
+
+        # First connection
+        conn1 = await open_db(db_path)
+        try:
+            await upsert_task(
+                conn1,
+                "task-123",
+                thread_id=999,
+                cwd="/tmp/test",
+                status="running",
+                zellij_pane_id="terminal_1",
+                current_claude_session_id="sess-abc",
+                current_transcript_path="/path/transcript",
+                now=now,
+            )
+        finally:
+            await conn1.close()
+
+        # Second connection
+        conn2 = await open_db(db_path)
+        try:
+            row = await get_task(conn2, "task-123")
+            assert row is not None
+            assert row.task_id == "task-123"
+            assert row.thread_id == 999
+            assert row.cwd == "/tmp/test"
+            assert row.status == "running"
+            assert row.zellij_pane_id == "terminal_1"
+            assert row.current_claude_session_id == "sess-abc"
+            assert row.current_transcript_path == "/path/transcript"
+            assert row.created_at == now
+            assert row.last_activity == now
+        finally:
+            await conn2.close()
+
+
+@pytest.mark.asyncio
+class TestApprovalLog:
+    """Tests for approval_log table and operations."""
+
+    async def test_open_db_creates_approval_log_table(self, tmp_path: Path) -> None:
+        """open_db creates approval_log table."""
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='approval_log'"
+            )
+            result = await cursor.fetchone()
+            assert result is not None
+            assert result[0] == "approval_log"
+        finally:
+            await conn.close()
+
+    async def test_log_approval_inserts(self, tmp_path: Path) -> None:
+        """log_approval inserts an approval row."""
+        from bridge.state import upsert_task, log_approval, list_approvals_for_task
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn, "task-123", 999, "/tmp", "running", now=now
+            )
+            await log_approval(
+                conn,
+                "req-1",
+                "task-123",
+                "tool_exec",
+                '{"cmd": "ls"}',
+                "allow",
+                "user approved",
+                now=now,
+            )
+
+            rows = await list_approvals_for_task(conn, "task-123")
+            assert len(rows) == 1
+            row = rows[0]
+            assert row.request_id == "req-1"
+            assert row.task_id == "task-123"
+            assert row.tool_name == "tool_exec"
+            assert row.tool_input_json == '{"cmd": "ls"}'
+            assert row.decision == "allow"
+            assert row.decision_reason == "user approved"
+            assert row.decided_at == now
+        finally:
+            await conn.close()
+
+    async def test_log_approval_insert_or_replace(self, tmp_path: Path) -> None:
+        """log_approval with duplicate request_id overwrites."""
+        from bridge.state import upsert_task, log_approval, list_approvals_for_task
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn, "task-123", 999, "/tmp", "running", now=now
+            )
+            await log_approval(
+                conn,
+                "req-1",
+                "task-123",
+                "tool_exec",
+                '{"cmd": "ls"}',
+                "allow",
+                "first approval",
+                now=now,
+            )
+            await log_approval(
+                conn,
+                "req-1",
+                "task-123",
+                "tool_exec",
+                '{"cmd": "ls"}',
+                "deny",
+                "second approval (override)",
+                now=now + 10,
+            )
+
+            rows = await list_approvals_for_task(conn, "task-123")
+            assert len(rows) == 1
+            row = rows[0]
+            assert row.decision == "deny"
+            assert row.decision_reason == "second approval (override)"
+            assert row.decided_at == now + 10
+        finally:
+            await conn.close()
+
+    async def test_list_approvals_for_task_ordering(self, tmp_path: Path) -> None:
+        """list_approvals_for_task returns rows in chronological order."""
+        from bridge.state import upsert_task, log_approval, list_approvals_for_task
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            now = int(time.time())
+            await upsert_task(
+                conn, "task-123", 999, "/tmp", "running", now=now
+            )
+            await log_approval(
+                conn, "req-1", "task-123", "tool_a", "{}", "allow", "a", now=now
+            )
+            await log_approval(
+                conn,
+                "req-2",
+                "task-123",
+                "tool_b",
+                "{}",
+                "deny",
+                "b",
+                now=now + 20,
+            )
+            await log_approval(
+                conn,
+                "req-3",
+                "task-123",
+                "tool_c",
+                "{}",
+                "allow",
+                "c",
+                now=now + 10,
+            )
+
+            rows = await list_approvals_for_task(conn, "task-123")
+            assert len(rows) == 3
+            # Should be ordered by decided_at ASC
+            assert rows[0].request_id == "req-1"
+            assert rows[1].request_id == "req-3"
+            assert rows[2].request_id == "req-2"
+        finally:
+            await conn.close()
