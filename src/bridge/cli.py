@@ -1,19 +1,49 @@
 """CLI entrypoints for the bridge daemon."""
 
 import asyncio
+import json
 import logging
 import os
 import stat
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import click
 
+import bridge
 from bridge.bot import Bot
-from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets
+from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets, secrets_file_perms
 from bridge.server import serve as serve_server
 
 logger = logging.getLogger(__name__)
+
+
+async def _validate_token_and_post_test(secrets: Secrets) -> bool:
+    """Validate token by starting bot and posting a test message.
+
+    Returns True if validation succeeds (bot ready and message posted).
+    Returns False if timeout waiting for bot to become ready.
+    """
+    bot = Bot(secrets.bot_token, secrets.channel_id)
+    try:
+        await bot.start()
+
+        # Wait up to 15 seconds for bot to become ready
+        start_time = asyncio.get_event_loop().time()
+        timeout = 15
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            if bot.is_ready:
+                # Post confirmation message to channel root (no thread)
+                await bot.post("✅ claude-discord-bridge init succeeded — you'll see future notifications here.")
+                return True
+            await asyncio.sleep(0.1)
+
+        # Timeout reached
+        return False
+    finally:
+        await bot.close()
 
 
 @click.group()
@@ -105,6 +135,24 @@ def init() -> None:
         )
         sys.exit(1)
 
+    # Validate token and channel by connecting to Discord
+    click.echo()
+    click.echo("Validating token and channel...")
+    try:
+        success = asyncio.run(_validate_token_and_post_test(secrets))
+        if not success:
+            click.echo(
+                "Error: could not connect — check token/intents/network",
+                err=True
+            )
+            sys.exit(2)
+    except Exception as e:
+        click.echo(
+            f"Error: could not connect — check token/intents/network ({e})",
+            err=True
+        )
+        sys.exit(2)
+
     click.echo()
     click.echo(
         f"Wrote secrets to {secrets_path} (mode 0600). "
@@ -151,6 +199,146 @@ def serve(host: str, port: int) -> None:
         sys.exit(2)
 
     asyncio.run(serve_server(secrets, host=host, port=port))
+
+
+@cli.command()
+def doctor() -> None:
+    """Run diagnostic checks on the bridge setup.
+
+    Checks:
+    - Secrets file present and mode 0600
+    - Bridge daemon health and bot connectivity
+    - Settings.json hooks point to bridge scripts
+    - Skill symlink setup
+
+    Exit 0 if all checks pass (ok) or warn. Exit 1 if any check fails.
+    """
+    failed = False
+    warned = False
+
+    # Resolve secrets path from env var for testability
+    secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
+
+    # Check 1: Secrets file present
+    if not secrets_path.exists():
+        click.echo(f"[fail] Secrets file present — {secrets_path} not found", err=True)
+        failed = True
+    else:
+        click.echo(f"[ok] Secrets file present — {secrets_path}")
+
+    # Check 2: Secrets file mode 0600
+    if secrets_path.exists():
+        perms = secrets_file_perms(secrets_path)
+        if perms is None or perms != 0o600:
+            click.echo(f"[fail] Secrets file mode 0600 — {oct(perms)} found", err=True)
+            failed = True
+        else:
+            click.echo("[ok] Secrets file mode 0600")
+
+    # Check 3: Daemon health
+    bridge_url = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787")
+    try:
+        health_url = f"{bridge_url}/v1/health"
+        req = urllib.request.Request(health_url)
+        response = urllib.request.urlopen(req, timeout=2)
+        data = json.loads(response.read().decode("utf-8"))
+        if response.status == 200 and data.get("bot_connected") is True:
+            click.echo(f"[ok] Daemon health — {bridge_url}/v1/health returns bot_connected: true")
+        elif response.status == 200 and data.get("bot_connected") is False:
+            click.echo(f"[warn] Daemon health — {bridge_url}/v1/health returns bot_connected: false", err=True)
+            warned = True
+        else:
+            click.echo(f"[fail] Daemon health — {bridge_url}/v1/health returned unexpected status", err=True)
+            failed = True
+    except Exception as e:
+        click.echo(f"[fail] Daemon health — {bridge_url}/v1/health unreachable ({type(e).__name__})", err=True)
+        failed = True
+
+    # Check 4: Settings.json hooks
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings_data = json.loads(settings_path.read_text())
+            hooks = settings_data.get("hooks", {})
+
+            # Compute expected hook paths at runtime
+            expected_hooks_dir = Path(bridge.__file__).parent.parent.parent / "hooks"
+            expected_stop_path = str(expected_hooks_dir / "notify-stop.py")
+            expected_notif_path = str(expected_hooks_dir / "notify-notification.py")
+
+            hooks_ok = True
+
+            # Check Stop matcher
+            stop_found = False
+            for stop_matcher in hooks.get("Stop", []):
+                for hook_spec in stop_matcher.get("hooks", []):
+                    cmd = hook_spec.get("command", "")
+                    if expected_stop_path in cmd:
+                        stop_found = True
+                        break
+
+            if not stop_found:
+                click.echo("[fail] Settings.json hooks — Stop matcher missing or incorrect", err=True)
+                hooks_ok = False
+
+            # Check Notification matcher
+            notif_found = False
+            for notif_matcher in hooks.get("Notification", []):
+                for hook_spec in notif_matcher.get("hooks", []):
+                    cmd = hook_spec.get("command", "")
+                    if expected_notif_path in cmd:
+                        notif_found = True
+                        break
+
+            if not notif_found:
+                click.echo("[fail] Settings.json hooks — Notification matcher missing or incorrect", err=True)
+                hooks_ok = False
+
+            if hooks_ok:
+                click.echo("[ok] Settings.json hooks — Stop and Notification matchers configured")
+            else:
+                failed = True
+        except Exception as e:
+            click.echo(f"[fail] Settings.json hooks — error reading {settings_path}: {e}", err=True)
+            failed = True
+    else:
+        click.echo(f"[warn] Settings.json hooks — {settings_path} not found (skipping)", err=True)
+        warned = True
+
+    # Check 5: Skill symlink
+    skill_path = Path.home() / ".claude" / "skills" / "ask-discord" / "SKILL.md"
+    if skill_path.exists():
+        # Check if it's a symlink to the repo or a copy with matching content
+        repo_skill_path = Path(bridge.__file__).parent.parent.parent / "skills" / "SKILL.md"
+        if skill_path.is_symlink():
+            target = skill_path.resolve()
+            if repo_skill_path.exists() and target == repo_skill_path.resolve():
+                click.echo(f"[ok] Skill symlink — {skill_path} → {target}")
+            else:
+                click.echo(f"[warn] Skill symlink — {skill_path} symlink target mismatch", err=True)
+                warned = True
+        else:
+            # Check if it's a copy with same content
+            if repo_skill_path.exists() and skill_path.read_text() == repo_skill_path.read_text():
+                click.echo(f"[ok] Skill symlink — {skill_path} (copy of {repo_skill_path})")
+            else:
+                click.echo(f"[warn] Skill symlink — {skill_path} exists but is not a symlink", err=True)
+                warned = True
+    else:
+        click.echo(f"[warn] Skill symlink — {skill_path} not found", err=True)
+        warned = True
+
+    # Final summary
+    click.echo()
+    if failed:
+        click.echo("Doctor: some checks failed. Please fix the issues above.", err=True)
+        sys.exit(1)
+    elif warned:
+        click.echo("Doctor: checks complete with warnings. Bridge may work but check the above.", err=True)
+        sys.exit(0)
+    else:
+        click.echo("Doctor: all checks passed. Bridge is ready.")
+        sys.exit(0)
 
 
 def main() -> None:

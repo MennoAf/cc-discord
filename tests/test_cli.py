@@ -1,9 +1,11 @@
 """Tests for bridge CLI using click.testing.CliRunner."""
 
-import os
+import asyncio
+import json
+import stat
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-import pytest
 from click.testing import CliRunner
 
 from bridge.cli import cli
@@ -13,10 +15,34 @@ from bridge.secrets import Secrets, write_secrets
 class TestInitCommand:
     """Tests for `claude-discord-bridge init` subcommand."""
 
+    def _get_ready_fake_bot(self):
+        """Create a fake bot that becomes ready immediately."""
+        class FakeBot:
+            def __init__(self, token: str, channel_id: int):
+                self.token = token
+                self.channel_id = channel_id
+                self._is_ready = False
+
+            @property
+            def is_ready(self) -> bool:
+                return self._is_ready
+
+            async def start(self) -> None:
+                self._is_ready = True
+
+            async def close(self) -> None:
+                pass
+
+            async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
+                return [123]
+
+        return FakeBot
+
     def test_init_writes_secrets_file(self, tmp_path: Path, monkeypatch) -> None:
         """init with simulated stdin writes a secrets file at the expected location."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -28,10 +54,9 @@ class TestInitCommand:
 
     def test_init_sets_0600_perms(self, tmp_path: Path, monkeypatch) -> None:
         """init writes a secrets file with exactly 0o600 permissions."""
-        import stat
-
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -46,6 +71,7 @@ class TestInitCommand:
         """init rejects a non-integer channel ID by reprompting."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         # Input: first bad channel ID, then a good one
@@ -78,6 +104,7 @@ class TestInitCommand:
         """init prompts interactively for bot token and channel ID."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -92,6 +119,7 @@ class TestInitCommand:
         """init prints a success message mentioning secrets.json and 0600."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -101,6 +129,236 @@ class TestInitCommand:
         assert result.exit_code == 0
         assert "secrets.json" in result.output or "wrote" in result.output
         assert "0600" in result.output
+
+    def test_init_validates_token_bot_not_ready(self, tmp_path: Path, monkeypatch) -> None:
+        """init validates token by starting bot; if bot never becomes ready, exits 2 and keeps secrets file."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+
+        # Create a fake bot that never becomes ready
+        class FakeBot:
+            def __init__(self, token: str, channel_id: int):
+                self.token = token
+                self.channel_id = channel_id
+                self._is_ready = False
+
+            @property
+            def is_ready(self) -> bool:
+                return self._is_ready
+
+            async def start(self) -> None:
+                # Simulate connection that never completes
+                await asyncio.sleep(10)
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["init"], input="test_token\n12345\n"
+        )
+
+        assert result.exit_code == 2
+        assert "could not connect" in result.output
+        assert secrets_file.exists()  # Secrets file should still be there
+
+    def test_init_validates_token_bot_ready_posts_message(self, tmp_path: Path, monkeypatch) -> None:
+        """init validates token by starting bot; if ready, posts test message and exits 0."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+
+        # Create a fake bot that becomes ready immediately and records posts
+        posted_messages = []
+
+        class FakeBot:
+            def __init__(self, token: str, channel_id: int):
+                self.token = token
+                self.channel_id = channel_id
+                self._is_ready = False
+
+            @property
+            def is_ready(self) -> bool:
+                return self._is_ready
+
+            async def start(self) -> None:
+                # Immediately become ready
+                self._is_ready = True
+
+            async def close(self) -> None:
+                pass
+
+            async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
+                posted_messages.append({"message": message, "thread_id": thread_id})
+                return [123]
+
+        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["init"], input="test_token\n12345\n"
+        )
+
+        assert result.exit_code == 0
+        assert len(posted_messages) == 1
+        assert "init succeeded" in posted_messages[0]["message"]
+        assert posted_messages[0]["thread_id"] is None  # Channel-level, no thread
+
+
+class TestDoctorCommand:
+    """Tests for `claude-discord-bridge doctor` subcommand."""
+
+    def test_doctor_all_ok(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor with all checks passing exits 0 and shows [ok] for each line."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        # Create a valid secrets file
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+
+        # Create a fake settings.json
+        settings_file = tmp_path / "settings.json"
+        bridge_repo_hooks = Path(__file__).parent.parent / "hooks"
+        settings_data = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {bridge_repo_hooks}/notify-stop.py",
+                            }
+                        ]
+                    }
+                ],
+                "Notification": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"python3 {bridge_repo_hooks}/notify-notification.py",
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+        settings_file.write_text(json.dumps(settings_data))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+        tmp_path.joinpath(".claude", "settings.json").write_text(json.dumps(settings_data))
+
+        # Create a fake skills directory with symlink
+        skills_dir = tmp_path / ".claude" / "skills"
+        skills_dir.mkdir(exist_ok=True, parents=True)
+        ask_discord_dir = skills_dir / "ask-discord"
+        ask_discord_dir.mkdir(exist_ok=True)
+        skill_md = ask_discord_dir / "SKILL.md"
+        skill_md.write_text("# ask-discord")
+
+        # Mock the health check to return bot_connected: true
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            runner = CliRunner()
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0
+        assert "[ok]" in result.output
+        assert "Secrets file present" in result.output or "present" in result.output.lower()
+
+    def test_doctor_bridge_unreachable(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor when bridge is unreachable: daemon health check fails, exit 1."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        # Create a valid secrets file
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        # Mock the health check to raise URLError (connection refused)
+        with patch("urllib.request.urlopen", side_effect=Exception("Connection refused")):
+            runner = CliRunner()
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[fail]" in result.output
+
+    def test_doctor_bot_connected_false(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor when daemon up but bot_connected=false: warns but exits 0."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        # Create a valid secrets file
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        # Mock the health check to return bot_connected: false
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": False}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            runner = CliRunner()
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0
+        assert "[warn]" in result.output
+
+    def test_doctor_secrets_file_mode_0644(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor detects secrets file with wrong mode (0644), fails."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        # Create a secrets file but with wrong mode
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        secrets_file.chmod(0o644)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[fail]" in result.output
+        assert "0600" in result.output or "mode" in result.output.lower()
+
+    def test_doctor_skill_symlink_missing(self, tmp_path: Path, monkeypatch) -> None:
+        """doctor detects missing skill symlink, warns but exits 0."""
+        secrets_file = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
+
+        # Create a valid secrets file
+        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path.joinpath(".claude").mkdir(exist_ok=True)
+
+        # Don't create the skill symlink
+        # Mock the health check to return bot_connected: true
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps({"bot_connected": True}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            runner = CliRunner()
+            result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0
+        assert "[warn]" in result.output
 
 
 class TestServeCommand:
