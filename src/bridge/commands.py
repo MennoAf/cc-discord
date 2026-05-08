@@ -11,6 +11,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
+from bridge import usage
 from bridge.bot import Bot
 from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
 
@@ -135,6 +136,32 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         await interaction.followup.send(f"🔄 Restarted `{task.task_id[:8]}`", ephemeral=True)
+
+    @tree.command(name="stats", description="Show model / token / cost stats for a task")
+    @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
+    async def stats_cmd(
+        interaction: discord.Interaction,
+        thread: discord.Thread | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, thread)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        if not task.current_transcript_path:
+            await interaction.followup.send(
+                "❌ Task has no transcript yet — wait for the first turn.",
+                ephemeral=True,
+            )
+            return
+        stats = usage.compute_stats(Path(task.current_transcript_path))
+        if stats is None:
+            await interaction.followup.send(
+                "❌ No usage data in transcript yet.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(usage.format_summary(stats), ephemeral=True)
 
     return tree
 

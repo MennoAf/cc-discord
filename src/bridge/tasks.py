@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 import bridge as _bridge_pkg
-from bridge import tool_summary, transcript
+from bridge import tool_summary, transcript, usage
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
@@ -833,8 +833,25 @@ class TaskRegistry:
             tp = Path(transcript_path)
             await self._wait_for_transcript_stable(tp)
             await self._stream_assistant_progress(task, tp)
+            await self._post_stats_footer(task, tp)
         else:
             logger.info("Stop: no transcript_path in body or task; skipping final stream")
+
+    async def _post_stats_footer(self, task: Task, transcript_path: Path) -> None:
+        """After Stop, post a one-line model/tokens/cost summary to Discord."""
+        try:
+            stats = usage.compute_stats(transcript_path)
+        except Exception:
+            logger.exception("compute_stats failed for task %s", task.task_id)
+            return
+        if stats is None:
+            return
+        try:
+            await self._bot.post(
+                usage.format_summary(stats), thread_id=task.thread_id
+            )
+        except Exception:
+            logger.exception("failed to post stats footer for task %s", task.task_id)
 
     # Max time to wait at Stop for the transcript file to stop growing
     # (i.e., the writer to flush). Tests override to 0 to skip the wait.
