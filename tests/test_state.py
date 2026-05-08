@@ -317,7 +317,6 @@ class TestTasks:
 
     async def test_open_db_creates_tasks_table(self, tmp_path: Path) -> None:
         """open_db creates tasks table."""
-        from bridge.state import TaskRow
         db_path = tmp_path / "state.db"
         conn = await open_db(db_path)
         try:
@@ -332,7 +331,6 @@ class TestTasks:
 
     async def test_open_db_tasks_table_schema(self, tmp_path: Path) -> None:
         """Tasks table has correct columns."""
-        from bridge.state import TaskRow
         db_path = tmp_path / "state.db"
         conn = await open_db(db_path)
         try:
