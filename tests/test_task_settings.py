@@ -15,9 +15,7 @@ class TestWriteTaskSettings:
         hooks_dir = tmp_path / "hooks"
         hooks_dir.mkdir()
 
-        # Create dummy hook files
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         out_path = _write_task_settings(
             "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
@@ -27,13 +25,16 @@ class TestWriteTaskSettings:
         assert out_path.exists()
 
     def test_write_task_settings_json_structure(self, tmp_path: Path) -> None:
-        """_write_task_settings generates valid JSON with all 8 hook events."""
+        """_write_task_settings registers the 7 observability events but NOT PreToolUse.
+
+        PreToolUse is intentionally omitted so the user's auto-mode classifier
+        drives approvals natively. See `_write_task_settings` docstring.
+        """
         settings_dir = tmp_path / "settings"
         hooks_dir = tmp_path / "hooks"
         hooks_dir.mkdir()
 
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         out_path = _write_task_settings(
             "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
@@ -42,9 +43,7 @@ class TestWriteTaskSettings:
         data = json.loads(out_path.read_text())
         hooks = data.get("hooks", {})
 
-        # Verify all 8 events are present
         expected_events = [
-            "PreToolUse",
             "SessionStart",
             "UserPromptSubmit",
             "PostToolUse",
@@ -55,6 +54,7 @@ class TestWriteTaskSettings:
         ]
         for event in expected_events:
             assert event in hooks, f"Missing event: {event}"
+        assert "PreToolUse" not in hooks, "PreToolUse must NOT be registered (auto-mode owns approvals)"
 
     def test_write_task_settings_hook_paths_absolute(self, tmp_path: Path) -> None:
         """_write_task_settings uses absolute paths for hook scripts."""
@@ -63,7 +63,6 @@ class TestWriteTaskSettings:
         hooks_dir.mkdir()
 
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         out_path = _write_task_settings(
             "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
@@ -72,14 +71,7 @@ class TestWriteTaskSettings:
         data = json.loads(out_path.read_text())
         hooks = data["hooks"]
 
-        # Check PreToolUse points to pretooluse-approve.py
-        pretooluse_hooks = hooks["PreToolUse"][0]["hooks"]
-        assert len(pretooluse_hooks) == 1
-        cmd = pretooluse_hooks[0]["command"]
-        assert "pretooluse-approve.py" in cmd
-        assert str(hooks_dir) in cmd
-
-        # Check one event hook points to event.py
+        # All registered hooks point to absolute paths under hooks_dir.
         session_start_hooks = hooks["SessionStart"][0]["hooks"]
         assert len(session_start_hooks) == 1
         cmd = session_start_hooks[0]["command"]
@@ -93,7 +85,6 @@ class TestWriteTaskSettings:
         hooks_dir.mkdir()
 
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         out_path = _write_task_settings(
             "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
@@ -109,7 +100,6 @@ class TestWriteTaskSettings:
         hooks_dir.mkdir()
 
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         out_path = _write_task_settings(
             "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
@@ -134,7 +124,6 @@ class TestCleanupTaskSettings:
         hooks_dir.mkdir()
 
         (hooks_dir / "event.py").write_text("# event hook")
-        (hooks_dir / "pretooluse-approve.py").write_text("# pretooluse hook")
 
         # Create the file first
         out_path = _write_task_settings(

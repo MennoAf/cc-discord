@@ -39,24 +39,18 @@ def _write_task_settings(
 ) -> Path:
     """Generate the task-scoped settings JSON. Returns the absolute path written.
 
-    The file registers `event.py` for the read-only event types and
-    `pretooluse-approve.py` for `PreToolUse`. All paths are absolute.
+    Registers `event.py` for the observability events. PreToolUse is
+    deliberately *not* registered: that lets the user's permission mode
+    (typically `defaultMode: "auto"`) drive approvals via Claude Code's own
+    classifier. Risky prompts surface as Notification events and route to
+    Discord through the existing `_on_notification` path.
     """
     settings_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings_dir / f"{task_id}.json"
     event_script = str(hooks_dir / "event.py")
-    pretooluse_script = str(hooks_dir / "pretooluse-approve.py")
 
     settings = {
         "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "*",
-                    "hooks": [
-                        {"type": "command", "command": pretooluse_script},
-                    ],
-                },
-            ],
             "SessionStart": [
                 {"matcher": "*", "hooks": [{"type": "command", "command": event_script}]},
             ],
