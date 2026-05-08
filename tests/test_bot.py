@@ -1,11 +1,10 @@
 """Tests for the discord bot wrapper."""
 
-import asyncio
 from unittest import mock
 
 import pytest
 
-from bridge.bot import MAX_CHUNK, _chunk, _extract_images, Bot, BotNotReady
+from bridge.bot import MAX_CHUNK, _chunk, Bot, BotNotReady
 
 
 class Test_chunk:

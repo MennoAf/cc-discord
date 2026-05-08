@@ -5,7 +5,7 @@ import pytest
 
 import time
 
-from bridge.state import open_db, close_db, DEFAULT_DB_PATH, SessionRow, get_session, upsert_session, delete_session
+from bridge.state import open_db, close_db, SessionRow, get_session, upsert_session, delete_session
 
 
 @pytest.mark.asyncio

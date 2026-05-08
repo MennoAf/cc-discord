@@ -220,7 +220,6 @@ class TestDoctorCommand:
         write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
 
         # Create a fake settings.json
-        settings_file = tmp_path / "settings.json"
         bridge_repo_hooks = Path(__file__).parent.parent / "hooks"
         settings_data = {
             "hooks": {
@@ -246,7 +245,6 @@ class TestDoctorCommand:
                 ],
             }
         }
-        settings_file.write_text(json.dumps(settings_data))
         monkeypatch.setenv("HOME", str(tmp_path))
         tmp_path.joinpath(".claude").mkdir(exist_ok=True)
         tmp_path.joinpath(".claude", "settings.json").write_text(json.dumps(settings_data))
