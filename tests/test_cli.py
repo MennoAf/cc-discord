@@ -1,6 +1,5 @@
 """Tests for bridge CLI using click.testing.CliRunner."""
 
-import asyncio
 import json
 import stat
 from pathlib import Path
