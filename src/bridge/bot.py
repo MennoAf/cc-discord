@@ -5,9 +5,40 @@ import base64
 import contextlib
 import logging
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TypeVar
 
+import aiohttp
 import discord
+
+
+_T = TypeVar("_T")
+
+
+# Discord occasionally serves transient 5xx during incidents. Retry the
+# bracketed call a few times with exponential backoff before propagating.
+_RETRY_DELAYS_SECS = (0.5, 1.5, 4.0)
+
+
+async def _with_retry(label: str, factory: Callable[[], Awaitable[_T]]) -> _T:
+    """Retry `factory()` on Discord 5xx / connection errors. Raises on the
+    final attempt or on any non-retryable error."""
+    last_exc: BaseException | None = None
+    for attempt, delay in enumerate((0.0,) + _RETRY_DELAYS_SECS):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await factory()
+        except (discord.DiscordServerError, aiohttp.ClientConnectionError) as e:
+            last_exc = e
+            logger.warning(
+                "%s: transient discord error (attempt %d/%d): %s",
+                label,
+                attempt + 1,
+                len(_RETRY_DELAYS_SECS) + 1,
+                e,
+            )
+    assert last_exc is not None  # the loop above always raises or returns
+    raise last_exc
 
 logger = logging.getLogger(__name__)
 
@@ -171,16 +202,24 @@ class Bot:
         """Post `message` to the configured channel (or thread within it).
 
         Chunks per `_chunk()`. Returns the list of created message IDs.
-        Raises `BotNotReady` if the bot isn't connected yet.
+        Raises `BotNotReady` if the bot isn't connected yet. Transient
+        Discord 5xx / connection errors are retried with backoff before
+        propagating.
         """
         if not self.is_ready or self._channel is None:
             raise BotNotReady("bot not connected to Discord")
         target: discord.abc.Messageable = self._channel
         if thread_id is not None:
-            target = await self._client.fetch_channel(thread_id)
+            target = await _with_retry(
+                f"fetch_channel({thread_id})",
+                lambda: self._client.fetch_channel(thread_id),
+            )
         ids: list[int] = []
         for chunk in _chunk(message):
-            msg = await target.send(chunk)
+            msg = await _with_retry(
+                f"send(thread={thread_id})",
+                lambda c=chunk: target.send(c),
+            )
             ids.append(msg.id)
         return ids
 
@@ -202,17 +241,27 @@ class Bot:
             raise ValueError("file_paths must not be empty")
         target: discord.abc.Messageable = self._channel
         if thread_id is not None:
-            target = await self._client.fetch_channel(thread_id)
+            target = await _with_retry(
+                f"fetch_channel({thread_id})",
+                lambda: self._client.fetch_channel(thread_id),
+            )
 
         capped = file_paths[:10]
         chunks = list(_chunk(text)) if text else [None]
         first_chunk = chunks[0]
-        files = [discord.File(str(p)) for p in capped]
+        # discord.File is consumed when sent — open fresh handles for retries.
+        send_first = lambda: target.send(  # noqa: E731
+            content=first_chunk,
+            files=[discord.File(str(p)) for p in capped],
+        )
         ids: list[int] = []
-        msg = await target.send(content=first_chunk, files=files)
+        msg = await _with_retry(f"send(thread={thread_id}, with files)", send_first)
         ids.append(msg.id)
         for follow in chunks[1:]:
-            msg = await target.send(follow)
+            msg = await _with_retry(
+                f"send(thread={thread_id}, follow-up)",
+                lambda c=follow: target.send(c),
+            )
             ids.append(msg.id)
         return ids
 

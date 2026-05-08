@@ -47,7 +47,7 @@ The systemd unit at `packaging/claude-discord-bridge.service` hardcodes `%h/.loc
 ## Architecture quick reference
 
 - `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`. `AskLockMap` lives here.
-- `src/bridge/bot.py` — `discord.py` wrapper. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes.
+- `src/bridge/bot.py` — `discord.py` wrapper. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes. `_with_retry` wraps every `fetch_channel` / `target.send` call with bounded backoff (4 attempts) on `DiscordServerError` / `ClientConnectionError` so transient Discord 5xx waves don't drop user-facing posts (incl. AskUserQuestion notifications).
 - `src/bridge/threads.py` — `ThreadRegistry` owns session_id→thread_id mapping with 404 recovery. Single global lock is intentional (per-session contention is rare).
 - `src/bridge/listener.py` — sliding-window coalescing for `/v1/ask` replies. `GRACE_SECS = 3.0` default; tests override.
 - `src/bridge/state.py` — aiosqlite, WAL mode. Tables: `sessions`, `tasks`, `approval_log`.
