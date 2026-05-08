@@ -167,9 +167,12 @@ class ZellijManager:
                 await self._action_write_bytes(27, 91, 50, 48, 48, 126)
                 for i, segment in enumerate(segments):
                     if segment:
+                        # `--` terminates flag parsing; otherwise zellij
+                        # silently drops segments that start with `-`
+                        # (markdown bullets, diff lines, CLI flag-y prose).
                         rc, _, stderr = await self._run_unlocked(
                             self._executable, "--session", SESSION_NAME,
-                            "action", "write-chars", segment,
+                            "action", "write-chars", "--", segment,
                         )
                         if rc != 0:
                             raise ZellijError(f"write-chars failed: {stderr}")
@@ -180,7 +183,7 @@ class ZellijManager:
             elif body:
                 rc, _, stderr = await self._run_unlocked(
                     self._executable, "--session", SESSION_NAME,
-                    "action", "write-chars", body,
+                    "action", "write-chars", "--", body,
                 )
                 if rc != 0:
                     raise ZellijError(f"write-chars failed: {stderr}")
