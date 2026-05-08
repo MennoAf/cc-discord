@@ -728,14 +728,16 @@ class TaskRegistry:
             parts.append(text)
         parts.extend(voice_segments)
         if other_paths:
-            # Plain paths, one per line — no `- ` bullet prefix. Markdown
-            # bullets confuse zellij's argparse (leading `-` is read as a
-            # flag), and Claude reads paths just as well without them.
-            parts.append(
-                "attached files (use the Read tool to view):\n"
-                + "\n".join(str(p) for p in other_paths)
-            )
-        combined = "\n\n".join(parts)
+            # Inline each path with the rest of the prose (space-separated)
+            # rather than putting them on their own lines. zellij's pipeline
+            # to claude's TUI loses content past the first ~50 bytes of
+            # multi-line writes, so keeping paths inline guarantees they
+            # arrive even if any later \n drops content.
+            for p in other_paths:
+                parts.append(f"[attached: {p}]")
+        # Single-space join keeps the relay one logical line (the user's own
+        # text may still contain its own newlines, but we don't add any).
+        combined = " ".join(parts)
 
         logger.info(
             "relay → pane (task=%s, %d chars, %d segments): %r",
