@@ -1,0 +1,28 @@
+{
+  "tabs": [
+    {
+      "name": "Tab 1",
+      "active": true,
+      "panes": [
+        {
+          "id": "terminal_0",
+          "title": "zsh",
+          "pwd": "/home/user",
+          "terminal_command": "zsh",
+          "exited": false,
+          "is_fullscreen": false,
+          "client_id": null
+        },
+        {
+          "id": "terminal_1",
+          "title": "claude session",
+          "pwd": "/tmp/work",
+          "terminal_command": "claude",
+          "exited": false,
+          "is_fullscreen": false,
+          "client_id": null
+        }
+      ]
+    }
+  ]
+}

@@ -6,17 +6,20 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import aiosqlite
 import pytest
 from aiohttp import test_utils
 
+from bridge import state
+from bridge.approvals import ApprovalRouter
 from bridge.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
-    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY
+    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY, TASK_REGISTRY_KEY, ZELLIJ_KEY
 )
 from bridge.threads import ThreadRegistry
+from bridge.tasks import TaskRegistry
+from bridge.zellij import ZellijManager
 
 
 @dataclass
@@ -54,10 +57,16 @@ class FakeBot:
         self._create_thread_calls: list[dict] = []
         self._next_thread_id = 2000
         self._thread_alive_map: dict[int, bool] = {}
+        self._client = None  # Stub for commands.py compatibility
 
     @property
     def channel_id(self) -> int:
         return self._channel_id
+
+    @property
+    def client(self):
+        """Stub for commands.py compatibility."""
+        return self._client
 
     @property
     def is_ready(self) -> bool:
@@ -84,6 +93,12 @@ class FakeBot:
         self._thread_alive_map[thread_id] = True
         return thread_id
 
+    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+        """Fake add_reactions: do nothing for testing."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        # Just do nothing for testing
+
     async def thread_alive(self, thread_id: int) -> bool:
         """Fake thread_alive: check the map."""
         return self._thread_alive_map.get(thread_id, True)
@@ -104,37 +119,33 @@ async def fake_bot():
     return FakeBot()
 
 
-@pytest.fixture
-async def in_memory_db():
-    """Create an in-memory SQLite database for testing."""
-    conn = await aiosqlite.connect(":memory:")
-    # Initialize the schema (same as state.open_db does)
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            cwd TEXT NOT NULL,
-            thread_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL
-        )
-    """)
-    await conn.commit()
-    yield conn
-    await conn.close()
 
 
 @pytest.fixture
-async def client(fake_bot, in_memory_db):
-    """Create a test client for the aiohttp app with ThreadRegistry wired in."""
+async def client(fake_bot, in_memory_db, monkeypatch):
+    """Create a test client for the aiohttp app with ThreadRegistry and TaskRegistry wired in."""
     started_at = time.monotonic()
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
+    # Create a mocked ZellijManager for testing
+    zellij = ZellijManager()
+
+    async def mock_run(*argv, env=None, timeout=10.0):
+        """Mock _run to always return success."""
+        return (0, "", "")
+
+    monkeypatch.setattr(zellij, "_run", mock_run)
+    task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+    await task_registry.load_from_db()
     # Wire in listener and ask_locks for /v1/ask testing
-    from bridge.server import AskLockMap
+    from bridge.server import AskLockMap, APPROVAL_ROUTER_KEY
+    from bridge.approvals import ApprovalRouter
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = Listener()
     app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db, timeout=0.5)
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
@@ -1093,3 +1104,499 @@ class TestAskEndpoint:
         assert resp.status == 500
         body = await resp.json()
         assert body["error"] == "internal"
+
+
+@pytest.mark.asyncio
+class TestHookEvent:
+    """Tests for POST /v1/hook/event endpoint."""
+
+    async def test_hook_event_session_start_with_task(self, client, fake_bot, in_memory_db):
+        """POST /v1/hook/event with SessionStart and matching task_id returns 200."""
+        from bridge.state import upsert_task
+        import time
+
+        # Create a task in the database
+        now = int(time.time())
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+        # Reload task registry
+        task_registry = client.app[TASK_REGISTRY_KEY]
+        await task_registry.load_from_db()
+
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-abc",
+                "cwd": "/tmp",
+                "transcript_path": "/path",
+                "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+        # Verify bot.post was called
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert posts[0]["thread_id"] == 999
+
+    async def test_hook_event_stop(self, client, fake_bot):
+        """POST /v1/hook/event with Stop event returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Stop",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_user_prompt_submit(self, client, fake_bot):
+        """POST /v1/hook/event with UserPromptSubmit returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_post_tool_use(self, client, fake_bot):
+        """POST /v1/hook/event with PostToolUse returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_notification(self, client, fake_bot):
+        """POST /v1/hook/event with Notification returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Notification",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_session_end(self, client, fake_bot):
+        """POST /v1/hook/event with SessionEnd returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionEnd",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_post_tool_use_failure(self, client, fake_bot):
+        """POST /v1/hook/event with PostToolUseFailure returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "PostToolUseFailure",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_missing_hook_event_name(self, client, fake_bot):
+        """POST /v1/hook/event without hook_event_name returns 400."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+
+    async def test_hook_event_malformed_json(self, client, fake_bot):
+        """POST /v1/hook/event with malformed JSON returns 400."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            data="not json",
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+
+    async def test_hook_event_non_dict_json_body(self, client, fake_bot):
+        """POST /v1/hook/event with non-dict JSON body returns 400."""
+        fake_bot.set_ready(True)
+        # Send a JSON number instead of an object
+        resp = await client.post(
+            "/v1/hook/event",
+            json=5,
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+        assert "JSON object" in body["error"]
+
+    async def test_hook_event_unknown_event_name(self, client, fake_bot):
+        """POST /v1/hook/event with unknown event_name returns 200 (silent no-op)."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Banana",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_handler_exception(self, client, fake_bot, monkeypatch):
+        """POST /v1/hook/event with handler exception returns 500."""
+        fake_bot.set_ready(True)
+
+        # Patch the registry's handle_event to raise an exception
+        async def failing_handle_event(*args, **kwargs):
+            raise RuntimeError("Handler failed")
+
+        task_registry = client.app[TASK_REGISTRY_KEY]
+        monkeypatch.setattr(task_registry, "handle_event", failing_handle_event)
+
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 500
+        body = await resp.json()
+        assert body["error"] == "internal"
+
+
+@pytest.mark.asyncio
+class TestDispatcher:
+    """Tests for message dispatcher in serve()."""
+
+    async def test_production_dispatcher_resolve_by_text_precedence(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Test the production dispatcher enforces resolve_by_text → maybe_route_message → listener order.
+
+        This regression test verifies the critical dispatch-order invariant: when a pending
+        approval exists for a thread and the user types a free-text reply, that reply is
+        resolved as deny-with-reason and NOT routed to zellij (maybe_route_message is skipped).
+        """
+        from bridge.server import make_message_dispatcher
+        from bridge.state import upsert_task
+
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        # Create a task in the database
+        task_id = "task-approval-test"
+        thread_id = 5001
+        pane_id = "pane_approval"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-abc",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Create approval router and register a pending approval
+        approval_router = ApprovalRouter(fake_bot, in_memory_db, timeout=0.1)
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Create a pending approval for this thread
+        import asyncio
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        import time
+        from bridge.approvals import _PendingApproval
+        pending = _PendingApproval(
+            request_id="req-1",
+            task_id=task_id,
+            tool_name="Bash",
+            tool_input={},
+            thread_id=thread_id,
+            created_at=int(time.time()),
+            future=fut,
+        )
+        async with approval_router._lock:
+            approval_router._by_request_id["req-1"] = pending
+
+        # Create the production dispatcher
+        _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
+
+        # Simulate a free-text reply to the approval in the thread
+        msg = FakeMsg(
+            author=FakeUser(id=111),
+            channel=FakeChannel(id=thread_id),
+            content="use a different approach instead"
+        )
+
+        await _dispatch_message(msg)
+
+        # Verify the approval was resolved by text
+        assert fut.done()
+        decision, reason = fut.result()
+        assert decision == "deny"
+        assert reason == "use a different approach instead"
+
+        # Verify the message was NOT routed to zellij
+        assert len(zellij_calls) == 0
+        # Verify the message was NOT delivered to listener
+        assert len(listener_calls) == 0
+
+    async def test_dispatcher_routes_task_thread_message(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Dispatcher routes task-thread messages to zellij, not listener."""
+        from bridge.state import upsert_task
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            """Mock _run to always return success."""
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        # Create a task in the database
+        task_id = "task-123"
+        thread_id = 5000
+        pane_id = "pane_1"
+        now = int(__import__('time').time())
+        await upsert_task(
+            in_memory_db, task_id, thread_id, "/tmp", "running",
+            zellij_pane_id=pane_id,
+            current_claude_session_id="sess-abc",
+            current_transcript_path="/path/transcript",
+            now=now,
+        )
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Build dispatcher
+        async def _dispatch_message(msg):
+            if await task_registry.maybe_route_message(msg):
+                return
+            await listener.deliver(msg)
+
+        # Simulate a message in the task thread
+        msg = FakeMsg(
+            author=FakeUser(id=111),
+            channel=FakeChannel(id=thread_id),
+            content="hello"
+        )
+        await _dispatch_message(msg)
+
+        # Verify dispatcher called zellij, not listener
+        assert len(zellij_calls) == 1
+        assert zellij_calls[0]["pane_id"] == pane_id
+        assert "hello" in zellij_calls[0]["text"]
+        assert len(listener_calls) == 0
+
+    async def test_dispatcher_falls_through_to_listener(
+        self, fake_bot, in_memory_db, monkeypatch
+    ) -> None:
+        """Dispatcher falls through to listener for non-task messages."""
+        zellij = ZellijManager()
+
+        async def mock_run(*argv, env=None, timeout=10.0):
+            """Mock _run to always return success."""
+            return (0, "", "")
+
+        monkeypatch.setattr(zellij, "_run", mock_run)
+
+        task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+        await task_registry.load_from_db()
+
+        listener = Listener()
+        listener_calls = []
+
+        async def track_deliver(msg):
+            listener_calls.append(msg)
+
+        listener.deliver = track_deliver
+
+        # Track zellij calls
+        zellij_calls = []
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            zellij_calls.append({"pane_id": pane_id, "text": text})
+
+        monkeypatch.setattr(zellij, "write_to_pane", mock_write_to_pane)
+
+        # Build dispatcher
+        async def _dispatch_message(msg):
+            if await task_registry.maybe_route_message(msg):
+                return
+            await listener.deliver(msg)
+
+        # Simulate a message in a thread with NO bound task
+        msg = FakeMsg(
+            author=FakeUser(id=222),
+            channel=FakeChannel(id=9999),  # Not a task thread
+            content="ask something"
+        )
+        await _dispatch_message(msg)
+
+        # Verify dispatcher called listener, not zellij
+        assert len(listener_calls) == 1
+        assert listener_calls[0] is msg
+        assert len(zellij_calls) == 0
+
+
+# Tests for POST /v1/hook/pretooluse endpoint
+
+@pytest.mark.asyncio
+async def test_pretooluse_valid_request(client, in_memory_db, fake_bot):
+    """POST /v1/hook/pretooluse with valid body and known task returns approval decision."""
+    # Set bot to ready state
+    fake_bot.set_ready(True)
+
+    # Create a task in the DB and in the TaskRegistry cache
+    from bridge.server import TASK_REGISTRY_KEY
+    await state.upsert_task(in_memory_db, "task-1", 1001, "/tmp", "running")
+    task_registry = client.server.app[TASK_REGISTRY_KEY]
+    # Reload from DB to populate cache
+    await task_registry.load_from_db()
+
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "task-1",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "ls"}
+        }
+    )
+
+    assert resp.status == 200
+    body = await resp.json()
+    # The default behavior is deny (timeout since there's no input to the future)
+    # That's the correct behavior - without user response, it times out and denies
+    assert body["decision"] == "deny"
+    assert body["reason"] == "approval timed out"
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_missing_field(client):
+    """POST /v1/hook/pretooluse missing required field returns 400."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "task-1",
+            # missing tool_name and tool_input
+        }
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_invalid_json(client):
+    """POST /v1/hook/pretooluse with invalid JSON returns 400."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        data="not json",
+        headers={"Content-Type": "application/json"}
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "error" in body
+
+
+@pytest.mark.asyncio
+async def test_pretooluse_unknown_task_id(client, in_memory_db):
+    """POST /v1/hook/pretooluse with unknown task_id returns deny decision."""
+    resp = await client.post(
+        "/v1/hook/pretooluse",
+        json={
+            "request_id": "req-1",
+            "task_id": "unknown-task",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "ls"}
+        }
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["decision"] == "deny"
+    assert "unknown" in body["reason"].lower()

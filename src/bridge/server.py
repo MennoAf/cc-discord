@@ -7,12 +7,16 @@ import signal
 import time
 from datetime import datetime, timezone
 
+import discord
 from aiohttp import web
 
+from bridge.approvals import ApprovalRouter
 from bridge.bot import Bot, BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.secrets import Secrets
+from bridge.tasks import TaskRegistry
 from bridge.threads import ThreadRegistry
+from bridge.zellij import ZellijManager
 from bridge import state
 
 logger = logging.getLogger(__name__)
@@ -78,6 +82,9 @@ BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
 THREADS_KEY: web.AppKey[ThreadRegistry] = web.AppKey("threads", ThreadRegistry)
 LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
 ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
+TASK_REGISTRY_KEY: web.AppKey[TaskRegistry] = web.AppKey("task_registry", TaskRegistry)
+ZELLIJ_KEY: web.AppKey[ZellijManager] = web.AppKey("zellij", ZellijManager)
+APPROVAL_ROUTER_KEY: web.AppKey[ApprovalRouter] = web.AppKey("approval_router", ApprovalRouter)
 
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
 
@@ -292,6 +299,137 @@ async def _handle_health(request: web.Request) -> web.Response:
     )
 
 
+async def _handle_hook_event(request: web.Request) -> web.Response:
+    """Handle POST /v1/hook/event — dispatch by hook_event_name to TaskRegistry."""
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "invalid json"}),
+            content_type="application/json",
+        )
+
+    # Validate that body is a JSON object (dict)
+    if not isinstance(body, dict):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "body must be a JSON object"}),
+            content_type="application/json",
+        )
+
+    # Validate required field
+    if "hook_event_name" not in body or not isinstance(body.get("hook_event_name"), str):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "missing required field: hook_event_name"}),
+            content_type="application/json",
+        )
+
+    try:
+        registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+        await registry.handle_event(body["hook_event_name"], body)
+        return web.Response(
+            status=200,
+            text=json.dumps({"ok": True}),
+            content_type="application/json",
+        )
+    except Exception:
+        logger.exception("hook event handler failed")
+        return web.Response(
+            status=500,
+            text=json.dumps({"error": "internal"}),
+            content_type="application/json",
+        )
+
+
+async def _handle_pretooluse(request: web.Request) -> web.Response:
+    """Handle POST /v1/hook/pretooluse — register Future, post approval prompt, await decision."""
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "invalid json"}),
+            content_type="application/json",
+        )
+
+    required = ("request_id", "task_id", "tool_name", "tool_input")
+    if not all(k in body for k in required):
+        missing = [k for k in required if k not in body]
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": f"missing: {missing}"}),
+            content_type="application/json",
+        )
+
+    try:
+        registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+        router: ApprovalRouter = request.app[APPROVAL_ROUTER_KEY]
+
+        task = registry.get_by_task_id(body["task_id"])
+        if task is None:
+            # Fail-closed at the daemon level too: deny if we don't know this task
+            return web.json_response({
+                "decision": "deny",
+                "reason": f"unknown task_id {body['task_id']}",
+            }, status=200)
+
+        decision, reason = await router.request_permission(
+            request_id=body["request_id"],
+            task_id=body["task_id"],
+            thread_id=task.thread_id,
+            tool_name=body["tool_name"],
+            tool_input=body.get("tool_input") or {},
+        )
+        return web.json_response({"decision": decision, "reason": reason}, status=200)
+    except Exception:
+        logger.exception("pretooluse handler failed")
+        return web.Response(
+            status=500,
+            text=json.dumps({"error": "internal"}),
+            content_type="application/json",
+        )
+
+
+def make_message_dispatcher(
+    approval_router: ApprovalRouter,
+    task_registry: TaskRegistry,
+    listener: Listener,
+) -> callable:
+    """Create a message dispatcher closure.
+
+    The dispatcher enforces a critical order: resolve_by_text (approval replies)
+    takes precedence over maybe_route_message (task thread routing), which takes
+    precedence over listener.deliver (general listener).
+
+    This invariant must not regress: if a user types a free-text deny reply to an
+    approval prompt, it is NOT routed to the task pane.
+
+    Args:
+        approval_router: ApprovalRouter instance for resolving approvals
+        task_registry: TaskRegistry instance for routing task-thread messages
+        listener: Listener instance for delivering non-routed messages
+
+    Returns:
+        async callable that dispatches messages in the correct order
+    """
+    async def _dispatch_message(msg):
+        # First, try to resolve any pending approval via text reply
+        if await approval_router.resolve_by_text(msg.channel.id, msg.content or "", msg.author.bot):
+            return
+        # Then, try to resolve any pending TUI answer via text reply
+        if await approval_router.resolve_tui_by_text(msg.channel.id, msg.content or "", msg.author.bot):
+            return
+        # Then, check task threads for tool output routing
+        if await task_registry.maybe_route_message(msg):
+            return
+        # Finally, fall back to the general listener
+        await listener.deliver(msg)
+
+    return _dispatch_message
+
+
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
@@ -300,6 +438,8 @@ async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Applica
     app.router.add_post("/v1/notify", _handle_notify)
     app.router.add_post("/v1/ask", _handle_ask)
     app.router.add_get("/v1/health", _handle_health)
+    app.router.add_post("/v1/hook/event", _handle_hook_event)
+    app.router.add_post("/v1/hook/pretooluse", _handle_pretooluse)
     return app
 
 
@@ -310,19 +450,59 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     Opens the database for session persistence and instantiates ThreadRegistry.
     """
     listener = Listener()
-    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=listener.deliver)
+    zellij = ZellijManager()
+    await zellij.ensure_session_alive()
+
     conn = await state.open_db()
+    approval_router = ApprovalRouter(None, conn)  # type: ignore
+    task_registry = TaskRegistry(conn, None, zellij, approval_router)  # type: ignore
+    await task_registry.load_from_db(reconcile_with_zellij=True)
+
+    # Create dispatcher with partially initialized components. The dispatcher will be
+    # called after bot is created (it updates task_registry._bot and approval_router._bot).
+    _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
+
+    async def _on_reaction_dispatch(payload):
+        """Dispatch raw reaction events to approval and TUI resolvers."""
+        user_is_self_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
+        # Try approval reactions first
+        if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
+            return
+        # Then try TUI reactions
+        await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
+
+    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
+
+    # Update references to bot now that it's created
+    task_registry._bot = bot
+    approval_router._bot = bot
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = listener
     app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = approval_router
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
     await bot.start()
     logger.info("listening on http://%s:%d", host, port)
+
+    # Build and sync the slash command tree
+    from bridge.commands import build_tree
+
+    tree = build_tree(bot, task_registry)
+    # Wait for bot to be ready before syncing commands
+    while not bot.is_ready:
+        await asyncio.sleep(0.1)
+    guild_id = bot.channel.guild.id  # type: ignore[union-attr]
+    guild = discord.Object(id=guild_id)
+    tree.copy_global_to(guild=guild)  # registers globally to this guild for instant sync
+    synced = await tree.sync(guild=guild)
+    logger.info("synced %d slash commands to guild %d", len(synced), guild_id)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

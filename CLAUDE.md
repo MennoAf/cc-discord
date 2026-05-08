@@ -21,6 +21,9 @@ Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3
 - **Single event loop, shared by aiohttp + discord.py.** Long blocking work (sync DB calls, `time.sleep`, `requests`) inside any handler starves both the HTTP server and the Discord gateway. Use the async equivalents (`aiosqlite`, `asyncio.sleep`, `aiohttp` client).
 - **`SKILL.md` in `skills/` is symlinked into `~/.claude/skills/ask-discord/SKILL.md`.** Edit the file in this repo; the live skill follows. Don't duplicate.
 - **`cli doctor` checks settings.json hook paths against `bridge.__file__`.** If you `uv tool install .` the bridge into `~/.local/bin`, `bridge.__file__` resolves into the uv tool venv, not this repo. The doctor's hook-path check expects `<repo>/hooks/notify-*.py` paths in `~/.claude/settings.json` to match wherever the package is currently importing from. Run `doctor` from the same install you registered hooks against.
+- **Task-scoped settings via `--settings` flag, not env var.** Discord-driven sessions (`/start` slash command) generate a per-task settings file at `~/.local/state/claude-discord-bridge/task-settings/<task_id>.json` and pass it via `claude --settings <path>`. Hooks **accumulate** (merge), not override — the user's existing `~/.claude/settings.json` hooks (e.g. `notify-stop.py`, `notify-notification.py`) still fire alongside the task-scoped hooks. The bridge's `event.py` hook is idempotent, so duplicate fires from both sources are harmless.
+- **`bridge` zellij session is shared.** All spawned Claude panes run in a single `bridge` zellij session. Don't `zellij kill-session bridge` while tasks are running — it kills all panes at once and the bridge will mark them all `crashed` on next event.
+- **`/restart` uses `--settings` + `--resume`.** The `/restart <task-id>` command spawns a new pane with both `claude --settings <path>` (to wire the task hooks) and `claude --resume <session_id>` (to pick up from the prior session). Don't manually delete `~/.claude/projects/...` for a session the bridge is using.
 
 ## Deployment paths
 
@@ -30,11 +33,14 @@ The systemd unit at `packaging/claude-discord-bridge.service` hardcodes `%h/.loc
 
 ## Architecture quick reference
 
-- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`. `AskLockMap` lives here.
+- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`. `AskLockMap` lives here.
 - `src/bridge/bot.py` — `discord.py` wrapper. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes.
 - `src/bridge/threads.py` — `ThreadRegistry` owns session_id→thread_id mapping with 404 recovery. Single global lock is intentional (per-session contention is rare).
 - `src/bridge/listener.py` — sliding-window coalescing for `/v1/ask` replies. `GRACE_SECS = 3.0` default; tests override.
-- `src/bridge/state.py` — aiosqlite, WAL mode, `sessions` table.
+- `src/bridge/state.py` — aiosqlite, WAL mode. Tables: `sessions`, `tasks`, `approval_log`.
+- `src/bridge/tasks.py` — `TaskRegistry` for Discord-driven sessions. Owns task lifecycle, hook-event dispatch, typing/tool-summary/transcript relay, startup reconciliation against zellij.
+- `src/bridge/zellij.py` — async wrapper around the `zellij` CLI. All spawned panes share the `bridge` session.
+- `src/bridge/approvals.py` — `ApprovalRouter` for PreToolUse round-trips (Discord reactions/text → hook decision) and `Notification` TUI prompts (AskUserQuestion / ExitPlanMode / free-text).
 - `src/bridge/secrets.py` — 0600 JSON at `~/.config/claude-discord-bridge/secrets.json`.
-- `hooks/` — Claude Code Stop/Notification hooks. Posts to `BRIDGE_URL` (default `http://127.0.0.1:8787`); falls back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down.
+- `hooks/` — Claude Code hooks. `notify-stop.py` / `notify-notification.py` are the standalone-bridge hooks. `event.py` (multi-event dispatcher) and `pretooluse-approve.py` (fail-closed approval wrapper) are the Discord-driven-session hooks injected via `--settings`. All post to `BRIDGE_URL` (default `http://127.0.0.1:8787`); the notify hooks fall back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down.
 - `skills/` — `/ask-discord` skill. `SKILL.md` is symlinked into `~/.claude/skills/ask-discord/`.

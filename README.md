@@ -128,6 +128,58 @@ Once the daemon is running, the four surfaces work without further intervention:
 
 Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` always routes to the same thread; different sessions get different threads. Mappings persist in SQLite at `~/.local/state/claude-discord-bridge/state.db` and survive daemon restarts. Archived/deleted threads recreate transparently.
 
+## Discord-driven sessions
+
+As an alternative to the hooks-based flow, the bridge also supports spawning Claude Code sessions directly from Discord slash commands. This is useful when you want Claude to run autonomously in a known working directory, with all output (typing, tool calls, final turn) automatically relayed back to Discord.
+
+### Slash commands
+
+- `/start cwd:<path>` — Spawn a new Claude session in the given directory, opening a dedicated zellij pane and Discord thread.
+- `/list` — Show all active tasks (running, spawning, or stopped).
+- `/stop <task-id>` — Gracefully stop the Claude session (sends `/stop` to the pane; archives the thread on exit).
+- `/kill <task-id>` — Forcefully close the pane (marks task as crashed; archives the thread immediately).
+- `/restart <task-id>` — Resume a stopped task (spawns a new pane with `claude --resume <session>`).
+
+### Task lifecycle
+
+1. `/start` creates a Discord thread and spawns Claude in a zellij pane.
+2. The pane is tagged with a unique `CC_DISCORD_TASK_ID` environment variable.
+3. The bridge hooks fire on every event: `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`.
+4. Output is relayed: typing indicator → Discord message for tool summaries → final turn posted on `Stop`.
+5. On `/stop` or `/kill`, the task is marked stopped/crashed and the thread is archived.
+6. On `/restart`, a new pane resumes the same session ID.
+
+### One-time setup
+
+Before using slash commands:
+
+1. **Install `zellij`** (terminal multiplexer):
+   ```bash
+   brew install zellij           # macOS
+   cargo install zellij          # Linux (Rust toolchain required)
+   ```
+   Verify: `zellij --version`
+
+2. **Bridge session**
+   The bridge auto-creates a shared `bridge` zellij session on first `/start`. To attach and watch panes:
+   ```bash
+   zellij attach bridge
+   ```
+
+3. **Settings directory**
+   The bridge writes per-task settings files at `~/.local/state/claude-discord-bridge/task-settings/<task_id>.json` (cleaned up when the task ends). Ensure this directory is writable:
+   ```bash
+   mkdir -p ~/.local/state/claude-discord-bridge/task-settings
+   ```
+
+### Verify setup
+
+```bash
+uv run claude-discord-bridge doctor
+```
+
+The new checks (Checks 6-10) verify `zellij` is installed, the `bridge` session reachable, the task-settings directory writable, hook scripts present, and `claude` on PATH.
+
 ## Architecture
 
 Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one asyncio event loop. Per-session thread mapping lives in SQLite. Reply routing uses a per-thread `asyncio.Lock` (FIFO) plus a sliding 3-second coalescing window so multi-message replies fold into one response.

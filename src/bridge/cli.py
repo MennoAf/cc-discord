@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import stat
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -328,6 +330,92 @@ def doctor() -> None:
                 warned = True
     else:
         click.echo(f"[warn] Skill symlink — {skill_path} not found", err=True)
+        warned = True
+
+    # Check 6: zellij installed
+    try:
+        result = subprocess.run(["zellij", "--version"], capture_output=True, timeout=5, text=True)
+        if result.returncode == 0:
+            version_line = result.stdout.strip().split("\n")[0] if result.stdout else "zellij"
+            click.echo(f"[ok] zellij CLI — {version_line}")
+        else:
+            click.echo(f"[fail] zellij CLI — exited with status {result.returncode}", err=True)
+            failed = True
+    except FileNotFoundError:
+        path_env = os.environ.get("PATH", "(not set)")
+        click.echo(f"[fail] zellij CLI — not installed (PATH = {path_env})", err=True)
+        failed = True
+    except subprocess.TimeoutExpired:
+        click.echo("[fail] zellij CLI — timeout checking version", err=True)
+        failed = True
+    except Exception as e:
+        click.echo(f"[fail] zellij CLI — error: {e}", err=True)
+        failed = True
+
+    # Check 7: bridge zellij session exists
+    try:
+        result = subprocess.run(["zellij", "list-sessions"], capture_output=True, timeout=5, text=True)
+        if "bridge" in result.stdout:
+            click.echo("[ok] bridge zellij session — running")
+        else:
+            click.echo("[warn] bridge zellij session — not running yet (will be created on first /start)", err=True)
+            warned = True
+    except FileNotFoundError:
+        click.echo("[warn] bridge zellij session — cannot check (zellij not installed)", err=True)
+        warned = True
+    except subprocess.TimeoutExpired:
+        click.echo("[warn] bridge zellij session — timeout checking sessions", err=True)
+        warned = True
+    except Exception as e:
+        click.echo(f"[warn] bridge zellij session — error: {e}", err=True)
+        warned = True
+
+    # Check 8: task-settings dir writable
+    task_settings_dir = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+    try:
+        task_settings_dir.mkdir(parents=True, exist_ok=True)
+        # Try to write a temp file
+        with tempfile.NamedTemporaryFile(dir=task_settings_dir, delete=True):
+            pass
+        click.echo(f"[ok] task-settings dir — {task_settings_dir}")
+    except PermissionError:
+        click.echo(f"[fail] task-settings dir — not writable ({task_settings_dir})", err=True)
+        failed = True
+    except Exception as e:
+        click.echo(f"[fail] task-settings dir — error: {e}", err=True)
+        failed = True
+
+    # Check 9: hook scripts present and executable
+    hooks_dir = Path(bridge.__file__).parent.parent.parent / "hooks"
+    hook_scripts = ["event.py", "pretooluse-approve.py"]
+    for script_name in hook_scripts:
+        script_path = hooks_dir / script_name
+        if script_path.exists() and os.access(script_path, os.X_OK):
+            click.echo(f"[ok] hook script — {script_name}")
+        else:
+            if not script_path.exists():
+                click.echo(f"[fail] hook script — {script_name} missing", err=True)
+            else:
+                click.echo(f"[fail] hook script — {script_name} not executable", err=True)
+            failed = True
+
+    # Check 10: claude on PATH
+    try:
+        result = subprocess.run(["which", "claude"], capture_output=True, timeout=2, text=True)
+        if result.returncode == 0:
+            claude_path = result.stdout.strip()
+            click.echo(f"[ok] claude CLI — {claude_path}")
+        else:
+            click.echo("[warn] claude CLI — not on PATH (the daemon's spawned shells must have it)", err=True)
+            warned = True
+    except FileNotFoundError:
+        click.echo("[warn] claude CLI — 'which' not found; cannot check PATH", err=True)
+        warned = True
+    except subprocess.TimeoutExpired:
+        click.echo("[warn] claude CLI — timeout checking PATH", err=True)
+        warned = True
+    except Exception as e:
+        click.echo(f"[warn] claude CLI — error: {e}", err=True)
         warned = True
 
     # Final summary

@@ -2,6 +2,7 @@
 
 from unittest import mock
 
+import discord
 import pytest
 
 from bridge.bot import MAX_CHUNK, _chunk, Bot, BotNotReady
@@ -283,3 +284,150 @@ class TestBot:
 
         # Callback should NOT have been called
         assert call_count == 0
+
+    def test_bot_client_property(self):
+        """Bot.client returns the underlying discord.Client."""
+        bot = Bot("test_token", 12345)
+        assert bot.client is bot._client
+
+    def test_bot_channel_property_before_ready(self):
+        """Bot.channel is None before on_ready is called."""
+        bot = Bot("test_token", 12345)
+        assert bot.channel is None
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_raises_when_not_ready(self):
+        """archive_thread raises BotNotReady if bot is not ready."""
+        from bridge.bot import BotNotReady
+
+        bot = Bot("test_token", 12345)
+        # Bot is not ready yet
+
+        with pytest.raises(BotNotReady):
+            await bot.archive_thread(9999)
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_swallows_404(self):
+        """archive_thread silently ignores discord.NotFound (404)."""
+        bot = Bot("test_token", 12345)
+        # Set ready event and channel manually
+        bot._ready.set()
+        bot._channel = mock.MagicMock(spec=discord.TextChannel)
+
+        # Mock _client.fetch_channel to raise NotFound
+        async def mock_fetch(channel_id):
+            resp = mock.MagicMock()
+            resp.status = 404
+            raise discord.NotFound(resp, "Not Found")
+
+        bot._client.fetch_channel = mock_fetch
+
+        # Should not raise
+        await bot.archive_thread(9999)
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_ignores_non_thread(self):
+        """archive_thread does nothing if fetch_channel returns non-Thread."""
+        bot = Bot("test_token", 12345)
+        bot._ready.set()
+        bot._channel = mock.MagicMock(spec=discord.TextChannel)
+
+        # Mock fetch_channel to return a TextChannel (not a Thread)
+        mock_channel = mock.MagicMock(spec=discord.TextChannel)
+        mock_channel.edit = mock.AsyncMock()
+
+        async def mock_fetch(channel_id):
+            return mock_channel
+
+        bot._client.fetch_channel = mock_fetch
+
+        # Should not raise, and edit should not be called
+        await bot.archive_thread(9999)
+        mock_channel.edit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_happy_path(self):
+        """archive_thread calls thread.edit(archived=True) for a Thread."""
+        bot = Bot("test_token", 12345)
+        bot._ready.set()
+        bot._channel = mock.MagicMock(spec=discord.TextChannel)
+
+        # Mock fetch_channel to return a Thread
+        mock_thread = mock.MagicMock(spec=discord.Thread)
+        mock_thread.edit = mock.AsyncMock()
+
+        async def mock_fetch(channel_id):
+            return mock_thread
+
+        bot._client.fetch_channel = mock_fetch
+
+        # Call archive_thread
+        await bot.archive_thread(9999)
+
+        # Verify edit was called with archived=True
+        mock_thread.edit.assert_called_once_with(archived=True)
+
+    @pytest.mark.asyncio
+    async def test_add_reactions_calls_add_reaction(self):
+        """add_reactions calls add_reaction for each emoji."""
+        bot = Bot("test_token", 12345)
+        bot._ready.set()
+
+        # Mock fetch_channel to return a channel with fetch_message
+        mock_channel = mock.MagicMock()
+        mock_msg = mock.MagicMock()
+        mock_msg.add_reaction = mock.AsyncMock()
+
+        bot._client.fetch_channel = mock.AsyncMock(return_value=mock_channel)
+        mock_channel.fetch_message = mock.AsyncMock(return_value=mock_msg)
+
+        # Call add_reactions
+        await bot.add_reactions(1001, 1002, ["✅", "❌"])
+
+        # Verify fetch_channel and fetch_message were called correctly
+        bot._client.fetch_channel.assert_called_once_with(1002)
+        mock_channel.fetch_message.assert_called_once_with(1001)
+        # Verify add_reaction was called for each emoji
+        assert mock_msg.add_reaction.call_count == 2
+        calls = mock_msg.add_reaction.call_args_list
+        assert calls[0] == mock.call("✅")
+        assert calls[1] == mock.call("❌")
+
+    @pytest.mark.asyncio
+    async def test_add_reactions_raises_when_not_ready(self):
+        """add_reactions raises BotNotReady if bot not connected."""
+        bot = Bot("test_token", 12345)
+        # Don't set _ready
+        with pytest.raises(BotNotReady):
+            await bot.add_reactions(1001, 1002, ["✅"])
+
+    @pytest.mark.asyncio
+    async def test_on_raw_reaction_add_dispatches_to_callback(self):
+        """on_raw_reaction_add calls the registered callback."""
+        callback_called = []
+
+        async def mock_callback(payload):
+            callback_called.append(payload)
+
+        bot = Bot("test_token", 12345, on_reaction=mock_callback)
+
+        # Create a mock RawReactionActionEvent
+        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
+
+        # Call on_raw_reaction_add
+        await bot.on_raw_reaction_add(payload)
+
+        # Verify callback was called with payload
+        assert len(callback_called) == 1
+        assert callback_called[0] is payload
+
+    @pytest.mark.asyncio
+    async def test_on_raw_reaction_add_no_callback(self):
+        """on_raw_reaction_add does nothing if no callback registered."""
+        bot = Bot("test_token", 12345)  # No on_reaction callback
+
+        # Create a mock RawReactionActionEvent
+        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
+
+        # Should not raise
+        await bot.on_raw_reaction_add(payload)
