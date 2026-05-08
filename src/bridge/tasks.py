@@ -1616,40 +1616,61 @@ class TaskRegistry:
         logger.debug("PreCompact received")
 
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
-        """Handle AskUserQuestion prompt: post to Discord with option reactions."""
+        """Handle AskUserQuestion prompt: post each question to Discord with
+        option reactions, in sequence. AskUserQuestion can bundle multiple
+        questions in one tool call — we present them one at a time, type the
+        answer into the pane after each so claude's TUI advances to the next.
+        """
         if not self._approval_router:
-            logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
+            logger.warning(
+                "approval_router not configured; cannot dispatch TUI prompt for task %s",
+                task.task_id,
+            )
             return
         questions = pending["input"].get("questions") or []
         if not questions:
             return await self._handle_free_text_stall(task)
-        q = questions[0]  # Phase 6 supports the first question only — multi-question is rare
-        options = [opt.get("label", "") for opt in (q.get("options") or [])]
-        if not options:
-            return await self._handle_free_text_stall(task)
-        # Build the Discord message body
-        lines = [f"❓ **{q.get('question', '?')}**"]
-        for i, opt in enumerate(q.get("options") or [], start=1):
-            emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"][i - 1] if i <= 4 else f"{i}."
-            label = opt.get("label", "")
-            desc = opt.get("description", "")
-            if desc:
-                lines.append(f"{emoji} **{label}** — {desc}")
-            else:
-                lines.append(f"{emoji} {label}")
-        body = "\n".join(lines)
 
-        request_id = str(uuid.uuid4())
-        answer, source = await self._approval_router.request_tui_answer(
-            request_id=request_id,
-            task_id=task.task_id,
-            thread_id=task.thread_id,
-            pane_id=task.zellij_pane_id or "",
-            kind="ask_question",
-            prompt_body=body,
-            options=options,
-        )
-        await self._inject_to_pane(task, answer, source)
+        total = len(questions)
+        for idx, q in enumerate(questions, start=1):
+            options = [opt.get("label", "") for opt in (q.get("options") or [])]
+            if not options:
+                # Question without options → fall back to free-text for this
+                # one, then continue on to the next.
+                await self._handle_free_text_stall(task)
+                continue
+
+            counter = f" ({idx}/{total})" if total > 1 else ""
+            lines = [f"❓ **{q.get('question', '?')}**{counter}"]
+            for i, opt in enumerate(q.get("options") or [], start=1):
+                emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"][i - 1] if i <= 4 else f"{i}."
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+                if desc:
+                    lines.append(f"{emoji} **{label}** — {desc}")
+                else:
+                    lines.append(f"{emoji} {label}")
+            body = "\n".join(lines)
+
+            request_id = str(uuid.uuid4())
+            answer, source = await self._approval_router.request_tui_answer(
+                request_id=request_id,
+                task_id=task.task_id,
+                thread_id=task.thread_id,
+                pane_id=task.zellij_pane_id or "",
+                kind="ask_question",
+                prompt_body=body,
+                options=options,
+            )
+            await self._inject_to_pane(task, answer, source)
+            if source in ("cancelled", "timeout", "post_failed"):
+                # User answered in zellij or it failed; stop dispatching the
+                # remaining questions to Discord (claude is already moving on
+                # via the user's TUI input or the failure).
+                return
+            # Brief pause so claude's TUI has time to advance to the next
+            # question's prompt before we post Q+1 to Discord.
+            await asyncio.sleep(0.5)
 
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
         """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
