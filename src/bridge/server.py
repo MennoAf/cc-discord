@@ -12,6 +12,7 @@ from aiohttp import web
 from bridge.bot import Bot, BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.secrets import Secrets
+from bridge.tasks import TaskRegistry
 from bridge.threads import ThreadRegistry
 from bridge import state
 
@@ -78,6 +79,7 @@ BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
 THREADS_KEY: web.AppKey[ThreadRegistry] = web.AppKey("threads", ThreadRegistry)
 LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
 ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
+TASK_REGISTRY_KEY: web.AppKey[TaskRegistry] = web.AppKey("task_registry", TaskRegistry)
 
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
 
@@ -292,6 +294,42 @@ async def _handle_health(request: web.Request) -> web.Response:
     )
 
 
+async def _handle_hook_event(request: web.Request) -> web.Response:
+    """Handle POST /v1/hook/event — dispatch by hook_event_name to TaskRegistry."""
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "invalid json"}),
+            content_type="application/json",
+        )
+
+    # Validate required field
+    if "hook_event_name" not in body or not isinstance(body.get("hook_event_name"), str):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "missing required field: hook_event_name"}),
+            content_type="application/json",
+        )
+
+    try:
+        registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+        await registry.handle_event(body["hook_event_name"], body)
+        return web.Response(
+            status=200,
+            text=json.dumps({"ok": True}),
+            content_type="application/json",
+        )
+    except Exception:
+        logger.exception("hook event handler failed")
+        return web.Response(
+            status=500,
+            text=json.dumps({"error": "internal"}),
+            content_type="application/json",
+        )
+
+
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
@@ -300,6 +338,7 @@ async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Applica
     app.router.add_post("/v1/notify", _handle_notify)
     app.router.add_post("/v1/ask", _handle_ask)
     app.router.add_get("/v1/health", _handle_health)
+    app.router.add_post("/v1/hook/event", _handle_hook_event)
     return app
 
 
@@ -313,10 +352,13 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=listener.deliver)
     conn = await state.open_db()
     registry = ThreadRegistry(bot, conn)
+    task_registry = TaskRegistry(conn, bot)
+    await task_registry.load_from_db()
     app = await build_app(bot)
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = listener
     app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

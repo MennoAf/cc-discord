@@ -14,9 +14,10 @@ from bridge.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
-    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY
+    LISTENER_KEY, ASK_LOCKS_KEY, THREADS_KEY, TASK_REGISTRY_KEY
 )
 from bridge.threads import ThreadRegistry
+from bridge.tasks import TaskRegistry
 
 
 @dataclass
@@ -119,6 +120,40 @@ async def in_memory_db():
             last_activity INTEGER NOT NULL
         )
     """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            thread_id INTEGER NOT NULL,
+            zellij_pane_id TEXT,
+            cwd TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_claude_session_id TEXT,
+            current_transcript_path TEXT,
+            created_at INTEGER NOT NULL,
+            last_activity INTEGER NOT NULL
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_thread_id ON tasks(thread_id)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(current_claude_session_id)"
+    )
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS approval_log (
+            request_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            tool_input_json TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            decision_reason TEXT NOT NULL,
+            decided_at INTEGER NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approval_log_task_id ON approval_log(task_id)"
+    )
     await conn.commit()
     yield conn
     await conn.close()
@@ -126,15 +161,18 @@ async def in_memory_db():
 
 @pytest.fixture
 async def client(fake_bot, in_memory_db):
-    """Create a test client for the aiohttp app with ThreadRegistry wired in."""
+    """Create a test client for the aiohttp app with ThreadRegistry and TaskRegistry wired in."""
     started_at = time.monotonic()
     app = await build_app(fake_bot, started_at=started_at)
     registry = ThreadRegistry(fake_bot, in_memory_db)
+    task_registry = TaskRegistry(in_memory_db, fake_bot)
+    await task_registry.load_from_db()
     # Wire in listener and ask_locks for /v1/ask testing
     from bridge.server import AskLockMap
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = Listener()
     app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
@@ -1088,6 +1126,194 @@ class TestAskEndpoint:
                 "session_id": "sess-test",
                 "cwd": "/tmp",
                 "question": "?",
+            },
+        )
+        assert resp.status == 500
+        body = await resp.json()
+        assert body["error"] == "internal"
+
+
+@pytest.mark.asyncio
+class TestHookEvent:
+    """Tests for POST /v1/hook/event endpoint."""
+
+    async def test_hook_event_session_start_with_task(self, client, fake_bot, in_memory_db):
+        """POST /v1/hook/event with SessionStart and matching task_id returns 200."""
+        from bridge.state import upsert_task
+        import time
+
+        # Create a task in the database
+        now = int(time.time())
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+        # Reload task registry
+        task_registry = client.app[TASK_REGISTRY_KEY]
+        await task_registry.load_from_db()
+
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-abc",
+                "cwd": "/tmp",
+                "transcript_path": "/path",
+                "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+        # Verify bot.post was called
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert posts[0]["thread_id"] == 999
+
+    async def test_hook_event_stop(self, client, fake_bot):
+        """POST /v1/hook/event with Stop event returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Stop",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_user_prompt_submit(self, client, fake_bot):
+        """POST /v1/hook/event with UserPromptSubmit returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_post_tool_use(self, client, fake_bot):
+        """POST /v1/hook/event with PostToolUse returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_notification(self, client, fake_bot):
+        """POST /v1/hook/event with Notification returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Notification",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_session_end(self, client, fake_bot):
+        """POST /v1/hook/event with SessionEnd returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionEnd",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_post_tool_use_failure(self, client, fake_bot):
+        """POST /v1/hook/event with PostToolUseFailure returns 200."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "PostToolUseFailure",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_missing_hook_event_name(self, client, fake_bot):
+        """POST /v1/hook/event without hook_event_name returns 400."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+
+    async def test_hook_event_malformed_json(self, client, fake_bot):
+        """POST /v1/hook/event with malformed JSON returns 400."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            data="not json",
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+
+    async def test_hook_event_unknown_event_name(self, client, fake_bot):
+        """POST /v1/hook/event with unknown event_name returns 200 (silent no-op)."""
+        fake_bot.set_ready(True)
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "Banana",
+                "session_id": "sess-abc",
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    async def test_hook_event_handler_exception(self, client, fake_bot, monkeypatch):
+        """POST /v1/hook/event with handler exception returns 500."""
+        fake_bot.set_ready(True)
+
+        # Patch the registry's handle_event to raise an exception
+        async def failing_handle_event(*args, **kwargs):
+            raise RuntimeError("Handler failed")
+
+        task_registry = client.app[TASK_REGISTRY_KEY]
+        monkeypatch.setattr(task_registry, "handle_event", failing_handle_event)
+
+        resp = await client.post(
+            "/v1/hook/event",
+            json={
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-abc",
             },
         )
         assert resp.status == 500
