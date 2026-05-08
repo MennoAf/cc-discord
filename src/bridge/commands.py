@@ -11,7 +11,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from bridge import usage
+from bridge import skills, usage
 from bridge.bot import Bot
 from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
 
@@ -136,6 +136,54 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         await interaction.followup.send(f"🔄 Restarted `{task.task_id[:8]}`", ephemeral=True)
+
+    async def _skill_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        cur = current.lower()
+        out: list[app_commands.Choice[str]] = []
+        for s in skills.list_skills():
+            if cur and cur not in s.name.lower() and not (
+                s.description and cur in s.description.lower()
+            ):
+                continue
+            label = s.name
+            if s.description:
+                label = f"{s.name} — {s.description}"
+            # Discord limits both the displayed name and submitted value to 100 chars.
+            out.append(
+                app_commands.Choice(name=label[:100], value=s.name[:100])
+            )
+            if len(out) >= 25:
+                break
+        return out
+
+    @tree.command(name="skill", description="Invoke a Claude Code skill in the task's session")
+    @app_commands.describe(
+        name="Skill name (autocomplete shows available skills + their descriptions)",
+        args="Optional arguments to pass after the skill name",
+    )
+    @app_commands.autocomplete(name=_skill_autocomplete)
+    async def skill_cmd(
+        interaction: discord.Interaction,
+        name: str,
+        args: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        try:
+            await registry.invoke_skill(task.task_id, name, args)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        rendered = f"/{name}" + (f" {args}" if args else "")
+        await interaction.followup.send(
+            f"✅ Sent `{rendered}` to `{task.task_id[:8]}`", ephemeral=True
+        )
 
     @tree.command(name="stats", description="Show model / token / cost stats for a task")
     @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")

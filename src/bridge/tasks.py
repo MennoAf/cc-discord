@@ -1221,6 +1221,26 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
 
+    async def invoke_skill(
+        self, task_id: str, skill_name: str, args: str | None = None
+    ) -> None:
+        """Send `/<skill_name>[ <args>]` to the task's pane so the claude TUI
+        invokes the skill. Raises TaskNotFound if the task isn't tracked or
+        TaskSpawnError if the pane isn't ready yet.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(f"task {task_id[:8]} not found")
+        if task.zellij_pane_id is None:
+            raise TaskSpawnError(f"task {task_id[:8]} has no pane yet")
+        text = f"/{skill_name}"
+        if args:
+            text += f" {args}"
+        text += "\n"
+        await self._zellij.write_to_pane(task.zellij_pane_id, text)
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
     async def list_tasks(self) -> list[Task]:
         """Return active tasks ordered by last_activity DESC.
 
