@@ -1,11 +1,11 @@
 """Task and TaskRegistry for managing discord-driven sessions."""
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import aiosqlite
 
-from bridge.state import TaskRow, get_task_by_session_id, list_active_tasks, upsert_task
+from bridge.state import TaskRow, list_active_tasks, upsert_task
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,18 @@ class Task:
 class TaskRegistry:
     """In-memory registry of tasks with database persistence."""
 
+    _HANDLERS: dict[str, str] = {
+        "SessionStart": "_on_session_start",
+        "UserPromptSubmit": "_on_user_prompt_submit",
+        "PostToolUse": "_on_post_tool_use",
+        "PostToolUseFailure": "_on_post_tool_use_failure",
+        "Stop": "_on_stop",
+        "Notification": "_on_notification",
+        "SessionEnd": "_on_session_end",
+        "SubagentStop": "_on_subagent_stop",
+        "PreCompact": "_on_pre_compact",
+    }
+
     def __init__(self, conn: aiosqlite.Connection, bot) -> None:
         """Initialize with database connection and bot."""
         self._conn = conn
@@ -50,17 +62,6 @@ class TaskRegistry:
         self._by_task_id: dict[str, Task] = {}
         self._by_thread_id: dict[int, Task] = {}
         self._by_session_id: dict[str, Task] = {}
-        self._HANDLERS: dict[str, str] = {
-            "SessionStart": "_on_session_start",
-            "UserPromptSubmit": "_on_user_prompt_submit",
-            "PostToolUse": "_on_post_tool_use",
-            "PostToolUseFailure": "_on_post_tool_use_failure",
-            "Stop": "_on_stop",
-            "Notification": "_on_notification",
-            "SessionEnd": "_on_session_end",
-            "SubagentStop": "_on_subagent_stop",
-            "PreCompact": "_on_pre_compact",
-        }
 
     async def load_from_db(self) -> None:
         """Load active tasks from database into memory maps."""
@@ -82,9 +83,14 @@ class TaskRegistry:
         """Get task by current_claude_session_id."""
         return self._by_session_id.get(session_id)
 
-    async def _index(self, task: Task) -> None:
+    async def _index(self, task: Task, prev_session_id: str | None = None) -> None:
         """Update all three maps for a task. Removes prior session_id entry if it changed."""
-        # Remove old session_id entry if this session_id was previously mapped
+        # Remove old session_id entry if this task previously had a different session_id
+        if prev_session_id and prev_session_id in self._by_session_id:
+            if self._by_session_id[prev_session_id].task_id == task.task_id:
+                del self._by_session_id[prev_session_id]
+
+        # Remove old session_id entry if a different task owns the new session_id
         if task.current_claude_session_id:
             old_task = self._by_session_id.get(task.current_claude_session_id)
             if old_task and old_task.task_id != task.task_id:
@@ -140,12 +146,13 @@ class TaskRegistry:
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}")
 
-        if task_id:
+        if task_id and session_id:
             task = self.get_by_task_id(task_id)
             if task:
+                prev_session_id = task.current_claude_session_id
                 task.current_claude_session_id = session_id
                 task.current_transcript_path = transcript_path
-                await self._index(task)
+                await self._index(task, prev_session_id=prev_session_id)
                 await self._persist(task)
                 await self._bot.post(
                     f"🟢 SessionStart received (task={task_id[:8]})",
@@ -156,8 +163,8 @@ class TaskRegistry:
         """Handle UserPromptSubmit event."""
         session_id = body.get("session_id")
         logger.info(f"UserPromptSubmit: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "💬 UserPromptSubmit received",
                 thread_id=task.thread_id,
@@ -167,8 +174,8 @@ class TaskRegistry:
         """Handle PostToolUse event."""
         session_id = body.get("session_id")
         logger.info(f"PostToolUse: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "🔧 PostToolUse received",
                 thread_id=task.thread_id,
@@ -178,8 +185,8 @@ class TaskRegistry:
         """Handle PostToolUseFailure event."""
         session_id = body.get("session_id")
         logger.info(f"PostToolUseFailure: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "❌ PostToolUseFailure received",
                 thread_id=task.thread_id,
@@ -189,8 +196,8 @@ class TaskRegistry:
         """Handle Stop event."""
         session_id = body.get("session_id")
         logger.info(f"Stop: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "⏹️ Stop received",
                 thread_id=task.thread_id,
@@ -200,8 +207,8 @@ class TaskRegistry:
         """Handle Notification event."""
         session_id = body.get("session_id")
         logger.info(f"Notification: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "🔔 Notification received",
                 thread_id=task.thread_id,
@@ -211,8 +218,8 @@ class TaskRegistry:
         """Handle SessionEnd event."""
         session_id = body.get("session_id")
         logger.info(f"SessionEnd: session_id={session_id}")
-        task = await get_task_by_session_id(self._conn, session_id) if session_id else None
-        if task and self.get_by_task_id(task.task_id):
+        task = self.get_by_session_id(session_id) if session_id else None
+        if task:
             await self._bot.post(
                 "🏁 SessionEnd received",
                 thread_id=task.thread_id,
@@ -220,8 +227,8 @@ class TaskRegistry:
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event (no-op in Phase 1)."""
-        logger.debug(f"SubagentStop received")
+        logger.debug("SubagentStop received")
 
     async def _on_pre_compact(self, body: dict) -> None:
         """Handle PreCompact event (no-op in Phase 1)."""
-        logger.debug(f"PreCompact received")
+        logger.debug("PreCompact received")

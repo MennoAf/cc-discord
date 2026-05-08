@@ -31,58 +31,6 @@ async def fake_bot():
     return FakeBot()
 
 
-@pytest.fixture
-async def in_memory_db():
-    """Create an in-memory SQLite database for testing."""
-    conn = await aiosqlite.connect(":memory:")
-    # Initialize the schema (same as state.open_db does)
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            cwd TEXT NOT NULL,
-            thread_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id TEXT PRIMARY KEY,
-            thread_id INTEGER NOT NULL,
-            zellij_pane_id TEXT,
-            cwd TEXT NOT NULL,
-            status TEXT NOT NULL,
-            current_claude_session_id TEXT,
-            current_transcript_path TEXT,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL
-        )
-    """)
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_thread_id ON tasks(thread_id)"
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(current_claude_session_id)"
-    )
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS approval_log (
-            request_id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            tool_input_json TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            decision_reason TEXT NOT NULL,
-            decided_at INTEGER NOT NULL,
-            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
-        )
-    """)
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_approval_log_task_id ON approval_log(task_id)"
-    )
-    await conn.commit()
-    yield conn
-    await conn.close()
 
 
 @pytest.mark.asyncio
@@ -254,6 +202,84 @@ class TestTaskRegistry:
         assert len(posts) == 1
         assert posts[0]["thread_id"] == 999
         assert "🟢 SessionStart" in posts[0]["content"]
+
+    async def test_handle_event_session_start_rotates_session_id(
+        self, fake_bot, in_memory_db
+    ) -> None:
+        """handle_event('SessionStart') rotates session_id and invalidates old mapping."""
+        now = 1000
+        # Seed task with initial session_id
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-A",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot)
+        await registry.load_from_db()
+
+        # Verify initial state
+        assert registry.get_by_session_id("sess-A") is not None
+        assert registry.get_by_session_id("sess-B") is None
+
+        # Rotate session_id to sess-B (e.g., on /clear or /compact)
+        body = {
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-B",
+            "cwd": "/tmp",
+            "transcript_path": "/path/to/transcript",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry.handle_event("SessionStart", body)
+
+        # Task should be updated with new session_id
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id == "sess-B"
+
+        # Old session_id mapping should be invalidated
+        assert registry.get_by_session_id("sess-A") is None
+        # New session_id mapping should be valid
+        assert registry.get_by_session_id("sess-B") is not None
+
+    async def test_handle_event_session_start_missing_session_id(
+        self, fake_bot, in_memory_db
+    ) -> None:
+        """handle_event('SessionStart') without session_id is silent no-op (guards against None)."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot)
+        await registry.load_from_db()
+
+        # SessionStart without session_id should be skipped
+        body = {
+            "hook_event_name": "SessionStart",
+            "cwd": "/tmp",
+            "transcript_path": "/path/to/transcript",
+            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+        }
+        await registry.handle_event("SessionStart", body)
+
+        # Task should not be updated
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.current_claude_session_id is None
+
+        # No post should happen
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
 
     async def test_handle_event_session_start_without_task(
         self, fake_bot, in_memory_db

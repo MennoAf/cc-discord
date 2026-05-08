@@ -305,6 +305,14 @@ async def _handle_hook_event(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
+    # Validate that body is a JSON object (dict)
+    if not isinstance(body, dict):
+        return web.Response(
+            status=400,
+            text=json.dumps({"error": "body must be a JSON object"}),
+            content_type="application/json",
+        )
+
     # Validate required field
     if "hook_event_name" not in body or not isinstance(body.get("hook_event_name"), str):
         return web.Response(

@@ -105,58 +105,6 @@ async def fake_bot():
     return FakeBot()
 
 
-@pytest.fixture
-async def in_memory_db():
-    """Create an in-memory SQLite database for testing."""
-    conn = await aiosqlite.connect(":memory:")
-    # Initialize the schema (same as state.open_db does)
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            cwd TEXT NOT NULL,
-            thread_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id TEXT PRIMARY KEY,
-            thread_id INTEGER NOT NULL,
-            zellij_pane_id TEXT,
-            cwd TEXT NOT NULL,
-            status TEXT NOT NULL,
-            current_claude_session_id TEXT,
-            current_transcript_path TEXT,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL
-        )
-    """)
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_thread_id ON tasks(thread_id)"
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(current_claude_session_id)"
-    )
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS approval_log (
-            request_id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            tool_input_json TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            decision_reason TEXT NOT NULL,
-            decided_at INTEGER NOT NULL,
-            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
-        )
-    """)
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_approval_log_task_id ON approval_log(task_id)"
-    )
-    await conn.commit()
-    yield conn
-    await conn.close()
 
 
 @pytest.fixture
@@ -1283,6 +1231,19 @@ class TestHookEvent:
         assert resp.status == 400
         body = await resp.json()
         assert "error" in body
+
+    async def test_hook_event_non_dict_json_body(self, client, fake_bot):
+        """POST /v1/hook/event with non-dict JSON body returns 400."""
+        fake_bot.set_ready(True)
+        # Send a JSON number instead of an object
+        resp = await client.post(
+            "/v1/hook/event",
+            json=5,
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "error" in body
+        assert "JSON object" in body["error"]
 
     async def test_hook_event_unknown_event_name(self, client, fake_bot):
         """POST /v1/hook/event with unknown event_name returns 200 (silent no-op)."""
