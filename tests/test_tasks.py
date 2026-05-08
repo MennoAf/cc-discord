@@ -793,6 +793,198 @@ class TestTaskRegistry:
         assert len(posts) == 1
         assert "Bound to session" in posts[0]["content"]
 
+    async def test_on_session_end_abnormal_exit_error(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with exit_reason='error' flips status to crashed and posts 💥."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-test",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-test",
+            "exit_reason": "error",
+        }
+        await registry._on_session_end(body)
+
+        # Verify status flipped to crashed
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "crashed"
+
+        # Verify 💥 notice posted
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 1
+        assert "💥 Claude process exited" in posts[0]["content"]
+
+        # Verify thread archived
+        archives = fake_bot.get_archive_calls()
+        assert len(archives) == 1
+
+    async def test_on_session_end_abnormal_exit_sigint(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with exit_reason='sigint' flips status to crashed."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-test",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-test",
+            "exit_reason": "sigint",
+        }
+        await registry._on_session_end(body)
+
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "crashed"
+
+    async def test_on_session_end_normal_exit(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with exit_reason='exit' flips status to stopped (graceful)."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-test",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-test",
+            "exit_reason": "exit",
+        }
+        await registry._on_session_end(body)
+
+        # Verify status flipped to stopped (not crashed)
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"
+
+        # Verify NO 💥 notice
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+        # But thread still archived
+        archives = fake_bot.get_archive_calls()
+        assert len(archives) == 1
+
+    async def test_on_session_end_no_exit_reason(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end with no exit_reason (None) treats as normal exit."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-test",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        body = {
+            "session_id": "sess-test",
+            # No exit_reason field
+        }
+        await registry._on_session_end(body)
+
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"  # Normal exit
+
+    async def test_on_session_end_idempotent_already_stopped(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end when task already stopped is idempotent."""
+        now = 1000
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "stopped",
+            current_claude_session_id="sess-test",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        # Manually load the stopped task since load_from_db skips stopped tasks
+        task = Task(
+            task_id="task-123",
+            thread_id=999,
+            zellij_pane_id=None,
+            cwd="/tmp",
+            status="stopped",
+            current_claude_session_id="sess-test",
+            current_transcript_path=None,
+            created_at=now,
+            last_activity=now,
+        )
+        await registry._index(task)
+
+        body = {
+            "session_id": "sess-test",
+            "exit_reason": "error",
+        }
+        await registry._on_session_end(body)
+
+        # Verify status stays stopped (not flipped to crashed)
+        task = registry.get_by_task_id("task-123")
+        assert task is not None
+        assert task.status == "stopped"
+
+        # Verify NO new notice (was already stopped)
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
+    async def test_on_session_end_unknown_session_is_noop(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_on_session_end for unknown session_id is a no-op."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        body = {
+            "session_id": "sess-unknown",
+            "exit_reason": "error",
+        }
+        await registry._on_session_end(body)
+
+        # Should be silent no-op
+        posts = fake_bot.get_post_calls()
+        assert len(posts) == 0
+
 
 @dataclass
 class FakeChannel:
@@ -1076,9 +1268,11 @@ class TestTaskRegistryPhase3:
         assert task is not None
         assert task.status == "stopped"
 
-        # Thread should be archived (bot method called)
-        assert len(fake_bot.get_archive_calls()) == 1
-        assert fake_bot.get_archive_calls()[0]["thread_id"] == 999
+        # Thread should be archived. Note: both stop_task (_mark_stopped) and
+        # SessionEnd handler (_on_session_end) may archive; archive_thread is idempotent.
+        archive_calls = fake_bot.get_archive_calls()
+        assert len(archive_calls) >= 1
+        assert archive_calls[0]["thread_id"] == 999
 
     async def test_stop_task_timeout_returns_false_and_marks_stopped(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch

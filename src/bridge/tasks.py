@@ -744,8 +744,10 @@ class TaskRegistry:
     async def _on_session_end(self, body: dict) -> None:
         """Handle SessionEnd event.
 
-        Stops typing indicator, resolves any pending stop_future for the task so stop_task can proceed.
-        Cleans up the task-scoped settings file.
+        Checks exit_reason: None/empty/"exit" = normal; anything else = abnormal.
+        - Abnormal exit → flip status to 'crashed', post 💥, archive thread, cleanup settings.
+        - Normal exit from 'running' task → flip status to 'stopped', archive thread.
+        - Already stopped/crashed → idempotent (no status change).
         """
         session_id = body.get("session_id")
         if not session_id:
@@ -754,13 +756,38 @@ class TaskRegistry:
         if task is None:
             return
         await self._stop_typing(task.task_id)
+
         fut = self._stop_futures.get(task.task_id)
         if fut is not None and not fut.done():
             fut.set_result(None)
-        # Always clean up the settings file when the claude process ends, regardless of
-        # whether the status was already stopped/crashed or is about to be flipped by Phase 8's
-        # logic. Idempotent — missing-file is silent.
-        _cleanup_task_settings(task.task_id)
+
+        exit_reason = body.get("exit_reason")
+        is_abnormal = exit_reason not in (None, "exit", "")
+        # 'None' means the field wasn't sent (older Claude versions) — assume normal.
+        # '' is empty — assume normal.
+
+        if is_abnormal and task.status not in ("stopped", "crashed"):
+            task.status = "crashed"
+            task.last_activity = int(time.time())
+            await self._persist(task)
+            try:
+                await self._bot.post(
+                    f"💥 Claude process exited (`{exit_reason}`)",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post crash notice for task %s", task.task_id)
+            await self._archive_thread(task.thread_id)
+            _cleanup_task_settings(task.task_id)
+        elif task.status == "running":
+            # Graceful exit; mark stopped. Note: stop_task also calls _mark_stopped which
+            # archives the thread, so we may double-archive here. That's OK — archive_thread
+            # is idempotent.
+            task.status = "stopped"
+            task.last_activity = int(time.time())
+            await self._persist(task)
+            await self._archive_thread(task.thread_id)
+            _cleanup_task_settings(task.task_id)
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event (no-op in Phase 1)."""
