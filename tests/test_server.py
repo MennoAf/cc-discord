@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import aiosqlite
 import pytest
 from aiohttp import test_utils
 

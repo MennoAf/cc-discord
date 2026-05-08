@@ -1,13 +1,10 @@
 """Tests for Task and TaskRegistry."""
 
-import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
-import aiosqlite
 import pytest
 
-from bridge.state import TaskRow, open_db, upsert_task
+from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry
 
 
