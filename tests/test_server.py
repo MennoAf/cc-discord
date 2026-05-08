@@ -144,7 +144,7 @@ async def client(fake_bot, in_memory_db, monkeypatch):
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
     app[ZELLIJ_KEY] = zellij
-    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db)
+    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db, timeout=0.5)
     async with test_utils.TestClient(test_utils.TestServer(app)) as client:
         yield client
 
