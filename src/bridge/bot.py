@@ -292,6 +292,27 @@ class Bot:
             raise BotNotReady("bot not connected to Discord")
         return await self._client.fetch_channel(thread_id)
 
+    async def edit_message(
+        self, thread_id: int, message_id: int, content: str
+    ) -> None:
+        """Edit an existing message. Used for the live-updating subagent
+        blocks. Discord limits the body to 2000 chars; caller must truncate.
+        """
+        if not self.is_ready or self._channel is None:
+            raise BotNotReady("bot not connected to Discord")
+        target = await _with_retry(
+            f"fetch_channel({thread_id})",
+            lambda: self._client.fetch_channel(thread_id),
+        )
+        msg = await _with_retry(
+            f"fetch_message({message_id})",
+            lambda: target.fetch_message(message_id),
+        )
+        await _with_retry(
+            f"edit({message_id})",
+            lambda: msg.edit(content=content),
+        )
+
     async def rename_thread(self, thread_id: int, name: str) -> None:
         """Rename a Discord thread. Discord enforces 1–100 chars; caller should sanitize."""
         if not self.is_ready:

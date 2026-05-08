@@ -15,6 +15,31 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 
+# Cap on how many recent subagent actions we render in a block.
+_SUBAGENT_BLOCK_MAX_ACTIONS = 5
+# Don't edit a block's Discord message more often than this; coalesces
+# bursty subagent activity into chunkier updates and keeps us under
+# Discord's per-channel edit rate limit (~5 edits / 5s).
+_SUBAGENT_EDIT_THROTTLE_SECS = 1.5
+
+
+@dataclass
+class SubagentBlock:
+    """Per-subagent live-updating Discord message: tracks state for one
+    subagent (identified by `agent_id`) so we can edit a single message in
+    place as the subagent runs, instead of streaming each tool call as its
+    own message.
+    """
+
+    agent_id: str
+    attribution: str  # e.g. "ed3d-research-agents:internet-researcher"
+    started_at: float
+    message_id: int | None = None
+    finished_at: float | None = None
+    last_entry_uuid: str | None = None  # change-detection key
+    last_edit_at: float = 0.0  # throttle edits
+
+
 # Marker convention agents use to attach files back to the Discord thread.
 # Example: `[[attach: /tmp/screenshot.png]]` in a streamed text block.
 _ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
@@ -279,6 +304,9 @@ class Task:
     # within the current turn. Cleared on UserPromptSubmit / SessionStart so a
     # new turn starts fresh; not persisted across bridge restarts.
     posted_assistant_uuids: set[str] = field(default_factory=set)
+    # Live-updating subagent blocks keyed by Claude's `agentId`. Cleared on
+    # UserPromptSubmit / SessionStart.
+    subagent_blocks: dict[str, "SubagentBlock"] = field(default_factory=dict)
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -851,6 +879,7 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         # New session = new turn boundary; drop any prior streaming state.
         task.posted_assistant_uuids.clear()
+        task.subagent_blocks.clear()
         if old_session_id and old_session_id in self._by_session_id:
             del self._by_session_id[old_session_id]
         if session_id:
@@ -898,15 +927,18 @@ class TaskRegistry:
             if cancelled > 0:
                 logger.info("cancelled %d pending TUI prompts for task %s (answered in zellij)", cancelled, task.task_id)
         task.last_activity = int(time.time())
-        # New turn — start fresh streaming.
+        # New turn — start fresh streaming and clear prior subagent blocks.
         task.posted_assistant_uuids.clear()
+        task.subagent_blocks.clear()
         await self._persist(task)
         await self._start_typing(task)
 
     async def _on_post_tool_use(self, body: dict) -> None:
-        """Handle PostToolUse event. Stream pending assistant prose, append
-        tool summary, and post a diff/content block for Edit/MultiEdit/Write.
-        Subagent (sidechain) tool calls get a `↳ ` prefix.
+        """Handle PostToolUse event. Stream pending main-agent prose, append
+        the tool summary to the main aggregator, and post a diff/content
+        block for Edit/MultiEdit/Write. Subagent activity bypasses the
+        aggregator entirely — it's collated into per-subagent live blocks
+        via `_refresh_subagent_blocks`.
         """
         session_id = body.get("session_id")
         if not session_id:
@@ -917,6 +949,15 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
 
+        # Always refresh subagent blocks first — they have their own
+        # detection and rendering, independent of main-agent flow.
+        await self._refresh_subagent_blocks(task)
+
+        # Suppress main-agent emission for tool calls that came from a
+        # subagent (the block already shows them).
+        if self._is_sidechain_tool(body, body.get("tool_name", "?")):
+            return
+
         # Stream any prose Claude wrote between the previous boundary and now.
         await self._stream_assistant_progress(task)
 
@@ -924,25 +965,64 @@ class TaskRegistry:
         tool_input = body.get("tool_input", {}) or {}
         tool_response = body.get("tool_response", {}) or {}
 
-        sidechain = self._is_sidechain_tool(body, tool_name)
         line = tool_summary.summarize(tool_name, tool_input, tool_response)
-        if sidechain:
-            line = "↳ " + line
         self._agg_for(task).append(line)
         await self._post_tool_diff(task, tool_name, tool_input)
 
     def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
         """Best-effort: did the most recent `tool_use` of `tool_name` come from
-        a subagent? Looks at the transcript file referenced by the hook body.
+        a subagent? Modern CC versions write subagent activity to separate
+        `<session>/subagents/agent-*.jsonl` files instead of marking entries
+        in the main transcript with `isSidechain`, so check both:
+
+          1. Legacy: the main transcript has a recent `tool_use` whose
+             parent assistant entry has `isSidechain: true`.
+          2. Current: any subagent file under the session contains a recent
+             `tool_use` matching `tool_name`.
         """
         tp = body.get("transcript_path")
         if not isinstance(tp, str):
             return False
+        main_path = Path(tp)
         try:
-            return transcript.is_recent_tool_use_sidechain(Path(tp), tool_name)
+            if transcript.is_recent_tool_use_sidechain(main_path, tool_name):
+                return True
         except Exception:
             logger.exception("is_recent_tool_use_sidechain failed for %s", tp)
+
+        subagents_dir = main_path.parent / main_path.stem / "subagents"
+        if not subagents_dir.is_dir():
             return False
+        try:
+            files = sorted(
+                subagents_dir.glob("agent-*.jsonl"),
+                key=lambda f: -f.stat().st_mtime,
+            )
+        except OSError:
+            return False
+        for f in files:
+            try:
+                # A tool_use in a subagent file is by definition sidechain.
+                for e in reversed(list(transcript.read_entries(f))):
+                    if e.get("type") != "assistant":
+                        continue
+                    msg = e.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    if any(
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_use"
+                        and b.get("name") == tool_name
+                        for b in content
+                    ):
+                        return True
+                    break  # only check the most recent assistant entry
+            except Exception:
+                logger.exception("subagent sidechain check failed for %s", f)
+        return False
 
     async def _on_post_tool_use_failure(self, body: dict) -> None:
         """Handle PostToolUseFailure event. Force-failure summary."""
@@ -1010,6 +1090,9 @@ class TaskRegistry:
             tp = Path(transcript_path)
             await self._wait_for_transcript_stable(tp)
             await self._stream_assistant_progress(task, tp)
+            # Final pass at subagent blocks so any in-flight ones end up in
+            # their `finished` state (with the latest 5 actions captured).
+            await self._refresh_subagent_blocks(task)
             await self._post_stats_footer(task, tp)
         else:
             logger.info("Stop: no transcript_path in body or task; skipping final stream")
@@ -1164,6 +1247,192 @@ class TaskRegistry:
         """Discord-render a thinking block: 🤔 + multi-line italics."""
         return f"🤔 *{text.strip()}*"
 
+    async def _refresh_subagent_blocks(self, task: Task) -> None:
+        """Scan `<session>/subagents/agent-*.jsonl` and create/update one
+        `SubagentBlock` per file. Each block is a single Discord message
+        edited in place to show the last N actions of that subagent.
+
+        Idempotent — uses `last_entry_uuid` for change detection so we only
+        edit when there's new content. Best-effort: errors are logged and
+        skipped so a single bad file doesn't break the loop.
+        """
+        if not task.current_transcript_path:
+            return
+        main_path = Path(task.current_transcript_path)
+        # Subagent files live at <project>/<session>/subagents/agent-*.jsonl
+        subagents_dir = main_path.parent / main_path.stem / "subagents"
+        if not subagents_dir.is_dir():
+            return
+        for f in sorted(subagents_dir.glob("agent-*.jsonl")):
+            agent_id = f.stem.removeprefix("agent-")
+            try:
+                await self._refresh_one_subagent_block(task, agent_id, f)
+            except Exception:
+                logger.exception(
+                    "subagent block refresh failed for %s", agent_id
+                )
+
+    async def _refresh_one_subagent_block(
+        self, task: Task, agent_id: str, agent_file: Path
+    ) -> None:
+        entries = list(transcript.read_entries(agent_file))
+        if not entries:
+            return
+
+        attribution = next(
+            (
+                e["attributionAgent"]
+                for e in entries
+                if isinstance(e.get("attributionAgent"), str)
+            ),
+            agent_id,
+        )
+
+        # Build action lines from the assistant entries' content blocks.
+        actions: list[str] = []
+        total_actions = 0
+        for e in entries:
+            if e.get("type") != "assistant":
+                continue
+            msg = e.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                line = self._format_subagent_action(block)
+                if line:
+                    actions.append(line)
+                    total_actions += 1
+        if not actions:
+            return
+
+        last_actions = actions[-_SUBAGENT_BLOCK_MAX_ACTIONS:]
+        last_uuid = entries[-1].get("uuid")
+
+        # Heuristic for "finished": the most recent assistant entry has no
+        # tool_use blocks (i.e. it's terminal text).
+        finished = self._is_subagent_finished(entries)
+
+        block = task.subagent_blocks.get(agent_id)
+        now = time.time()
+
+        if block is None:
+            block = SubagentBlock(
+                agent_id=agent_id,
+                attribution=attribution,
+                started_at=now,
+                last_entry_uuid=last_uuid,
+                last_edit_at=now,
+            )
+            task.subagent_blocks[agent_id] = block
+            body = self._render_subagent_block(
+                block, last_actions, total_actions, finished
+            )
+            try:
+                ids = await self._bot.post(body, thread_id=task.thread_id)
+                if ids:
+                    block.message_id = ids[0]
+            except Exception:
+                logger.exception(
+                    "failed to post initial subagent block for %s", agent_id
+                )
+            if finished:
+                block.finished_at = now
+            return
+
+        if block.last_entry_uuid == last_uuid and block.finished_at is not None:
+            return  # nothing to do
+        if block.last_entry_uuid == last_uuid and not finished:
+            return
+        if not finished and now - block.last_edit_at < _SUBAGENT_EDIT_THROTTLE_SECS:
+            return  # throttle; will catch up on the next refresh
+
+        block.last_entry_uuid = last_uuid
+        block.last_edit_at = now
+        if finished and block.finished_at is None:
+            block.finished_at = now
+
+        if block.message_id is None:
+            return  # initial post failed; nothing to edit
+        body = self._render_subagent_block(
+            block, last_actions, total_actions, finished
+        )
+        try:
+            await self._bot.edit_message(
+                task.thread_id, block.message_id, body
+            )
+        except Exception:
+            logger.exception(
+                "failed to edit subagent block for %s", agent_id
+            )
+
+    def _format_subagent_action(self, block: dict) -> str | None:
+        """Format one assistant content block as a single bulleted line."""
+        btype = block.get("type")
+        if btype == "tool_use":
+            line = tool_summary.summarize(
+                block.get("name", "?"),
+                block.get("input") or {},
+                None,
+            )
+            return f"• {line}"
+        if btype == "text":
+            txt = (block.get("text") or "").strip().splitlines()
+            head = txt[0][:140] if txt else ""
+            return f"• 💬 {head}" if head else None
+        if btype == "thinking":
+            thought = (block.get("thinking") or "").strip().splitlines()
+            head = thought[0][:140] if thought else ""
+            return f"• 💭 *{head}*" if head else None
+        return None
+
+    @staticmethod
+    def _is_subagent_finished(entries: list[dict]) -> bool:
+        """Subagent considered finished when the latest assistant entry has
+        no tool_use blocks — i.e. it stopped to deliver a final response."""
+        for e in reversed(entries):
+            if e.get("type") != "assistant":
+                continue
+            msg = e.get("message")
+            if not isinstance(msg, dict):
+                return False
+            content = msg.get("content")
+            if not isinstance(content, list):
+                return False
+            return not any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in content
+            )
+        return False
+
+    def _render_subagent_block(
+        self,
+        block: SubagentBlock,
+        last_actions: list[str],
+        total_actions: int,
+        finished: bool,
+    ) -> str:
+        status = "finished" if finished else "running"
+        end = block.finished_at if finished else time.time()
+        elapsed = end - block.started_at
+        dur = (
+            f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
+        )
+        header = (
+            f"🤖 `{block.attribution}` · {status} · "
+            f"{total_actions} actions · {dur}"
+        )
+        body = "\n".join(last_actions)
+        out = f"{header}\nlast {len(last_actions)}:\n{body}"
+        # Discord per-message hard limit; truncate aggressively if long.
+        if len(out) > 1900:
+            out = out[:1897] + "…"
+        return out
+
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes."""
         handler_task.add_done_callback(lambda t, k=task_id: self._tui_handler_tasks.pop(k, None))
@@ -1279,8 +1548,15 @@ class TaskRegistry:
                 self._by_session_id.pop(task.current_claude_session_id, None)
 
     async def _on_subagent_stop(self, body: dict) -> None:
-        """Handle SubagentStop event (no-op in Phase 1)."""
-        logger.debug("SubagentStop received")
+        """Handle SubagentStop event: refresh subagent blocks so any agents
+        that just finished get their final-state edit."""
+        session_id = body.get("session_id")
+        if not session_id:
+            return
+        task = self.get_by_session_id(session_id)
+        if task is None:
+            return
+        await self._refresh_subagent_blocks(task)
 
     async def _on_pre_compact(self, body: dict) -> None:
         """Handle PreCompact event (no-op in Phase 1)."""
