@@ -941,9 +941,11 @@ class TaskRegistry:
             if cancelled > 0:
                 logger.info("cancelled %d pending TUI prompts for task %s (answered in zellij)", cancelled, task.task_id)
         task.last_activity = int(time.time())
-        # New turn — start fresh streaming and clear prior subagent blocks.
+        # New turn — start fresh streaming. Keep subagent_blocks across
+        # turns: the JSONL files for prior subagents persist on disk, and
+        # clearing the dict here would cause the next refresh to re-create
+        # duplicate Discord messages for those same agent_ids.
         task.posted_assistant_uuids.clear()
-        task.subagent_blocks.clear()
         await self._persist(task)
         await self._start_typing(task)
 
