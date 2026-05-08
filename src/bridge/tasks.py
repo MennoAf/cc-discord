@@ -1468,10 +1468,18 @@ class TaskRegistry:
             await agg.flush_now()
 
         transcript_path = body.get("transcript_path") or task.current_transcript_path
+        # Dump the full body so we can see what fields claude provides for
+        # AskUserQuestion / ExitPlanMode / permission prompts. Truncate so a
+        # huge payload doesn't blow up the log.
+        try:
+            body_dump = json.dumps(body)[:1500]
+        except Exception:
+            body_dump = repr(body)[:1500]
         logger.info(
-            "Notification: session=%s transcript=%s",
+            "Notification: session=%s transcript=%s body=%s",
             session_id[:8] if session_id else "?",
             transcript_path,
+            body_dump,
         )
         if not transcript_path:
             handler_task = asyncio.create_task(
