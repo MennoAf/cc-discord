@@ -177,6 +177,10 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
         await self._archive_thread(task.thread_id)
+        # Remove from live indexes; stopped tasks should not be returned by get_by_thread_id/get_by_session_id
+        self._by_thread_id.pop(task.thread_id, None)
+        if task.current_claude_session_id is not None:
+            self._by_session_id.pop(task.current_claude_session_id, None)
 
     async def _archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
@@ -552,6 +556,10 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
         await self._archive_thread(task.thread_id)
+        # Remove from live indexes; crashed tasks should not be returned by get_by_thread_id/get_by_session_id
+        self._by_thread_id.pop(task.thread_id, None)
+        if task.current_claude_session_id is not None:
+            self._by_session_id.pop(task.current_claude_session_id, None)
 
     async def restart_task(self, task_id: str) -> Task:
         """Resume a task by spawning a new claude with --resume <session_id>.
