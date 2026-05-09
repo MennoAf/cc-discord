@@ -319,6 +319,14 @@ class Task:
     # Live-updating subagent blocks keyed by Claude's `agentId`. Cleared on
     # UserPromptSubmit / SessionStart.
     subagent_blocks: dict[str, "SubagentBlock"] = field(default_factory=dict)
+    # Mirror of claude's session task list, keyed by claude's task id.
+    # Each entry: {"subject", "status", "owner", "description"}. Updated
+    # incrementally on TaskCreate/TaskUpdate, snapshot-replaced on TaskList.
+    # Cleared on SessionStart so a fresh session starts empty.
+    task_list_state: dict[str, dict] = field(default_factory=dict)
+    # Debounce handle so a burst of TaskCreate/TaskUpdate events coalesces
+    # into a single Discord post 1s after the last event.
+    task_list_post_timer: asyncio.Task | None = None
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -932,6 +940,10 @@ class TaskRegistry:
         # New session = new turn boundary; drop any prior streaming state.
         task.posted_assistant_uuids.clear()
         task.subagent_blocks.clear()
+        task.task_list_state.clear()
+        if task.task_list_post_timer is not None and not task.task_list_post_timer.done():
+            task.task_list_post_timer.cancel()
+            task.task_list_post_timer = None
         if old_session_id and old_session_id in self._by_session_id:
             del self._by_session_id[old_session_id]
         if session_id:
@@ -1067,6 +1079,143 @@ class TaskRegistry:
         line = tool_summary.summarize(tool_name, tool_input, tool_response)
         self._agg_for(task).append(line)
         await self._post_tool_diff(task, tool_name, tool_input)
+
+        # Mirror claude's session task list as it mutates. TaskCreate /
+        # TaskUpdate trigger a debounced repost; TaskList silently syncs
+        # the mirror without posting.
+        if tool_name in ("TaskCreate", "TaskUpdate", "TaskList"):
+            self._update_task_list_state(task, tool_name, tool_input, tool_response)
+            if tool_name in ("TaskCreate", "TaskUpdate"):
+                self._schedule_task_list_post(task)
+
+    def _update_task_list_state(
+        self,
+        task: Task,
+        tool_name: str,
+        tool_input: dict,
+        tool_response: dict,
+    ) -> None:
+        """Apply a TaskCreate/TaskUpdate/TaskList event to `task.task_list_state`.
+
+        The shape of `tool_response` for these isn't fully documented; we
+        accept either a top-level list of tasks or a `{"tasks": [...]}`
+        envelope, and pull task ids from `id`/`taskId`/`task_id`.
+        """
+        if tool_name == "TaskCreate":
+            task_id = self._extract_task_id(tool_response, tool_input)
+            if task_id is None:
+                return
+            entry = task.task_list_state.setdefault(str(task_id), {})
+            for key in ("subject", "description", "owner"):
+                val = tool_input.get(key)
+                if isinstance(val, str):
+                    entry[key] = val
+            entry.setdefault("status", "pending")
+            return
+
+        if tool_name == "TaskUpdate":
+            task_id = tool_input.get("taskId") or tool_input.get("task_id")
+            if task_id is None:
+                return
+            entry = task.task_list_state.setdefault(str(task_id), {})
+            for key in ("status", "subject", "description", "owner"):
+                val = tool_input.get(key)
+                if isinstance(val, str):
+                    entry[key] = val
+            return
+
+        if tool_name == "TaskList":
+            tasks_payload = tool_response.get("tasks") if isinstance(tool_response, dict) else None
+            if tasks_payload is None and isinstance(tool_response, list):
+                tasks_payload = tool_response
+            if not isinstance(tasks_payload, list):
+                return
+            new_state: dict[str, dict] = {}
+            for t in tasks_payload:
+                if not isinstance(t, dict):
+                    continue
+                tid = t.get("id") or t.get("taskId") or t.get("task_id")
+                if tid is None:
+                    continue
+                new_state[str(tid)] = {
+                    "subject": t.get("subject") or "",
+                    "status": t.get("status") or "pending",
+                    "owner": t.get("owner") or "",
+                    "description": t.get("description") or "",
+                }
+            task.task_list_state = new_state
+
+    @staticmethod
+    def _extract_task_id(tool_response: dict, tool_input: dict) -> str | None:
+        """Pull a task id out of a TaskCreate response. Falls back to a
+        synthesized id derived from the subject if nothing's in the
+        response (rendering still works; subsequent TaskUpdate by real id
+        won't merge but that's a minor display glitch)."""
+        for src in (tool_response, tool_input):
+            if not isinstance(src, dict):
+                continue
+            for key in ("id", "taskId", "task_id"):
+                val = src.get(key)
+                if val is not None:
+                    return str(val)
+        # No id found — synthesize from subject so it at least renders.
+        subject = tool_input.get("subject") if isinstance(tool_input, dict) else None
+        if isinstance(subject, str) and subject.strip():
+            return f"~{subject.strip()[:40]}"
+        return None
+
+    def _schedule_task_list_post(self, task: Task) -> None:
+        """Debounce: post the current task list 1s after the last
+        TaskCreate/TaskUpdate. Bursts (5 quick TaskCreates → one plan
+        message) coalesce into a single post.
+        """
+        existing = task.task_list_post_timer
+        if existing is not None and not existing.done():
+            existing.cancel()
+        task.task_list_post_timer = asyncio.create_task(
+            self._post_task_list_after_delay(task),
+            name=f"task-list-post-{task.task_id[:8]}",
+        )
+
+    async def _post_task_list_after_delay(
+        self, task: Task, *, delay: float = 1.0
+    ) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if not task.task_list_state:
+            return
+        body = self._render_task_list_body(task)
+        try:
+            await self._bot.post(body, thread_id=task.thread_id)
+        except Exception:
+            logger.exception("failed to post task list for task %s", task.task_id)
+
+    @staticmethod
+    def _render_task_list_body(task: Task) -> str:
+        """Render the task_list_state mirror as a fenced checklist body."""
+        lines = ["**📋 Task list:**"]
+        # Sort by id; ids are typically integer-stringy so try numeric sort.
+        def _sort_key(tid: str) -> tuple[int, int | str]:
+            try:
+                return (0, int(tid))
+            except ValueError:
+                return (1, tid)
+        for tid in sorted(task.task_list_state.keys(), key=_sort_key):
+            entry = task.task_list_state[tid]
+            status = entry.get("status") or "pending"
+            subject = entry.get("subject") or "(no subject)"
+            mark = {
+                "completed": "✅",
+                "in_progress": "▶️",
+                "deleted": "🗑",
+            }.get(status, "⬜")
+            lines.append(f"{mark} #{tid} {subject}")
+        body = "\n".join(lines)
+        if len(body) > 1900:
+            body = body[:1897] + "…"
+        return body
 
     def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
         """Best-effort: did the most recent `tool_use` of `tool_name` come from

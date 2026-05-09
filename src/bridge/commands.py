@@ -257,6 +257,31 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
             return
         await interaction.followup.send(usage.format_summary(stats), ephemeral=True)
 
+    @tree.command(
+        name="tasks",
+        description="Show claude's current session task list (mirrored by the bridge)",
+    )
+    @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
+    async def tasks_cmd(
+        interaction: discord.Interaction,
+        thread: discord.Thread | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, thread)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        if not task.task_list_state:
+            await interaction.followup.send(
+                "ℹ No tasks tracked yet — claude hasn't called TaskCreate "
+                "in this session (or the daemon was restarted since the last call).",
+                ephemeral=True,
+            )
+            return
+        body = registry._render_task_list_body(task)
+        await interaction.followup.send(body, ephemeral=True)
+
     return tree
 
 
