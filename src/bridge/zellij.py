@@ -194,9 +194,25 @@ class ZellijManager:
         the paste path, because zellij's `action write-chars` parses
         argv-style and silently drops args that look like flags — a
         free-text reply like `-y` or `--help` would otherwise vanish.
+
+        Control bytes are stripped from the body before sending. This
+        defends against a Discord message containing the bracketed-paste
+        terminator (ESC[201~) — without the strip, a hostile message
+        could close paste mode mid-body and have its tail interpreted
+        as keypresses by the receiving TUI. Tabs and newlines are
+        preserved (newlines are the whole point of paste-mode).
         """
         submit = text.endswith("\n")
         body = text[:-1] if submit else text
+        # Drop C0/C1 control bytes (other than \n and \t) so a hostile
+        # message can't terminate bracketed paste early or smuggle in
+        # CSI/OSC/DCS sequences. ESC (\x1b) is the entry to all of
+        # these and is also stripped — we add our own ESC[200~/ESC[201~
+        # framing back below.
+        body = "".join(
+            ch for ch in body
+            if ch in ("\n", "\t") or (ord(ch) >= 0x20 and ord(ch) != 0x7f)
+        )
         # Force paste-mode for content that starts with `-` so write-chars
         # argparse doesn't eat it as a flag (see docstring).
         multiline = "\n" in body or body.startswith("-")

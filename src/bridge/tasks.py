@@ -50,6 +50,10 @@ _SUBAGENT_EDIT_THROTTLE_SECS = 1.5
 _ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
 # Discord per-message attachment cap.
 _MAX_ATTACHMENTS_PER_POST = 10
+# claude session ids are uuid4 — reject any other shape on ingest so a
+# malformed value can't reach argv (claude --resume <id>) or the KDL
+# layout (interpolated as an env(1) arg).
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 @dataclass
@@ -167,8 +171,17 @@ def _write_task_layout(
     out_path = settings_dir / f"{task_id}.kdl"
 
     def _kdl_quote(s: str) -> str:
-        # KDL strings: double-quoted, backslash-escape \" and \\.
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        # KDL strings are double-quoted. We backslash-escape \ and ".
+        # Control bytes (NUL, BS, TAB, LF, CR, ESC, etc.) would either
+        # break out of the string or — once zellij's KDL parser unescapes
+        # them — get passed through env(1) into claude's argv with their
+        # embedded form intact. None of our legitimate values (env vars,
+        # tab name, claude argv) ever need a control byte, so strip them
+        # rather than escape them. Defense-in-depth: callers also
+        # validate session_id at ingest, but this keeps us safe even if
+        # a new field flows in unsanitized later.
+        cleaned = "".join(ch for ch in s if ch >= " " or ch == " ")
+        return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     args_tokens: list[str] = []
     for k, v in env.items():
@@ -1046,6 +1059,18 @@ class TaskRegistry:
                 logger.warning("SessionStart: no session_id in body")
             elif not transcript_path:
                 logger.warning("SessionStart: no transcript_path in body")
+            return
+
+        # session_id flows from a hook body into argv (claude --resume
+        # <session_id>) and into the KDL layout file. claude's own
+        # session ids are UUIDs; reject anything that doesn't fit that
+        # shape so a malformed/hostile field can't smuggle in newlines,
+        # quotes, control bytes, or argv-flag-shaped content.
+        if not _SESSION_ID_RE.match(session_id):
+            logger.warning(
+                "SessionStart: rejecting session_id with unexpected shape: %r",
+                session_id[:80],
+            )
             return
 
         task = self.get_by_task_id(task_id)

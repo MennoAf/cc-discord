@@ -134,15 +134,21 @@ async def _transcribe_local_whisper(
         logger.exception("failed to clear stale transcript %s", expected_out)
 
     try:
+        # Pass options first, then `--` and the positional audio path.
+        # Today our paths are anchored under ATTACHMENTS_DIR so they
+        # can't begin with `-`, but the `--` sentinel makes the argv
+        # robust to future filename-layout changes (and is supported
+        # by openai-whisper's argparse).
         proc = await asyncio.create_subprocess_exec(
             binary,
-            str(audio_path),
             "--model",
             model,
             "--output_format",
             "txt",
             "--output_dir",
             str(out_dir),
+            "--",
+            str(audio_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
