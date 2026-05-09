@@ -446,6 +446,11 @@ class TaskRegistry:
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
+        # Per-task locks serializing _stream_assistant_progress so a Stop
+        # event can't race a still-in-flight PostToolUse streamer (which
+        # was causing both duplicate messages AND, after the fix for
+        # those, lost messages on transient post failure).
+        self._streamer_locks: dict[str, asyncio.Lock] = {}
         # Discord-side reconciliation notices staged by load_from_db. Flushed by
         # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
@@ -1583,10 +1588,17 @@ class TaskRegistry:
         turn that hasn't been streamed yet. Idempotent — entries already in
         `task.posted_assistant_uuids` are skipped.
 
+        Concurrency: uses a per-task `asyncio.Lock` so a Stop event firing
+        while a still-in-flight PostToolUse streamer is awaiting `bot.post`
+        can't race. Inside the lock we only mark a uuid as posted AFTER its
+        post succeeds — so a transient post failure leaves the uuid
+        un-marked and the next streamer call (next PostToolUse, or Stop)
+        will reconsider and retry it. This means the final assistant text
+        survives a single bot.post failure rather than getting silently
+        dropped.
+
         Walks from the last real-user prompt forward; only emits text and
-        thinking blocks (tool_use blocks are handled by PostToolUse). Marks
-        each visited assistant entry as posted regardless of whether it had
-        any postable content, so we don't reconsider it on the next call.
+        thinking blocks (tool_use blocks are handled by PostToolUse).
         """
         if path is None:
             if not task.current_transcript_path:
@@ -1595,47 +1607,46 @@ class TaskRegistry:
         if not path.is_file():
             return
 
-        entries = list(transcript.read_entries(path))
-        if not entries:
-            return
+        lock = self._streamer_locks.setdefault(task.task_id, asyncio.Lock())
+        async with lock:
+            entries = list(transcript.read_entries(path))
+            if not entries:
+                return
 
-        last_user_idx = -1
-        for i in range(len(entries) - 1, -1, -1):
-            e = entries[i]
-            if e.get("type") != "user":
-                continue
-            if e.get("isSidechain") is True or e.get("isMeta") is True:
-                continue
-            msg = e.get("message")
-            if not isinstance(msg, dict):
-                continue
-            if isinstance(msg.get("content"), str):
-                last_user_idx = i
-                break
+            last_user_idx = -1
+            for i in range(len(entries) - 1, -1, -1):
+                e = entries[i]
+                if e.get("type") != "user":
+                    continue
+                if e.get("isSidechain") is True or e.get("isMeta") is True:
+                    continue
+                msg = e.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if isinstance(msg.get("content"), str):
+                    last_user_idx = i
+                    break
 
-        for e in entries[last_user_idx + 1:]:
-            if e.get("type") != "assistant":
-                continue
-            if e.get("isMeta") is True:
-                continue
-            uid = e.get("uuid")
-            if not isinstance(uid, str) or uid in task.posted_assistant_uuids:
-                continue
-            # Mark posted BEFORE the async posts below — otherwise a
-            # concurrent _stream_assistant_progress call (e.g. from a
-            # second PostToolUse firing while we're still awaiting the
-            # bot.post for this uid) would also see uid as un-posted and
-            # send a duplicate. Trade-off: if our post fails, the entry
-            # is silently dropped instead of retried — acceptable since
-            # the post() retry-with-backoff already covers transient
-            # 5xx, and a permanent failure shouldn't trigger replays.
-            task.posted_assistant_uuids.add(uid)
-            sidechain = e.get("isSidechain") is True
-            prefix = "↳ " if sidechain else ""
+            for e in entries[last_user_idx + 1:]:
+                if e.get("type") != "assistant":
+                    continue
+                if e.get("isMeta") is True:
+                    continue
+                uid = e.get("uuid")
+                if not isinstance(uid, str) or uid in task.posted_assistant_uuids:
+                    continue
+                sidechain = e.get("isSidechain") is True
+                prefix = "↳ " if sidechain else ""
 
-            msg = e.get("message")
-            content = msg.get("content") if isinstance(msg, dict) else None
-            if isinstance(content, list):
+                msg = e.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    # Nothing postable in this entry — but mark posted so
+                    # we don't keep re-considering it on every refresh.
+                    task.posted_assistant_uuids.add(uid)
+                    continue
+
+                entry_succeeded = True
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -1660,6 +1671,7 @@ class TaskRegistry:
                                 logger.exception(
                                     "failed to stream text for task %s", task.task_id
                                 )
+                                entry_succeeded = False
                     elif btype == "thinking":
                         # Extended-thinking blocks are encrypted by default
                         # (`thinking` is empty). Only post when content is
@@ -1675,8 +1687,12 @@ class TaskRegistry:
                                 logger.exception(
                                     "failed to stream thinking for task %s", task.task_id
                                 )
-            # uid was already added to posted_assistant_uuids at the top of
-            # the loop body to dedupe concurrent calls.
+                                entry_succeeded = False
+                # Only mark the uid posted if every block we tried to send
+                # succeeded — this lets the next streamer call re-try the
+                # whole entry on transient post failure.
+                if entry_succeeded:
+                    task.posted_assistant_uuids.add(uid)
 
     @staticmethod
     def _format_thinking(text: str) -> str:
