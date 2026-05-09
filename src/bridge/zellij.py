@@ -153,14 +153,16 @@ class ZellijManager:
         multiline = "\n" in body
 
         async with self._session_lock:
-            # 3s rather than the default 10s — these zellij actions are
-            # near-instant when the session is healthy. A 10s wait on a
-            # wedged session blocks the discord on_message coroutine
-            # for far longer than necessary.
+            # 5s rather than the default 10s — these zellij actions are
+            # near-instant when the session is healthy. When no client is
+            # attached to the session, zellij can take a couple seconds
+            # to respond to `go-to-tab-name`, hence not 3s. tasks.py adds
+            # a single retry on top so a single transient hiccup doesn't
+            # drop the user's message.
             rc, _, stderr = await self._run_unlocked(
                 self._executable, "--session", SESSION_NAME,
                 "action", "go-to-tab-name", pane_id,
-                timeout=3.0,
+                timeout=5.0,
             )
             if rc != 0:
                 raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")

@@ -901,27 +901,56 @@ class TaskRegistry:
             combined.count("\n") + 1,
             combined[:300] + ("…" if len(combined) > 300 else ""),
         )
-        try:
-            await self._zellij.write_to_pane(task.zellij_pane_id, combined + "\n")
-        except ZellijError as e:
-            # zellij wedged or tab gone — let the user know in the thread
-            # instead of swallowing the message. Keep status as-is so they
-            # can /restart or /kill explicitly.
-            logger.exception("write_to_pane failed for task %s", task.task_id)
-            try:
-                await self._bot.post(
-                    f"⚠ Couldn't deliver your message — zellij command failed "
-                    f"(`{e}`). The task may be wedged; try `/restart` or `/kill`.",
-                    thread_id=task.thread_id,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to post wedge notice for task %s", task.task_id
-                )
-            return True  # consumed: don't fall through to /v1/ask listener
+        if not await self._write_with_retry(task, combined + "\n"):
+            return True  # error already surfaced to the thread
         task.last_activity = int(time.time())
         await self._persist(task)
         return True
+
+    async def _write_with_retry(self, task: Task, payload: str) -> bool:
+        """Type `payload` into the task's pane, retrying once on ZellijError.
+
+        Empirically zellij hiccups on `go-to-tab-name` when no client is
+        attached to the session — Hailey reported that re-sending the same
+        message works on the second try. Retry once after a 1s pause
+        before surfacing the failure as a thread notice.
+
+        Returns True if delivery succeeded (caller should bump
+        last_activity), False if both attempts failed (caller should
+        skip activity bump because we already posted an error).
+        """
+        for attempt in (1, 2):
+            try:
+                await self._zellij.write_to_pane(task.zellij_pane_id, payload)
+                if attempt == 2:
+                    logger.info(
+                        "write_to_pane succeeded on retry for task %s",
+                        task.task_id,
+                    )
+                return True
+            except ZellijError as e:
+                if attempt == 1:
+                    logger.warning(
+                        "write_to_pane attempt 1 failed for task %s (%s); retrying",
+                        task.task_id, e,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.exception(
+                    "write_to_pane retry also failed for task %s", task.task_id
+                )
+                try:
+                    await self._bot.post(
+                        f"⚠ Couldn't deliver your message — zellij command failed "
+                        f"(`{e}`). The task may be wedged; try `/restart` or `/kill`.",
+                        thread_id=task.thread_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to post wedge notice for task %s", task.task_id
+                    )
+                return False
+        return False
 
     async def _save_attachments(self, task_id: str, msg: MessageLike) -> list[Path]:
         """Download Discord attachments to disk under ATTACHMENTS_DIR/<task_id>/.
