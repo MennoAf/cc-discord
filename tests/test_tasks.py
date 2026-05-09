@@ -2859,6 +2859,7 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     )
 
     registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
     # Trigger notification (returns immediately, spawns handler task)
@@ -2940,6 +2941,7 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     )
 
     registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
     # Trigger notification (returns immediately, spawns handler task)

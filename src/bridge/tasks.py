@@ -2020,6 +2020,32 @@ class TaskRegistry:
         the session_id at the next SessionStart, which is where we re-bind."""
         logger.debug("PreCompact received")
 
+    # Brief wait before streaming preceding assistant text on a TUI
+    # prompt, so the transcript writer has time to flush the assistant
+    # entry that carries the lead-in text. Tests override to 0.
+    _PRE_PROMPT_FLUSH_SECS: float = 0.5
+
+    async def _flush_pending_text_before_prompt(self, task: Task) -> None:
+        """Stream any preceding assistant text before posting a TUI prompt.
+
+        Why: PreToolUse fires the moment claude decides to invoke
+        AskUserQuestion / ExitPlanMode, but the assistant entry that
+        carries the introductory text alongside the tool_use block isn't
+        always flushed to the JSONL transcript yet at that instant. If
+        we post the prompt now, Discord shows it before the lead-in
+        text — order inverted vs the TUI. Sleep briefly to let the
+        transcript writer catch up, then run the streamer so the text
+        lands first.
+        """
+        if self._PRE_PROMPT_FLUSH_SECS > 0:
+            await asyncio.sleep(self._PRE_PROMPT_FLUSH_SECS)
+        try:
+            await self._stream_assistant_progress(task)
+        except Exception:
+            logger.exception(
+                "pre-prompt streamer failed for task %s", task.task_id
+            )
+
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
         """Handle AskUserQuestion prompt: post each question to Discord with
         option reactions, in sequence.
@@ -2034,6 +2060,12 @@ class TaskRegistry:
         After all questions are answered, claude's TUI shows a final submit
         screen — the bridge sends Enter (byte 13) to confirm the whole batch.
         """
+        # Give the transcript writer a beat to flush the assistant entry
+        # holding the just-decided tool_use (often it carries preceding text
+        # like "Here are the options…" alongside the tool_use block). Then
+        # stream that text so it lands in Discord BEFORE the question — same
+        # order as the TUI.
+        await self._flush_pending_text_before_prompt(task)
         if not self._approval_router:
             logger.warning(
                 "approval_router not configured; cannot dispatch TUI prompt for task %s",
@@ -2152,6 +2184,7 @@ class TaskRegistry:
 
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
         """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
+        await self._flush_pending_text_before_prompt(task)
         if not self._approval_router:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
