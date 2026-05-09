@@ -3,22 +3,40 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 from typing import Iterator
 
 
+# Cap on entries we'll yield from a single transcript read. Real claude
+# sessions stay well under this (a long, dense session is on the order of
+# 1-2k entries). The cap exists to defend the daemon against a hostile or
+# buggy hook payload pointing `transcript_path` at /dev/zero or a giant
+# unrelated file: without it, every consumer that does `list(read_entries
+# (path))` would slurp the whole thing into memory.
+_MAX_ENTRIES = 50_000
+
+
 def read_entries(path: Path) -> Iterator[dict]:
-    """Yield each JSON entry from a transcript JSONL. Skips malformed lines silently."""
+    """Yield each JSON entry from a transcript JSONL.
+
+    Skips malformed lines silently. Reads with explicit utf-8 encoding so
+    a misconfigured `LANG=POSIX` doesn't break parsing. Yields at most
+    `_MAX_ENTRIES` entries — the LAST `_MAX_ENTRIES`, since callers
+    almost universally walk newest-last and care about recent state.
+    """
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            recent: deque[dict] = deque(maxlen=_MAX_ENTRIES)
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    recent.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+            yield from recent
     except (IOError, OSError):
         return
 

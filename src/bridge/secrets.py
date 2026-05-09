@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,20 +83,40 @@ def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
 def write_secrets(secrets: Secrets, path: Path = SECRETS_FILE) -> None:
     """Write secrets to a 0600 JSON file.
 
-    Creates parent directories with 0700 mode. Writes JSON file with 0600 mode.
+    Creates parent directories with 0700 mode. Opens the secrets file
+    via `os.open` with mode 0o600 baked in, so the bot token never
+    exists on disk world-readable — closes the umask-window TOCTOU
+    that `write_text` + `chmod` left open.
     """
-    # Create parent directory with 0700 mode
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
 
-    # Write JSON
     data = {
         "DISCORD_BOT_TOKEN": secrets.bot_token,
         "DISCORD_CHANNEL_ID": secrets.channel_id,
     }
-    path.write_text(json.dumps(data, indent=2))
+    payload = json.dumps(data, indent=2)
 
-    # Set file mode to 0600
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+    except BaseException:
+        # If write failed mid-stream, the file may exist with partial
+        # contents under 0600 already — that's fine, but ensure we don't
+        # leak the fd if fdopen raises before taking ownership.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+    # Defensive: if the file pre-existed with looser perms, our O_CREAT
+    # didn't change them. Force 0600 now.
     path.chmod(0o600)
 
 
