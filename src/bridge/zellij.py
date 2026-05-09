@@ -189,10 +189,17 @@ class ZellijManager:
         is dispatched in a single `action write` so zellij delivers it
         atomically; per-segment write-chars + interleaved write calls
         race with the TUI's paste-mode state and lose trailing content.
+
+        Single-line bodies that start with `-` are also routed through
+        the paste path, because zellij's `action write-chars` parses
+        argv-style and silently drops args that look like flags — a
+        free-text reply like `-y` or `--help` would otherwise vanish.
         """
         submit = text.endswith("\n")
         body = text[:-1] if submit else text
-        multiline = "\n" in body
+        # Force paste-mode for content that starts with `-` so write-chars
+        # argparse doesn't eat it as a flag (see docstring).
+        multiline = "\n" in body or body.startswith("-")
 
         async with self._session_lock:
             # 5s rather than the default 10s — these zellij actions are

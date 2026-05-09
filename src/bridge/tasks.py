@@ -1905,8 +1905,22 @@ class TaskRegistry:
         return embed
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
-        """Track a TUI handler task and remove it from tracking when it completes."""
-        handler_task.add_done_callback(lambda t, k=task_id: self._tui_handler_tasks.pop(k, None))
+        """Track a TUI handler task and remove it from tracking when it completes.
+
+        The done-callback runs via `loop.call_soon`, so it can fire AFTER
+        a successor handler has already been registered for the same
+        task_id (when the previous handler finished moments before the
+        new one was spawned). Without the identity check the callback
+        would happily evict the new in-flight handler from the map,
+        making it invisible to kill_task / _mark_stopped — and a TUI
+        prompt would sit there for the full router timeout. Only pop
+        when the entry is still THIS task.
+        """
+        def _evict(t: asyncio.Task, k: str = task_id) -> None:
+            if self._tui_handler_tasks.get(k) is t:
+                self._tui_handler_tasks.pop(k, None)
+
+        handler_task.add_done_callback(_evict)
         self._tui_handler_tasks[task_id] = handler_task
 
     async def _on_notification(self, body: dict) -> None:

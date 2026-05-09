@@ -168,10 +168,15 @@ def _diff_summary(tool_input: dict) -> str:
     return f"+{plus} -{minus}"
 
 
-# Discord's hard limit is 2000 chars per message; reserve headroom for the
-# fence + truncation marker.
+# Discord's hard limit is 2000 chars per message; bot.py chunks at 1900
+# (`MAX_CHUNK`) to leave attribution-header headroom. Diff/code blocks get
+# wrapped in a fenced container (` ```diff\n…\n``` ` ≈ 12 chars) and may
+# also append a `\n…` truncation marker, so the body budget must stay
+# below 1900 minus that overhead — otherwise the bot's chunker splits a
+# fenced block in the middle and the second message arrives with no
+# opening fence (and the closing fence renders as visible text).
 _DISCORD_LIMIT = 2000
-_DIFF_BUDGET = _DISCORD_LIMIT - 80
+_DIFF_BUDGET = 1850
 
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
