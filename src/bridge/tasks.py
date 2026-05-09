@@ -662,6 +662,10 @@ class TaskRegistry:
             handler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
+        # Drop the per-task streamer lock — it's keyed on task_id and a
+        # stopped task will never stream again. Without this the dict
+        # leaks one Lock object per task forever.
+        self._streamer_locks.pop(task.task_id, None)
         # Clean up the task-scoped settings file
         _cleanup_task_artifacts(task.task_id)
 
@@ -1991,10 +1995,18 @@ class TaskRegistry:
             task.status = "crashed"
             task.last_activity = int(time.time())
             await self._persist(task)
+            # Catch BotNotReady (early-startup window) and any other post
+            # error; we still need to do the rest of the bookkeeping or
+            # we'll leave the task indexed-but-crashed with no archive.
             try:
                 await self._bot.post(
                     f"💥 Claude process exited (`{exit_reason}`)",
                     thread_id=task.thread_id,
+                )
+            except BotNotReady:
+                logger.info(
+                    "crash notice deferred (bot not ready) for task %s",
+                    task.task_id,
                 )
             except Exception:
                 logger.exception("failed to post crash notice for task %s", task.task_id)
@@ -2004,6 +2016,7 @@ class TaskRegistry:
             self._by_thread_id.pop(task.thread_id, None)
             if task.current_claude_session_id is not None:
                 self._by_session_id.pop(task.current_claude_session_id, None)
+            self._streamer_locks.pop(task.task_id, None)
         elif task.status == "running":
             # Graceful exit; mark stopped. Note: stop_task also calls _mark_stopped which
             # archives the thread, so we may double-archive here. That's OK — archive_thread
@@ -2017,6 +2030,7 @@ class TaskRegistry:
             self._by_thread_id.pop(task.thread_id, None)
             if task.current_claude_session_id is not None:
                 self._by_session_id.pop(task.current_claude_session_id, None)
+            self._streamer_locks.pop(task.task_id, None)
 
     async def _on_subagent_stop(self, body: dict) -> None:
         """Handle SubagentStop event: refresh subagent blocks so any agents
@@ -2416,6 +2430,13 @@ class TaskRegistry:
 
         Marks status='crashed' and archives the thread.
         Raises TaskNotFound if task_id doesn't exist.
+
+        Bridge bookkeeping (DB row, indexes, artifact cleanup) runs
+        unconditionally even if `close_pane` raises — `zellij.close_pane`
+        already swallows ZellijError internally, but we don't want a
+        bug elsewhere (subprocess explosion, asyncio cancel) to leave
+        the task in `running` while commands.py reports a successful
+        kill to the user.
         """
         task = self.get_by_task_id(task_id)
         if task is None:
@@ -2426,7 +2447,13 @@ class TaskRegistry:
             return
 
         if task.zellij_pane_id is not None:
-            await self._zellij.close_pane(task.zellij_pane_id)
+            try:
+                await self._zellij.close_pane(task.zellij_pane_id)
+            except Exception:
+                logger.exception(
+                    "kill_task %s: close_pane raised; continuing with bookkeeping",
+                    task.task_id,
+                )
 
         task.status = "crashed"
         task.last_activity = int(time.time())
@@ -2444,6 +2471,8 @@ class TaskRegistry:
             handler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await handler_task
+        # Drop the per-task streamer lock; mirrors _mark_stopped.
+        self._streamer_locks.pop(task.task_id, None)
         # Clean up the task-scoped settings file
         _cleanup_task_artifacts(task_id)
 
