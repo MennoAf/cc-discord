@@ -224,76 +224,53 @@ class TestZellijManager:
         assert len(patch_exec._call_log) == 1
 
     async def test_spawn_task_success(self, patch_exec):
-        """Three subprocess calls: attach, new-tab, run; returns the tab name.
+        """Two subprocess calls: attach + new-tab --layout. Returns the tab name.
 
-        env is injected via the `env(1)` prefix because zellij's client-server
-        model means the subprocess env we'd otherwise pass is invisible to the
-        spawned claude.
+        spawn_task no longer separately invokes `run` — the layout file
+        passed to `new-tab --layout` describes the single claude pane,
+        which avoids the default shell pane that `new-tab` would
+        otherwise spawn alongside.
         """
-        for _ in range(3):
+        for _ in range(2):
             patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        tab = await mgr.spawn_task("/tmp", {"FOO": "bar"}, "cc-aa429dc4")
+        tab = await mgr.spawn_task("/tmp", "cc-aa429dc4", "/tmp/layout.kdl")
 
         assert tab == "cc-aa429dc4"
-        assert len(patch_exec._call_log) == 3
+        assert len(patch_exec._call_log) == 2
         assert patch_exec._call_log[0][0] == (
             "zellij", "attach", "--create-background", "bridge"
         )
         assert patch_exec._call_log[1][0] == (
             "zellij", "--session", "bridge", "action", "new-tab",
             "--name", "cc-aa429dc4", "--cwd", "/tmp",
+            "--layout", "/tmp/layout.kdl",
         )
-        run_argv, _ = patch_exec._call_log[2]
-        assert run_argv == (
-            "zellij", "--session", "bridge", "run",
-            "--close-on-exit", "--cwd", "/tmp", "--",
-            "env", "FOO=bar", "claude",
-        )
-
-    async def test_spawn_task_extra_argv(self, patch_exec):
-        """spawn_task appends extra_argv after `claude` (used for --resume)."""
-        for _ in range(3):
-            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
-
-        mgr = ZellijManager()
-        await mgr.spawn_task(
-            "/tmp", {}, "cc-aa429dc4", extra_argv=["--resume", "sess-xyz"]
-        )
-
-        run_argv, _ = patch_exec._call_log[2]
-        assert run_argv[-3:] == ("claude", "--resume", "sess-xyz")
-        # With empty env, the prefix is just `env claude ...`.
-        assert "env" in run_argv
-        assert run_argv.index("env") < run_argv.index("claude")
 
     async def test_spawn_task_session_already_exists_is_success(self, patch_exec):
         """attach returning 'Session already exists' is treated as success."""
         patch_exec._queue.append(
             FakeProc(returncode=2, stdout_data=b"", stderr_data=b"Session already exists")
         )
-        for _ in range(2):
-            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        tab = await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+        tab = await mgr.spawn_task("/tmp", "cc-aa429dc4", "/tmp/layout.kdl")
         assert tab == "cc-aa429dc4"
 
     async def test_spawn_task_skips_attach_when_colocated(self, patch_exec, monkeypatch):
         """When running inside the target session, spawn_task skips the attach
-        call (only new-tab + run remain)."""
+        call (only the new-tab call remains)."""
         monkeypatch.setenv("ZELLIJ_SESSION_NAME", "bridge")
-        for _ in range(2):
-            patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
-        tab = await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+        tab = await mgr.spawn_task("/tmp", "cc-aa429dc4", "/tmp/layout.kdl")
 
         assert tab == "cc-aa429dc4"
-        assert len(patch_exec._call_log) == 2
+        assert len(patch_exec._call_log) == 1
         assert patch_exec._call_log[0][0][4] == "new-tab"
-        assert patch_exec._call_log[1][0][3] == "run"
 
     async def test_spawn_task_new_tab_failure(self, patch_exec):
         patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # attach
@@ -302,44 +279,28 @@ class TestZellijManager:
         )
         mgr = ZellijManager()
         with pytest.raises(ZellijSpawnError, match="new-tab"):
-            await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
-
-    async def test_spawn_task_run_failure(self, patch_exec):
-        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # attach
-        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))  # new-tab
-        patch_exec._queue.append(
-            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"command not found: claude")
-        )
-        mgr = ZellijManager()
-        with pytest.raises(ZellijSpawnError, match="run claude failed"):
-            await mgr.spawn_task("/tmp", {}, "cc-aa429dc4")
+            await mgr.spawn_task("/tmp", "cc-aa429dc4", "/tmp/layout.kdl")
 
     async def test_spawn_task_concurrent_serialized(self, patch_exec):
         """Concurrent spawn_task calls serialize on the session lock; each sees its own
-        attach/new-tab/run sequence ungaroupbled."""
-        # 3 calls per spawn × 2 spawns = 6 total
-        for _ in range(6):
+        attach + new-tab sequence ungaroupbled."""
+        # 2 calls per spawn × 2 spawns = 4 total
+        for _ in range(4):
             patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
 
         mgr = ZellijManager()
         tab1, tab2 = await asyncio.gather(
-            mgr.spawn_task("/tmp", {}, "cc-spawn1"),
-            mgr.spawn_task("/home", {}, "cc-spawn2"),
+            mgr.spawn_task("/tmp", "cc-spawn1", "/tmp/l1.kdl"),
+            mgr.spawn_task("/home", "cc-spawn2", "/tmp/l2.kdl"),
         )
         assert {tab1, tab2} == {"cc-spawn1", "cc-spawn2"}
 
-        # The 6 calls should appear as two interleaved-but-not-tangled groups.
-        # Check that within each spawn's group, attach precedes new-tab precedes run.
         log = patch_exec._call_log
-        # Find the new-tab calls and verify each is preceded by an attach
-        # within the same lock-held window.
         for i, (argv, _) in enumerate(log):
             if "new-tab" in argv:
-                # Previous call in log should be attach
+                # Each new-tab should be preceded by an attach within the
+                # same lock window.
                 prev_argv = log[i - 1][0]
                 assert prev_argv[1] == "attach"
-                # Next call should be run for the same tab name
-                next_argv = log[i + 1][0]
-                assert "run" in next_argv
                 tab_name = argv[argv.index("--name") + 1]
                 assert tab_name in {"cc-spawn1", "cc-spawn2"}

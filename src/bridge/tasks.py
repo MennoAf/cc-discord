@@ -141,15 +141,56 @@ def _write_task_settings(
     return out_path
 
 
+def _write_task_layout(
+    task_id: str,
+    *,
+    env: dict[str, str],
+    claude_argv: list[str],
+    settings_dir: Path = TASK_SETTINGS_DIR,
+) -> Path:
+    """Generate a zellij KDL layout file that opens the new tab with a
+    single pane running `env K=V ... claude <argv>`. Used so the tab spawns
+    with claude as the only pane — no default shell pane to close
+    afterward.
+
+    Returns the absolute path written.
+    """
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    out_path = settings_dir / f"{task_id}.kdl"
+
+    def _kdl_quote(s: str) -> str:
+        # KDL strings: double-quoted, backslash-escape \" and \\.
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    args_tokens: list[str] = []
+    for k, v in env.items():
+        args_tokens.append(_kdl_quote(f"{k}={v}"))
+    args_tokens.append(_kdl_quote("claude"))
+    for arg in claude_argv:
+        args_tokens.append(_kdl_quote(arg))
+    args_line = " ".join(args_tokens)
+
+    layout = (
+        "layout {\n"
+        '    pane command="env" close_on_exit=true {\n'
+        f"        args {args_line}\n"
+        "    }\n"
+        "}\n"
+    )
+    out_path.write_text(layout)
+    return out_path
+
+
 def _cleanup_task_settings(task_id: str, *, settings_dir: Path = TASK_SETTINGS_DIR) -> None:
-    """Remove the task-scoped settings file. Idempotent — silent on missing file."""
-    p = settings_dir / f"{task_id}.json"
-    try:
-        p.unlink()
-    except FileNotFoundError:
-        return
-    except Exception:
-        logger.exception("failed to remove task settings file %s", p)
+    """Remove the task-scoped settings + layout files. Idempotent — silent on missing files."""
+    for suffix in (".json", ".kdl"):
+        p = settings_dir / f"{task_id}{suffix}"
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.exception("failed to remove task file %s", p)
 
 
 def _cleanup_task_attachments(
@@ -703,13 +744,21 @@ class TaskRegistry:
         # Build env for spawned claude
         env = self._build_spawn_env(task_id)
 
+        # Generate a zellij layout that opens the new tab as a single
+        # claude pane (no default shell). claude_argv is what runs after
+        # `env K=V ...`.
+        layout_path = _write_task_layout(
+            task_id,
+            env=env,
+            claude_argv=["--settings", str(settings_path)],
+        )
+
         # Spawn via zellij; on failure, mark the task as crashed and re-raise
         try:
             pane_id = await self._zellij.spawn_task(
                 cwd=cwd,
-                env=env,
                 pane_name=f"cc-{task_id[:8]}",
-                extra_argv=["--settings", str(settings_path)],
+                layout_path=str(layout_path),
             )
         except ZellijError:
             logger.exception(f"spawn_task failed for task_id {task_id}")
@@ -2323,11 +2372,18 @@ class TaskRegistry:
         # Spawn a fresh pane with the resumed session.
         settings_path = _write_task_settings(task.task_id)
         env = self._build_spawn_env(task.task_id)
+        layout_path = _write_task_layout(
+            task.task_id,
+            env=env,
+            claude_argv=[
+                "--settings", str(settings_path),
+                "--resume", task.current_claude_session_id,
+            ],
+        )
         new_pane_id = await self._zellij.spawn_task(
             cwd=task.cwd,
-            env=env,
             pane_name=f"cc-{task.task_id[:8]}",
-            extra_argv=["--settings", str(settings_path), "--resume", task.current_claude_session_id],
+            layout_path=str(layout_path),
         )
         task.zellij_pane_id = new_pane_id
         task.last_activity = int(time.time())

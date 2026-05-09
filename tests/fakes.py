@@ -122,11 +122,13 @@ class FakeZellij:
     _close_calls: list[dict] = field(default_factory=list)
 
     async def spawn_task(
-        self, cwd: str, env: dict, pane_name: str, *, extra_argv: list[str] | None = None
+        self, cwd: str, pane_name: str, layout_path: str
     ) -> str:
-        """Fake spawn_task."""
+        """Fake spawn_task. The new contract takes a layout file path
+        instead of env+extra_argv (env vars and claude argv now live in
+        the layout)."""
         self._spawn_calls.append(
-            {"cwd": cwd, "env": env, "pane_name": pane_name, "extra_argv": extra_argv}
+            {"cwd": cwd, "pane_name": pane_name, "layout_path": layout_path}
         )
         return "terminal_1"
 
