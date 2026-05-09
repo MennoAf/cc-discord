@@ -1,12 +1,16 @@
 """Async wrapper around the zellij CLI for managing per-task tabs in a session.
 
-zellij 0.43+ removed `list-panes`, `--pane-id` targeting, and `send-keys`. We
-target each task by tab name (e.g. `cc-aa429dc4`), focus the tab via
-`go-to-tab-name` before issuing `write-chars`, and submit Enter via raw
-`action write 13`.
+zellij 0.43 removed `list-panes`, `--pane-id` targeting, and `send-keys`; 0.44
+restored `list-panes` (now JSON-capable). We target each task by tab name
+(e.g. `cc-aa429dc4`), focus the tab via `go-to-tab-name` before issuing
+`write-chars`, and submit Enter via raw `action write 13`. On 0.44+ we use
+`list-panes --json --state --tab` to detect exited panes inside live tabs;
+on 0.43 we fall back to `query-tab-names` (which can only see tabs, not
+their pane state).
 """
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -123,19 +127,57 @@ class ZellijManager:
     async def list_panes(self) -> list[dict]:
         """List bridge-owned task tabs in the session.
 
-        Returns a list of dicts shaped `{"id": tab_name, "exited": False}` for
+        Returns a list of dicts shaped `{"id": tab_name, "exited": bool}` for
         each tab whose name starts with `cc-`. The "id" field carries the tab
-        name (preserving the historical `pane_id` contract). "exited" is always
-        False because zellij 0.43 has no API to detect a dead pane in an
-        existing tab — we infer death only from the tab disappearing entirely.
+        name (preserving the historical `pane_id` contract).
+
+        On zellij 0.44+ we use `list-panes --json --state --tab` and report
+        `exited` truthfully: a task tab is considered exited iff every one
+        of its panes has exited. (Each task layout produces exactly one
+        pane, so in practice the AND folds to that single pane's value.)
+
+        On older zellij (or any failure of the new path) we fall back to
+        `query-tab-names`, in which case `exited` is always False because
+        the legacy command has no pane-state info. Death is inferred from
+        the tab disappearing entirely in the legacy path.
         """
-        returncode, stdout, stderr = await self._run(
+        rc, stdout, stderr = await self._run(
+            self._executable, "--session", SESSION_NAME,
+            "action", "list-panes", "--json", "--state", "--tab",
+        )
+        if rc == 0:
+            try:
+                panes = json.loads(stdout)
+            except json.JSONDecodeError as e:
+                raise ZellijError(f"list-panes JSON parse failed: {e}") from e
+            if not isinstance(panes, list):
+                raise ZellijError(
+                    f"list-panes JSON not a list: {type(panes).__name__}"
+                )
+            by_tab: dict[str, bool] = {}
+            for pane in panes:
+                if not isinstance(pane, dict):
+                    continue
+                tab_name = pane.get("tab_name")
+                if not isinstance(tab_name, str) or not tab_name.startswith("cc-"):
+                    continue
+                ex = bool(pane.get("exited", False))
+                # AND across panes in the same tab: tab is exited only when
+                # all panes are. seed with True so the first pane sets state.
+                by_tab[tab_name] = by_tab.get(tab_name, True) and ex
+            return [{"id": n, "exited": e} for n, e in by_tab.items()]
+
+        # Legacy fallback for zellij ≤ 0.43 (or transient list-panes failure).
+        logger.info(
+            "list-panes failed (rc=%d, stderr=%r); falling back to query-tab-names",
+            rc, stderr.strip()[:120],
+        )
+        rc2, stdout2, stderr2 = await self._run(
             self._executable, "--session", SESSION_NAME, "action", "query-tab-names"
         )
-        if returncode != 0:
-            raise ZellijError(f"query-tab-names failed: {stderr}")
-
-        names = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if rc2 != 0:
+            raise ZellijError(f"query-tab-names failed: {stderr2}")
+        names = [line.strip() for line in stdout2.splitlines() if line.strip()]
         return [{"id": n, "exited": False} for n in names if n.startswith("cc-")]
 
     async def write_to_pane(self, pane_id: str, text: str) -> None:
