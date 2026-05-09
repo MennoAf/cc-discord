@@ -332,6 +332,10 @@ class Task:
     # the last message in the thread when the next post fires, we edit
     # it in place instead of posting a duplicate.
     last_task_list_message_id: int | None = None
+    # Current status indicator emoji prefixed onto the thread name. Empty
+    # string means "not set yet" (so the first state transition takes effect
+    # even if the thread name happens to already start with a green dot).
+    status_indicator: str = ""
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -398,6 +402,18 @@ class TaskRegistry:
         """Attach the Bot instance after construction. Called once by
         `server.serve` after the Bot is created."""
         self._bot = bot
+
+    @staticmethod
+    def _notify_mention_prefix() -> str:
+        """Return `<@USER_ID> ` to prepend to interactive TUI prompts so the
+        configured user gets a Discord notification when claude is blocking
+        on input. Empty string if `BRIDGE_NOTIFY_USER_ID` isn't set —
+        keeps the prompt body unchanged for users who don't want pings.
+        """
+        user_id = os.environ.get("BRIDGE_NOTIFY_USER_ID", "").strip()
+        if not user_id.isdigit():
+            return ""
+        return f"<@{user_id}> "
 
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.
@@ -1942,7 +1958,10 @@ class TaskRegistry:
                 idx, total, is_multi, len(options),
             )
             counter = f" ({idx}/{total})" if total > 1 else ""
-            lines = [f"❓ **{q.get('question', '?')}**{counter}"]
+            # Mention only on the first question — subsequent ones are
+            # immediate follow-ups, no need to spam notifications.
+            mention = self._notify_mention_prefix() if idx == 1 else ""
+            lines = [f"{mention}❓ **{q.get('question', '?')}**{counter}"]
             if is_multi:
                 lines.append(
                     "_(multi-select: tap each option you want, then ✅ to submit)_"
@@ -2030,7 +2049,7 @@ class TaskRegistry:
             return
         plan = pending["input"].get("plan") or "(empty plan)"
         body = (
-            f"📋 **Plan ready for review**\n\n{plan}\n\n"
+            f"{self._notify_mention_prefix()}📋 **Plan ready for review**\n\n{plan}\n\n"
             f"React ✅ to approve, ❌ to reject, or reply in this thread to leave feedback."
         )
         request_id = str(uuid.uuid4())
@@ -2050,7 +2069,10 @@ class TaskRegistry:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         request_id = str(uuid.uuid4())
-        body = "🟡 Claude is waiting for input. Reply in this thread or type in zellij."
+        body = (
+            f"{self._notify_mention_prefix()}🟡 Claude is waiting for input. "
+            "Reply in this thread or type in zellij."
+        )
         answer, source = await self._approval_router.request_tui_answer(
             request_id=request_id,
             task_id=task.task_id,
