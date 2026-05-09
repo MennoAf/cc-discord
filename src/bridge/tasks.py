@@ -19,6 +19,7 @@ import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
+from bridge.bot import BotNotReady
 from bridge.listener import MessageLike
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
@@ -1210,6 +1211,9 @@ class TaskRegistry:
                         content=body,
                     )
                     return
+            except BotNotReady:
+                # Will retry next time TaskCreate/TaskUpdate fires.
+                return
             except Exception:
                 logger.exception(
                     "task-list edit-in-place check failed for task %s; posting fresh",
@@ -1220,6 +1224,8 @@ class TaskRegistry:
             ids = await self._bot.post(body, thread_id=task.thread_id)
             if ids:
                 task.last_task_list_message_id = ids[0]
+        except BotNotReady:
+            return
         except Exception:
             logger.exception("failed to post task list for task %s", task.task_id)
 
@@ -1613,18 +1619,31 @@ class TaskRegistry:
                 last_edit_at=now,
                 finished_at=now if finished else None,
             )
-            task.subagent_blocks[agent_id] = block
             embed = self._render_subagent_embed(
                 block, last_actions, total_actions, finished
             )
+            # Post FIRST, persist only on success. If the post fails (most
+            # commonly: bot not yet logged in during the brief startup window
+            # where the HTTP server is already accepting hook events), don't
+            # add the block to task.subagent_blocks — that lets the next
+            # refresh re-try as if fresh, instead of leaving a zombie block
+            # whose `message_id is None` blocks future edits.
             try:
                 block.message_id = await self._bot.post_embed(
                     embed, thread_id=task.thread_id
                 )
+            except BotNotReady:
+                logger.info(
+                    "bot not ready for subagent block %s; will retry on next refresh",
+                    agent_id,
+                )
+                return
             except Exception:
                 logger.exception(
                     "failed to post initial subagent block for %s", agent_id
                 )
+                return
+            task.subagent_blocks[agent_id] = block
             return
 
         if block.last_entry_uuid == last_uuid and block.finished_at is not None:
