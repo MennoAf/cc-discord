@@ -279,8 +279,8 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
                 ephemeral=True,
             )
             return
-        body = registry._render_task_list_body(task)
-        await interaction.followup.send(body, ephemeral=True)
+        embed = registry._render_task_list_embed(task)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     return tree
 

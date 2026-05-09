@@ -1192,7 +1192,7 @@ class TaskRegistry:
             return
         if not task.task_list_state:
             return
-        body = self._render_task_list_body(task)
+        embed = self._render_task_list_embed(task)
 
         # If our most recent task-list post is STILL the most recent
         # message in the thread (i.e. nothing else has been posted since),
@@ -1208,11 +1208,10 @@ class TaskRegistry:
                     await self._bot.edit_message(
                         task.thread_id,
                         task.last_task_list_message_id,
-                        content=body,
+                        embed=embed,
                     )
                     return
             except BotNotReady:
-                # Will retry next time TaskCreate/TaskUpdate fires.
                 return
             except Exception:
                 logger.exception(
@@ -1221,41 +1220,67 @@ class TaskRegistry:
                 )
 
         try:
-            ids = await self._bot.post(body, thread_id=task.thread_id)
-            if ids:
-                task.last_task_list_message_id = ids[0]
+            task.last_task_list_message_id = await self._bot.post_embed(
+                embed, thread_id=task.thread_id
+            )
         except BotNotReady:
             return
         except Exception:
             logger.exception("failed to post task list for task %s", task.task_id)
 
     @staticmethod
-    def _render_task_list_body(task: Task) -> str:
-        """Render the task_list_state mirror as a fenced checklist body."""
-        lines = ["**📋 Task list:**"]
+    def _render_task_list_embed(task: Task) -> discord.Embed:
+        """Render the task_list_state mirror as a Discord embed so it stands
+        apart from the thread's prose flow with a colored border."""
         # Sort by id; ids are typically integer-stringy so try numeric sort.
         def _sort_key(tid: str) -> tuple[int, int | str]:
             try:
                 return (0, int(tid))
             except ValueError:
                 return (1, tid)
+
+        lines: list[str] = []
+        total = 0
+        done = 0
+        in_progress = 0
         for tid in sorted(task.task_list_state.keys(), key=_sort_key):
             entry = task.task_list_state[tid]
             status = entry.get("status") or "pending"
             subject = (entry.get("subject") or "").strip()
-            mark = {
-                "completed": "✅",
-                "in_progress": "▶️",
-                "deleted": "🗑",
-            }.get(status, "⬜")
+            if status == "completed":
+                mark, done = "✅", done + 1
+            elif status == "in_progress":
+                mark, in_progress = "▶️", in_progress + 1
+            elif status == "deleted":
+                mark = "🗑"
+            else:
+                mark = "⬜"
+            total += 1
             line = f"{mark} #{tid}"
             if subject:
                 line += f" {subject}"
             lines.append(line)
-        body = "\n".join(lines)
-        if len(body) > 1900:
-            body = body[:1897] + "…"
-        return body
+
+        description = "\n".join(lines) or "_(no tasks)_"
+        if len(description) > 4000:
+            description = description[:3997] + "…"
+
+        # Color: green when everything's done, yellow if any in progress,
+        # otherwise neutral grey.
+        if total > 0 and done == total:
+            color = 0x57F287
+        elif in_progress > 0:
+            color = 0xFEE75C
+        else:
+            color = 0x95A5A6
+
+        embed = discord.Embed(
+            title="📋 Tasks",
+            description=description,
+            color=color,
+        )
+        embed.set_footer(text=f"{done}/{total} done")
+        return embed
 
     def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
         """Best-effort: did the most recent `tool_use` of `tool_name` come from
@@ -1488,6 +1513,15 @@ class TaskRegistry:
             uid = e.get("uuid")
             if not isinstance(uid, str) or uid in task.posted_assistant_uuids:
                 continue
+            # Mark posted BEFORE the async posts below — otherwise a
+            # concurrent _stream_assistant_progress call (e.g. from a
+            # second PostToolUse firing while we're still awaiting the
+            # bot.post for this uid) would also see uid as un-posted and
+            # send a duplicate. Trade-off: if our post fails, the entry
+            # is silently dropped instead of retried — acceptable since
+            # the post() retry-with-backoff already covers transient
+            # 5xx, and a permanent failure shouldn't trigger replays.
+            task.posted_assistant_uuids.add(uid)
             sidechain = e.get("isSidechain") is True
             prefix = "↳ " if sidechain else ""
 
@@ -1533,7 +1567,8 @@ class TaskRegistry:
                                 logger.exception(
                                     "failed to stream thinking for task %s", task.task_id
                                 )
-            task.posted_assistant_uuids.add(uid)
+            # uid was already added to posted_assistant_uuids at the top of
+            # the loop body to dedupe concurrent calls.
 
     @staticmethod
     def _format_thinking(text: str) -> str:
