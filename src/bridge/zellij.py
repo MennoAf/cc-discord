@@ -153,9 +153,14 @@ class ZellijManager:
         multiline = "\n" in body
 
         async with self._session_lock:
+            # 3s rather than the default 10s — these zellij actions are
+            # near-instant when the session is healthy. A 10s wait on a
+            # wedged session blocks the discord on_message coroutine
+            # for far longer than necessary.
             rc, _, stderr = await self._run_unlocked(
                 self._executable, "--session", SESSION_NAME,
                 "action", "go-to-tab-name", pane_id,
+                timeout=3.0,
             )
             if rc != 0:
                 raise ZellijError(f"go-to-tab-name {pane_id!r} failed: {stderr}")

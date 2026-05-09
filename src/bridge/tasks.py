@@ -788,7 +788,24 @@ class TaskRegistry:
             combined.count("\n") + 1,
             combined[:300] + ("…" if len(combined) > 300 else ""),
         )
-        await self._zellij.write_to_pane(task.zellij_pane_id, combined + "\n")
+        try:
+            await self._zellij.write_to_pane(task.zellij_pane_id, combined + "\n")
+        except ZellijError as e:
+            # zellij wedged or tab gone — let the user know in the thread
+            # instead of swallowing the message. Keep status as-is so they
+            # can /restart or /kill explicitly.
+            logger.exception("write_to_pane failed for task %s", task.task_id)
+            try:
+                await self._bot.post(
+                    f"⚠ Couldn't deliver your message — zellij command failed "
+                    f"(`{e}`). The task may be wedged; try `/restart` or `/kill`.",
+                    thread_id=task.thread_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to post wedge notice for task %s", task.task_id
+                )
+            return True  # consumed: don't fall through to /v1/ask listener
         task.last_activity = int(time.time())
         await self._persist(task)
         return True
