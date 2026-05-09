@@ -205,6 +205,14 @@ class Bot:
         Raises `BotNotReady` if the bot isn't connected yet. Transient
         Discord 5xx / connection errors are retried with backoff before
         propagating.
+
+        Partial-send semantics: each chunk is retried independently. If
+        chunk N exhausts its retry budget after chunks 1..N-1 already
+        landed, this call raises but the earlier chunks remain visible
+        in the thread. The caller has no way to know exactly how many
+        landed beyond inspecting the (incomplete) returned list before
+        the raise — so treat any exception from this method as
+        "message may have been partially delivered".
         """
         if not self.is_ready or self._channel is None:
             raise BotNotReady("bot not connected to Discord")

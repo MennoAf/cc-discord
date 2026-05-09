@@ -456,28 +456,31 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     await zellij.ensure_session_alive()
 
     conn = await state.open_db()
-    approval_router = ApprovalRouter(None, conn)  # type: ignore
-    task_registry = TaskRegistry(conn, None, zellij, approval_router)  # type: ignore
+    approval_router = ApprovalRouter(None, conn)
+    task_registry = TaskRegistry(conn, None, zellij, approval_router)
     await task_registry.load_from_db(reconcile_with_zellij=True)
 
-    # Create dispatcher with partially initialized components. The dispatcher will be
-    # called after bot is created (it updates task_registry._bot and approval_router._bot).
+    # Dispatcher closures call into approval_router/task_registry; both are
+    # available now. The Bot is constructed after these closures because Bot's
+    # constructor wires the callbacks up to discord.py event handlers.
     _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
 
-    async def _on_reaction_dispatch(payload):
+    bot_holder: dict[str, Bot] = {}
+
+    async def _on_reaction_dispatch(payload: discord.RawReactionActionEvent) -> None:
         """Dispatch raw reaction events to approval and TUI resolvers."""
-        user_is_self_bot = (payload.user_id == bot.client.user.id) if bot.client.user else False
-        # Try approval reactions first
+        bot_self = bot_holder.get("bot")
+        client_user = bot_self.client.user if bot_self and bot_self.client else None
+        user_is_self_bot = bool(client_user and payload.user_id == client_user.id)
         if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
             return
-        # Then try TUI reactions
         await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
+    bot_holder["bot"] = bot
 
-    # Update references to bot now that it's created
-    task_registry._bot = bot
-    approval_router._bot = bot
+    approval_router.bind_bot(bot)
+    task_registry.bind_bot(bot)
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry

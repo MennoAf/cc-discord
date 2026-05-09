@@ -50,7 +50,7 @@ MODEL_PRICES: dict[str, dict[str, float]] = {
 # Default context window in tokens, by model id. The 1M-context variants are
 # selected via the `[1m]` model alias at the user-settings level — the alias
 # isn't present in the transcript, so we infer it from `~/.claude/settings.json`
-# at module import time (see _detect_one_m_default).
+# (see `_detect_one_m_default`, called per `context_limit()`).
 MODEL_CONTEXT: dict[str, int] = {
     "claude-opus-4-7": 200_000,
     "claude-opus-4-6": 200_000,
@@ -77,9 +77,6 @@ def _detect_one_m_default() -> int | None:
     return None
 
 
-_USER_DEFAULT_CONTEXT_LIMIT: int | None = _detect_one_m_default()
-
-
 def context_limit(model: str | None) -> int | None:
     """Return the context window for `model`, in tokens.
 
@@ -87,6 +84,8 @@ def context_limit(model: str | None) -> int | None:
       1. `BRIDGE_CONTEXT_LIMIT` env var (always wins).
       2. User-default detected from ~/.claude/settings.json's `[1m]` alias —
          a user opted into a long-context build via that alias, so use it.
+         Re-read on each call so toggling the alias takes effect without a
+         daemon restart.
       3. `MODEL_CONTEXT[model]` if set.
       4. None — caller should skip the percentage display.
     """
@@ -96,8 +95,9 @@ def context_limit(model: str | None) -> int | None:
             return int(override)
         except ValueError:
             pass
-    if _USER_DEFAULT_CONTEXT_LIMIT is not None:
-        return _USER_DEFAULT_CONTEXT_LIMIT
+    user_default = _detect_one_m_default()
+    if user_default is not None:
+        return user_default
     if model and model in MODEL_CONTEXT:
         return MODEL_CONTEXT[model]
     return None

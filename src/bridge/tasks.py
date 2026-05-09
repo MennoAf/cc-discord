@@ -355,11 +355,17 @@ class TaskRegistry:
     def __init__(
         self,
         conn: aiosqlite.Connection,
-        bot: "Bot",
+        bot: "Bot | None",
         zellij: ZellijManager,
         approval_router: "ApprovalRouter | None" = None,
     ) -> None:
-        """Initialize with database connection, bot, zellij manager, and optional approval router."""
+        """Initialize with database connection, bot, zellij manager, and optional approval router.
+
+        `bot` may be None at construction time — `server.serve` builds the
+        registry before the Bot exists (load_from_db must run before the HTTP
+        server accepts requests, but the Bot logs in later) and calls
+        `bind_bot` once the Bot is constructed.
+        """
         self._conn = conn
         self._bot = bot
         self._zellij = zellij
@@ -372,9 +378,13 @@ class TaskRegistry:
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
         # Discord-side reconciliation notices staged by load_from_db. Flushed by
-        # flush_startup_notices() once the bot is ready — load_from_db must run
-        # before the HTTP server accepts requests, but the bot logs in later.
+        # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
+
+    def bind_bot(self, bot: "Bot") -> None:
+        """Attach the Bot instance after construction. Called once by
+        `server.serve` after the Bot is created."""
+        self._bot = bot
 
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.
@@ -684,10 +694,21 @@ class TaskRegistry:
                 current_claude_session_id=None,
                 current_transcript_path=None,
             )
-            # Clean up the task-scoped settings file
             _cleanup_task_artifacts(task_id)
-            # Phase 3 slash-command handler will see this crashed status.
-            # TODO: Phase 3 should clean up the Discord thread on failure.
+            # Surface the failure in the just-created Discord thread, then
+            # archive it so the user isn't left with an empty silent thread.
+            try:
+                await self._bot.post(
+                    "💥 Task failed to spawn — zellij couldn't open the pane. "
+                    "Check the bridge daemon log for details.",
+                    thread_id=thread_id,
+                )
+            except Exception:
+                logger.exception("failed to post spawn-failure notice for task %s", task_id)
+            try:
+                await self._archive_thread(thread_id)
+            except Exception:
+                logger.exception("failed to archive thread for failed spawn %s", task_id)
             raise
 
         # Update row with zellij_pane_id (bump last_activity)

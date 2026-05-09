@@ -80,12 +80,16 @@ class _PendingTuiAnswer:
 class ApprovalRouter:
     def __init__(
         self,
-        bot: Bot,
+        bot: Bot | None,
         conn: aiosqlite.Connection,
         *,
         timeout: float = DEFAULT_APPROVAL_TIMEOUT,
         tui_timeout: float = TUI_DEFAULT_TIMEOUT,
     ) -> None:
+        # `bot` may be None at construction time (server.serve constructs the
+        # router before the Bot exists, then calls `bind_bot` once it does)
+        # — this avoids a chicken-and-egg between Bot's reaction callback and
+        # the router that callback dispatches to.
         self._bot = bot
         self._conn = conn
         self._timeout = timeout
@@ -97,6 +101,11 @@ class ApprovalRouter:
         self._tui_by_thread_id: dict[int, list[_PendingTuiAnswer]] = {}
         self._recently_cancelled_threads: dict[int, float] = {}  # thread_id -> cancel_timestamp
         self._lock = asyncio.Lock()
+
+    def bind_bot(self, bot: Bot) -> None:
+        """Attach the Bot instance after construction. Called once by
+        `server.serve` after the Bot is created."""
+        self._bot = bot
 
     async def request_permission(
         self,
@@ -449,8 +458,16 @@ class ApprovalRouter:
         async with self._lock:
             pendings = self._tui_by_thread_id.get(thread_id, [])
             to_cancel = [p for p in pendings if not p.future.done()]
-            # Record this cancellation for late-arriving requests
-            self._recently_cancelled_threads[thread_id] = time.time()
+            now = time.time()
+            # Record this cancellation for late-arriving requests, and reap
+            # stale entries inline so the dict can't grow without bound when
+            # nothing else triggers _cleanup_tui's reaper.
+            self._recently_cancelled_threads = {
+                tid: ts
+                for tid, ts in self._recently_cancelled_threads.items()
+                if now - ts < 5.0
+            }
+            self._recently_cancelled_threads[thread_id] = now
         for p in to_cancel:
             if not p.future.done():
                 p.future.set_result(("", "cancelled"))
