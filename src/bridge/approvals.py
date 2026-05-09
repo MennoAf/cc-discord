@@ -355,9 +355,8 @@ class ApprovalRouter:
             idx = _NUMERIC_REACTIONS[emoji]
             if idx >= len(pending.options):
                 return False
-            # Inject the option's *number* (1-indexed) — Claude's AskUserQuestion TUI accepts
-            # the index. This is the simplest interop; the alternative (typing the label text)
-            # depends on how the TUI is currently parsing user input.
+            # Resolve with the option's 1-indexed number — Claude's
+            # AskUserQuestion TUI selects on numeric hot-key.
             pending.future.set_result((str(idx + 1), "reaction"))
             return True
 

@@ -617,7 +617,6 @@ class TaskRegistry:
                 await t
 
     def _agg_for(self, task: Task) -> _ToolSummaryAggregator:
-        """Lookup or create aggregator for a task."""
         agg = self._aggregators.get(task.task_id)
         if agg is None:
             agg = _ToolSummaryAggregator(self._bot, task.thread_id)
@@ -637,8 +636,10 @@ class TaskRegistry:
         8. Indexes the task in memory.
         9. Returns the Task.
 
-        The `prompt` parameter is accepted for forward compatibility but ignored
-        in Phase 2 — Phase 3 will call write_to_pane after SessionStart binding.
+        The `prompt` parameter is accepted but not used here — the slash-command
+        layer in `commands.py` waits for SessionStart binding and then calls
+        `write_initial_prompt` separately, since the pane isn't writable until
+        the per-task settings file is loaded by claude.
 
         Raises TaskSpawnError if cwd is not a directory or zellij spawn fails.
         """
@@ -1211,8 +1212,10 @@ class TaskRegistry:
         except Exception:
             logger.exception("failed to post stats footer for task %s", task.task_id)
 
-    # Max time to wait at Stop for the transcript file to stop growing
-    # (i.e., the writer to flush). Tests override to 0 to skip the wait.
+    # Max time to wait at Stop for the transcript writer to flush. Empirically,
+    # claude finishes writing the final assistant entry within 1-2s of Stop on
+    # short responses but can take 5-8s on long ones; 10s leaves headroom
+    # without delaying truly stuck cases too long. Tests override to 0.
     _STOP_TRANSCRIPT_RETRY_SECS: float = 10.0
 
     async def _wait_for_transcript_stable(
@@ -1220,6 +1223,9 @@ class TaskRegistry:
     ) -> None:
         """Wait until path's size hasn't changed for `stable_secs`, or budget elapses.
 
+        Polls at 50ms and considers the file "stable" once 250ms have passed
+        with no size change — generous enough to absorb a slow writer's
+        between-chunks pause, tight enough to avoid noticeable user lag.
         Bounded by `_STOP_TRANSCRIPT_RETRY_SECS`. No-op if file doesn't exist.
         """
         if not path.is_file():
@@ -1649,7 +1655,8 @@ class TaskRegistry:
         await self._refresh_subagent_blocks(task)
 
     async def _on_pre_compact(self, body: dict) -> None:
-        """Handle PreCompact event (no-op in Phase 1)."""
+        """Handle PreCompact event. No bridge-side action — claude rotates
+        the session_id at the next SessionStart, which is where we re-bind."""
         logger.debug("PreCompact received")
 
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:

@@ -390,9 +390,17 @@ def doctor() -> None:
         click.echo(f"[fail] task-settings dir — error: {e}", err=True)
         failed = True
 
-    # Check 9: hook scripts present and executable
+    # Check 9: hook scripts present and executable. Listed here:
+    #   - notify-stop / notify-notification: registered in the user's global
+    #     ~/.claude/settings.json (verified earlier in checks 5-6).
+    #   - event / pretooluse-approve: injected per-task by `_write_task_settings`.
     hooks_dir = Path(bridge.__file__).parent.parent.parent / "hooks"
-    hook_scripts = ["event.py", "pretooluse-approve.py"]
+    hook_scripts = [
+        "notify-stop.py",
+        "notify-notification.py",
+        "event.py",
+        "pretooluse-approve.py",
+    ]
     for script_name in hook_scripts:
         script_path = hooks_dir / script_name
         if script_path.exists() and os.access(script_path, os.X_OK):

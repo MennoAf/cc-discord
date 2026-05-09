@@ -200,10 +200,27 @@ def _format_edit_diff(path: str, old: str, new: str) -> str:
 
 
 def _diff_body(old: str, new: str) -> str:
-    return "\n".join(
-        [f"-{line}" for line in old.splitlines()]
-        + [f"+{line}" for line in new.splitlines()]
+    """Render a unified diff body (no file headers — caller adds those).
+
+    Uses `difflib.unified_diff` so additions/removals interleave per their
+    actual positions instead of dumping all `-`s followed by all `+`s,
+    which made small edits in long blocks unreadable.
+    """
+    import difflib
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old.splitlines(),
+            new.splitlines(),
+            n=3,  # 3 lines of context, like git's default
+            lineterm="",
+        )
     )
+    # `unified_diff` emits its own `--- ` / `+++ ` headers; strip them since
+    # our caller already produced ones with the file path attached.
+    while diff_lines and (diff_lines[0].startswith("--- ") or diff_lines[0].startswith("+++ ")):
+        diff_lines.pop(0)
+    return "\n".join(diff_lines)
 
 
 def _wrap_diff(body: str) -> str:

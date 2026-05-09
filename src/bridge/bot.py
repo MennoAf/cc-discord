@@ -43,7 +43,8 @@ async def _with_retry(label: str, factory: Callable[[], Awaitable[_T]]) -> _T:
 logger = logging.getLogger(__name__)
 
 
-# Lifted verbatim from /home/discord/victrola/src/discord_bot/bot.py:144-158.
+# Discord enforces 2000 chars per message; leave headroom for an attribution
+# header / future codes appended by the bot.
 MAX_CHUNK = 1900
 
 
@@ -64,10 +65,8 @@ def _chunk(text: str, limit: int = MAX_CHUNK) -> list[str]:
     return chunks
 
 
-# Lifted verbatim from /home/discord/victrola/src/discord_bot/bot.py:37-69.
-# Per-image cap. Discord allows up to 10MB on free; we match that. Very
-# large images will be quietly skipped with a log line rather than crash
-# the agent call.
+# Per-image cap. Matches Discord's free-tier upload limit. Larger files are
+# logged and skipped rather than crashing the agent call.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
@@ -129,7 +128,11 @@ class Bot:
         on_reaction: Callable[[discord.RawReactionActionEvent], Awaitable[None]] | None = None,
     ) -> None:
         intents = discord.Intents.default()
-        intents.message_content = True  # required for Phase 3 reply routing
+        # Privileged intent — required for `on_message` payloads to carry
+        # `content`, which the bridge reads to route Discord replies into
+        # the corresponding zellij pane. Must also be enabled on the bot
+        # user in the Discord Developer Portal.
+        intents.message_content = True
         self._client = discord.Client(intents=intents)
         self._token = token
         self._channel_id = channel_id

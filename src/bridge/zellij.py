@@ -85,7 +85,7 @@ class ZellijManager:
                     await proc.wait()
                 except Exception:
                     pass
-                raise ZellijError(f"Command timed out: {' '.join(argv)}")
+                raise ZellijError(f"Command timed out: {' '.join(argv)}") from None
 
             stdout, stderr = await proc.communicate()
             return (proc.returncode, stdout.decode(), stderr.decode())

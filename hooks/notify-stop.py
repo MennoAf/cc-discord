@@ -61,38 +61,36 @@ def _try_webhook_fallback(msg: str) -> None:
 
 def _find_last_user_prompt_timestamp(transcript_path: Path) -> str | None:
     """
-    Parse the transcript JSONL and return the timestamp of the last user message.
-    Returns None if no valid user message is found or if the file is malformed.
+    Return the timestamp of the most recent real user message in the transcript.
+    Reads the file once into a list and walks backward, stopping at the first
+    match — O(scan-from-end) rather than O(N) walk-and-overwrite. Important
+    because Stop fires often and transcripts grow unbounded over a long
+    session.
     """
     try:
         with open(transcript_path) as f:
-            last_ts = None
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    # Malformed line — skip and continue
-                    continue
-
-                # Filter: type == "user", isSidechain == false, isMeta != true, message.content is str
-                if (
-                    entry.get("type") == "user"
-                    and entry.get("isSidechain", False) is False
-                    and entry.get("isMeta", False) is not True
-                ):
-                    msg = entry.get("message")
-                    if isinstance(msg, dict):
-                        content = msg.get("content")
-                        if isinstance(content, str):
-                            ts = entry.get("timestamp")
-                            if ts:
-                                last_ts = ts
-            return last_ts
+            lines = f.readlines()
     except (IOError, OSError):
         return None
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if (
+            entry.get("type") == "user"
+            and entry.get("isSidechain", False) is False
+            and entry.get("isMeta", False) is not True
+        ):
+            msg = entry.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                ts = entry.get("timestamp")
+                if ts:
+                    return ts
+    return None
 
 
 def main() -> None:

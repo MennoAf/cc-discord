@@ -46,22 +46,10 @@ class ApprovalLogRow:
     decided_at: int
 
 
-async def open_db(path: Path = DEFAULT_DB_PATH) -> aiosqlite.Connection:
-    """Open SQLite database, initializing schema if needed.
-
-    Creates parent directories if missing. Sets WAL mode for concurrent access.
-    Returns a ready-to-use aiosqlite.Connection.
-    """
-    # Create parent directory
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Open connection
-    conn = await aiosqlite.connect(path)
-
-    # Set WAL mode
+async def init_schema(conn: aiosqlite.Connection) -> None:
+    """Create the schema (idempotent — uses CREATE TABLE IF NOT EXISTS).
+    Public so tests/conftest.py can reuse it without duplicating SQL."""
     await conn.execute("PRAGMA journal_mode=WAL")
-
-    # Initialize schema if it doesn't exist
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -71,7 +59,6 @@ async def open_db(path: Path = DEFAULT_DB_PATH) -> aiosqlite.Connection:
             last_activity INTEGER NOT NULL
         )
     """)
-
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
@@ -91,7 +78,6 @@ async def open_db(path: Path = DEFAULT_DB_PATH) -> aiosqlite.Connection:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(current_claude_session_id)"
     )
-
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS approval_log (
             request_id TEXT PRIMARY KEY,
@@ -107,9 +93,18 @@ async def open_db(path: Path = DEFAULT_DB_PATH) -> aiosqlite.Connection:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_approval_log_task_id ON approval_log(task_id)"
     )
-
     await conn.commit()
 
+
+async def open_db(path: Path = DEFAULT_DB_PATH) -> aiosqlite.Connection:
+    """Open SQLite database, initializing schema if needed.
+
+    Creates parent directories if missing. Sets WAL mode for concurrent access.
+    Returns a ready-to-use aiosqlite.Connection.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = await aiosqlite.connect(path)
+    await init_schema(conn)
     return conn
 
 
