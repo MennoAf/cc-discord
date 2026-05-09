@@ -1082,14 +1082,14 @@ class TaskRegistry:
         tool_input = body.get("tool_input", {}) or {}
         tool_response = body.get("tool_response", {}) or {}
 
-        line = tool_summary.summarize(tool_name, tool_input, tool_response)
-        self._agg_for(task).append(line)
-        await self._post_tool_diff(task, tool_name, tool_input)
-
-        # Mirror claude's session task list as it mutates. TaskCreate /
-        # TaskUpdate trigger a debounced repost; TaskList silently syncs
-        # the mirror without posting.
-        if tool_name in ("TaskCreate", "TaskUpdate", "TaskList"):
+        # TaskCreate / TaskUpdate / TaskList don't get inline aggregator
+        # lines — the debounced full-list block already shows their effect,
+        # and the inline lines duplicate that.
+        if tool_name not in ("TaskCreate", "TaskUpdate", "TaskList"):
+            line = tool_summary.summarize(tool_name, tool_input, tool_response)
+            self._agg_for(task).append(line)
+            await self._post_tool_diff(task, tool_name, tool_input)
+        else:
             self._update_task_list_state(task, tool_name, tool_input, tool_response)
             if tool_name in ("TaskCreate", "TaskUpdate"):
                 self._schedule_task_list_post(task)
@@ -1242,13 +1242,16 @@ class TaskRegistry:
         for tid in sorted(task.task_list_state.keys(), key=_sort_key):
             entry = task.task_list_state[tid]
             status = entry.get("status") or "pending"
-            subject = entry.get("subject") or "(no subject)"
+            subject = (entry.get("subject") or "").strip()
             mark = {
                 "completed": "✅",
                 "in_progress": "▶️",
                 "deleted": "🗑",
             }.get(status, "⬜")
-            lines.append(f"{mark} #{tid} {subject}")
+            line = f"{mark} #{tid}"
+            if subject:
+                line += f" {subject}"
+            lines.append(line)
         body = "\n".join(lines)
         if len(body) > 1900:
             body = body[:1897] + "…"
