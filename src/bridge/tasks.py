@@ -146,12 +146,20 @@ def _write_task_layout(
     *,
     env: dict[str, str],
     claude_argv: list[str],
+    tab_name: str,
     settings_dir: Path = TASK_SETTINGS_DIR,
 ) -> Path:
     """Generate a zellij KDL layout file that opens the new tab with a
     single pane running `env K=V ... claude <argv>`. Used so the tab spawns
     with claude as the only pane — no default shell pane to close
     afterward.
+
+    The layout wraps the pane in `tab name="..."` so the tab gets the
+    bridge-expected name (`cc-<task_id_prefix>`), since `new-tab --layout`
+    sources the tab name from the layout when the layout's outer node is
+    `tab`. `close_on_exit` is a CHILD node on the pane — zellij's KDL
+    treats `close_on_exit=true` as an attribute on a different syntax
+    branch and the boolean child is what actually gates the tab close.
 
     Returns the absolute path written.
     """
@@ -172,8 +180,11 @@ def _write_task_layout(
 
     layout = (
         "layout {\n"
-        '    pane command="env" close_on_exit=true {\n'
-        f"        args {args_line}\n"
+        f'    tab name={_kdl_quote(tab_name)} focus=true {{\n'
+        '        pane command="env" {\n'
+        f"            args {args_line}\n"
+        "            close_on_exit true\n"
+        "        }\n"
         "    }\n"
         "}\n"
     )
@@ -746,18 +757,21 @@ class TaskRegistry:
 
         # Generate a zellij layout that opens the new tab as a single
         # claude pane (no default shell). claude_argv is what runs after
-        # `env K=V ...`.
+        # `env K=V ...`. `tab_name` matches what we'll use to address the
+        # tab via `go-to-tab-name` later.
+        tab_name = f"cc-{task_id[:8]}"
         layout_path = _write_task_layout(
             task_id,
             env=env,
             claude_argv=["--settings", str(settings_path)],
+            tab_name=tab_name,
         )
 
         # Spawn via zellij; on failure, mark the task as crashed and re-raise
         try:
             pane_id = await self._zellij.spawn_task(
                 cwd=cwd,
-                pane_name=f"cc-{task_id[:8]}",
+                pane_name=tab_name,
                 layout_path=str(layout_path),
             )
         except ZellijError:
@@ -2372,6 +2386,7 @@ class TaskRegistry:
         # Spawn a fresh pane with the resumed session.
         settings_path = _write_task_settings(task.task_id)
         env = self._build_spawn_env(task.task_id)
+        tab_name = f"cc-{task.task_id[:8]}"
         layout_path = _write_task_layout(
             task.task_id,
             env=env,
@@ -2379,10 +2394,11 @@ class TaskRegistry:
                 "--settings", str(settings_path),
                 "--resume", task.current_claude_session_id,
             ],
+            tab_name=tab_name,
         )
         new_pane_id = await self._zellij.spawn_task(
             cwd=task.cwd,
-            pane_name=f"cc-{task.task_id[:8]}",
+            pane_name=tab_name,
             layout_path=str(layout_path),
         )
         task.zellij_pane_id = new_pane_id
