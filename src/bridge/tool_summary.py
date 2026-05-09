@@ -94,6 +94,50 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
         return f"{emoji} TodoWrite: {done}/{len(todos)} done"
 
+    if tool_name == "TaskCreate":
+        # Claude Code's session-task tracker — separate from the Task tool
+        # (subagent dispatch). Surface the subject so users can follow what
+        # claude is planning.
+        subject = tool_input.get("subject") or "?"
+        emoji = _EMOJI_FAIL if failed else "📋"
+        return f"{emoji} TaskCreate: {_truncate(subject, 100)}"
+
+    if tool_name == "TaskUpdate":
+        task_id = tool_input.get("taskId") or "?"
+        bits: list[str] = []
+        for key in ("status", "subject", "owner"):
+            val = tool_input.get(key)
+            if isinstance(val, str) and val:
+                bits.append(f"{key}={val}")
+        detail = ", ".join(bits) if bits else "no-op"
+        emoji = _EMOJI_FAIL if failed else "📋"
+        return f"{emoji} TaskUpdate: #{task_id} {_truncate(detail, 100)}"
+
+    if tool_name == "TaskList":
+        emoji = _EMOJI_FAIL if failed else "📋"
+        return f"{emoji} TaskList"
+
+    if tool_name == "TaskGet":
+        task_id = tool_input.get("taskId") or "?"
+        emoji = _EMOJI_FAIL if failed else "📋"
+        return f"{emoji} TaskGet: #{task_id}"
+
+    if tool_name == "EnterWorktree":
+        # Surface the chosen branch / slug so the thread shows where claude
+        # ended up working.
+        slug = (
+            tool_input.get("branch")
+            or tool_input.get("slug")
+            or tool_input.get("name")
+            or "?"
+        )
+        emoji = _EMOJI_FAIL if failed else "🌿"
+        return f"{emoji} EnterWorktree: {_truncate(str(slug), 80)}"
+
+    if tool_name == "ExitWorktree":
+        emoji = _EMOJI_FAIL if failed else "🌿"
+        return f"{emoji} ExitWorktree"
+
     # Generic fallback
     emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
     return f"{emoji} {tool_name}"
