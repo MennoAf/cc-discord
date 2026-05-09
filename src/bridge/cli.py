@@ -18,6 +18,7 @@ import bridge
 from bridge.bot import Bot
 from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets, secrets_file_perms
 from bridge.server import serve as serve_server
+from bridge.zellij import SESSION_NAME as ZELLIJ_SESSION_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -355,19 +356,23 @@ def doctor() -> None:
     # Check 7: bridge zellij session exists
     try:
         result = subprocess.run(["zellij", "list-sessions"], capture_output=True, timeout=5, text=True)
-        if "bridge" in result.stdout:
-            click.echo("[ok] bridge zellij session — running")
+        if ZELLIJ_SESSION_NAME in result.stdout:
+            click.echo(f"[ok] zellij session `{ZELLIJ_SESSION_NAME}` — running")
         else:
-            click.echo("[warn] bridge zellij session — not running yet (will be created on first /start)", err=True)
+            click.echo(
+                f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — not running yet "
+                "(will be created on first /start)",
+                err=True,
+            )
             warned = True
     except FileNotFoundError:
-        click.echo("[warn] bridge zellij session — cannot check (zellij not installed)", err=True)
+        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — cannot check (zellij not installed)", err=True)
         warned = True
     except subprocess.TimeoutExpired:
-        click.echo("[warn] bridge zellij session — timeout checking sessions", err=True)
+        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — timeout checking sessions", err=True)
         warned = True
     except Exception as e:
-        click.echo(f"[warn] bridge zellij session — error: {e}", err=True)
+        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — error: {e}", err=True)
         warned = True
 
     # Check 8: task-settings dir writable

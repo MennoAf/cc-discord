@@ -14,53 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-
-# Cap on how many recent subagent actions we render in a block.
-_SUBAGENT_BLOCK_MAX_ACTIONS = 5
-# Don't edit a block's Discord message more often than this; coalesces
-# bursty subagent activity into chunkier updates and keeps us under
-# Discord's per-channel edit rate limit (~5 edits / 5s).
-_SUBAGENT_EDIT_THROTTLE_SECS = 1.5
-
-
-@dataclass
-class SubagentBlock:
-    """Per-subagent live-updating Discord message: tracks state for one
-    subagent (identified by `agent_id`) so we can edit a single message in
-    place as the subagent runs, instead of streaming each tool call as its
-    own message.
-    """
-
-    agent_id: str
-    attribution: str  # e.g. "ed3d-research-agents:internet-researcher"
-    started_at: float
-    message_id: int | None = None
-    finished_at: float | None = None
-    last_entry_uuid: str | None = None  # change-detection key
-    last_edit_at: float = 0.0  # throttle edits
-
-
-# Marker convention agents use to attach files back to the Discord thread.
-# Example: `[[attach: /tmp/screenshot.png]]` in a streamed text block.
-_ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
-# Discord per-message attachment cap.
-_MAX_ATTACHMENTS_PER_POST = 10
-
-
-def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
-    """Strip `[[attach: <path>]]` markers from text and return the cleaned
-    text plus the list of resolved file paths (must be absolute & exist)."""
-    paths: list[Path] = []
-    for match in _ATTACH_MARKER.finditer(text):
-        candidate = Path(match.group(1).strip())
-        if candidate.is_absolute() and candidate.is_file():
-            paths.append(candidate)
-        else:
-            logger.info("attach marker skipped (not absolute / missing): %r", str(candidate))
-    cleaned = _ATTACH_MARKER.sub("", text).strip()
-    return cleaned, paths[:_MAX_ATTACHMENTS_PER_POST]
-
 import aiosqlite
+import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
@@ -81,6 +36,50 @@ ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "
 
 # Hook scripts directory — resolved at import time for test monkeypatch support
 HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
+
+# Cap on how many recent subagent actions we render in a block.
+_SUBAGENT_BLOCK_MAX_ACTIONS = 5
+# Don't edit a block's Discord message more often than this; coalesces
+# bursty subagent activity into chunkier updates and keeps us under
+# Discord's per-channel edit rate limit (~5 edits / 5s).
+_SUBAGENT_EDIT_THROTTLE_SECS = 1.5
+
+# Marker convention agents use to attach files back to the Discord thread.
+# Example: `[[attach: /tmp/screenshot.png]]` in a streamed text block.
+_ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
+# Discord per-message attachment cap.
+_MAX_ATTACHMENTS_PER_POST = 10
+
+
+@dataclass
+class SubagentBlock:
+    """Per-subagent live-updating Discord message: tracks state for one
+    subagent (identified by `agent_id`) so we can edit a single message in
+    place as the subagent runs, instead of streaming each tool call as its
+    own message.
+    """
+
+    agent_id: str
+    attribution: str  # e.g. "ed3d-research-agents:internet-researcher"
+    started_at: float
+    message_id: int | None = None
+    finished_at: float | None = None
+    last_entry_uuid: str | None = None  # change-detection key
+    last_edit_at: float = 0.0  # throttle edits
+
+
+def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
+    """Strip `[[attach: <path>]]` markers from text and return the cleaned
+    text plus the list of resolved file paths (must be absolute & exist)."""
+    paths: list[Path] = []
+    for match in _ATTACH_MARKER.finditer(text):
+        candidate = Path(match.group(1).strip())
+        if candidate.is_absolute() and candidate.is_file():
+            paths.append(candidate)
+        else:
+            logger.info("attach marker skipped (not absolute / missing): %r", str(candidate))
+    cleaned = _ATTACH_MARKER.sub("", text).strip()
+    return cleaned, paths[:_MAX_ATTACHMENTS_PER_POST]
 
 
 def _write_task_settings(
@@ -1206,7 +1205,7 @@ class TaskRegistry:
             return
         if self._STOP_TRANSCRIPT_RETRY_SECS <= 0:
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + self._STOP_TRANSCRIPT_RETRY_SECS
         last_size = -1
         stable_since: float | None = None
@@ -1492,9 +1491,7 @@ class TaskRegistry:
         last_actions: list[str],
         total_actions: int,
         finished: bool,
-    ) -> "discord.Embed":
-        import discord  # local import to avoid widening the module's surface
-
+    ) -> discord.Embed:
         status = "finished" if finished else "running"
         # finished_at may not have been set yet on the first observed-finished
         # refresh; fall back to now to avoid a None subtraction.

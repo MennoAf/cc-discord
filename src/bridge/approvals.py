@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,9 +66,13 @@ class _PendingTuiAnswer:
     task_id: str
     thread_id: int
     pane_id: str
-    kind: str  # "ask_question" | "exit_plan" | "free_text"
-    options: list[str]  # [] for free_text and exit_plan; option labels for ask_question
-    future: asyncio.Future  # resolves to (answer_text: str, source: "reaction"|"reply"|"zellij")
+    kind: str  # "ask_question" | "multi_select" | "exit_plan" | "free_text"
+    options: list[str]  # [] for free_text/exit_plan; option labels for ask_question/multi_select
+    # Future resolves to (answer, source). `answer` is `str` for ask_question /
+    # exit_plan / free_text, and `list[int]` (0-based selected indices) for
+    # multi_select. `source` is one of "reaction" | "reply" | "cancelled" |
+    # "timeout" | "post_failed".
+    future: asyncio.Future
     message_id: int | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -403,6 +408,27 @@ class ApprovalRouter:
             return False
         # Most recently created wins
         pending = max(candidates, key=lambda p: p.created_at)
+
+        # multi_select expects list[int] selected indices. Parse comma- /
+        # space- / newline-separated digits from the text. If none parse,
+        # we still resolve (with an empty list) so the user can type "skip"
+        # or similar to advance with no selections — preferable to silently
+        # black-holing the message.
+        if pending.kind == "multi_select":
+            indices: list[int] = []
+            for token in re.split(r"[\s,]+", text.strip()):
+                if not token:
+                    continue
+                try:
+                    n = int(token)
+                except ValueError:
+                    continue
+                idx = n - 1  # users type 1-based numbers
+                if 0 <= idx < len(pending.options) and idx not in indices:
+                    indices.append(idx)
+            pending.future.set_result((sorted(indices), "reply"))
+            return True
+
         # For exit_plan we always treat text as the comment body.
         # For ask_question we treat text as the typed answer (could be a number or a free-form
         # answer; inject literally — Claude's TUI parses).
