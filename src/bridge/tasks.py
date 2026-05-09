@@ -327,6 +327,10 @@ class Task:
     # Debounce handle so a burst of TaskCreate/TaskUpdate events coalesces
     # into a single Discord post 1s after the last event.
     task_list_post_timer: asyncio.Task | None = None
+    # Discord message id of the most recent task-list post. If it's still
+    # the last message in the thread when the next post fires, we edit
+    # it in place instead of posting a duplicate.
+    last_task_list_message_id: int | None = None
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -941,6 +945,7 @@ class TaskRegistry:
         task.posted_assistant_uuids.clear()
         task.subagent_blocks.clear()
         task.task_list_state.clear()
+        task.last_task_list_message_id = None
         if task.task_list_post_timer is not None and not task.task_list_post_timer.done():
             task.task_list_post_timer.cancel()
             task.task_list_post_timer = None
@@ -1187,8 +1192,34 @@ class TaskRegistry:
         if not task.task_list_state:
             return
         body = self._render_task_list_body(task)
+
+        # If our most recent task-list post is STILL the most recent
+        # message in the thread (i.e. nothing else has been posted since),
+        # edit it in place to avoid stacking duplicate-looking messages.
+        # Otherwise post a fresh one — that way the latest state is
+        # always the bottom-most thing in the thread when activity has
+        # moved on past the previous render.
+        if task.last_task_list_message_id is not None:
+            try:
+                channel = await self._bot.fetch_messageable(task.thread_id)
+                last_id = getattr(channel, "last_message_id", None)
+                if last_id == task.last_task_list_message_id:
+                    await self._bot.edit_message(
+                        task.thread_id,
+                        task.last_task_list_message_id,
+                        content=body,
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "task-list edit-in-place check failed for task %s; posting fresh",
+                    task.task_id,
+                )
+
         try:
-            await self._bot.post(body, thread_id=task.thread_id)
+            ids = await self._bot.post(body, thread_id=task.thread_id)
+            if ids:
+                task.last_task_list_message_id = ids[0]
         except Exception:
             logger.exception("failed to post task list for task %s", task.task_id)
 
