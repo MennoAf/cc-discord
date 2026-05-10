@@ -122,7 +122,7 @@ If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl 
 uv tool install .   # places `claude-discord-bridge` at ~/.local/bin/
 ```
 
-Write `~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`, replacing `<you>` with your home dir leaf:
+Write `~/Library/LaunchAgents/local.claude-discord-bridge.plist`, replacing `<you>` with your home dir leaf:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -130,7 +130,7 @@ Write `~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`, repla
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.brokentoys.claude-discord-bridge</string>
+    <string>local.claude-discord-bridge</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/<you>/.local/bin/claude-discord-bridge</string>
@@ -153,10 +153,10 @@ Write `~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`, repla
 
 Load it:
 ```bash
-launchctl load -w ~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist
+launchctl load -w ~/Library/LaunchAgents/local.claude-discord-bridge.plist
 ```
 
-`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/claude-discord-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`.
+`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/claude-discord-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/local.claude-discord-bridge.plist`.
 
 ### 7. Verify
 
