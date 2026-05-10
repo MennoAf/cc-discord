@@ -1,14 +1,22 @@
 # claude-discord-bridge
 
-Localhost HTTP bridge between Claude Code sessions and Discord. Long turns ping your phone, permission prompts surface in a thread, and Claude can `/ask-discord <question>` when it's blocked and you're away from the keyboard.
+Localhost HTTP bridge between Claude Code sessions and Discord. Long turns ping your phone, permission prompts surface in a thread, Claude can `/ask-discord <question>` when it's blocked, and you can drive whole Claude sessions from Discord slash commands without ever attaching to the terminal.
 
 ## What it does
 
-Runs as a small Python daemon (`aiohttp` + `discord.py`) on `127.0.0.1:8787`. Three things hang off it:
+Runs as a small Python daemon (`aiohttp` + `discord.py`) on `127.0.0.1:8787`. Two modes, share one daemon:
 
-- **Stop hook** — `~/.claude/hooks/notify-long-task.sh` is replaced by a Python script that pings Discord when a Claude turn took >10 minutes. Result lands in a per-session thread instead of the channel root.
+**Notification mode** (you run Claude in your terminal, the bridge listens):
+- **Stop hook** — Pings Discord when a Claude turn took >10 minutes. Result lands in a per-session thread.
 - **Notification hook** — Permission prompts and idle states surface as `⏸ awaiting input` in the same thread.
-- **`/ask-discord` skill** — Claude calls this when blocked on a decision; the question lands in the thread, the daemon waits up to 15 minutes for your reply, and Claude continues with whatever you say.
+- **`/ask-discord` skill** — Claude calls this when blocked; the question lands in the thread, the daemon waits up to 15 min for your reply, and Claude continues.
+
+**Discord-driven mode** (`/start` from Discord spawns Claude in a zellij tab):
+- Slash commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`.
+- The bridge mirrors assistant text, tool use (with fenced diffs for Edit/Write), subagent activity (live-updated embed per agent), and the session's task list back to its thread.
+- Discord replies in the thread relay into the pane; attachments are saved and their paths get inlined into the prompt so Claude reads them with the `Read` tool. Voice memos are auto-transcribed (Wispr Flow API or local `whisper`).
+- `AskUserQuestion` and `ExitPlanMode` round-trip through Discord reactions / text replies — no need to attach to the pane to answer.
+- The agent can attach files back by emitting `[[attach: /absolute/path]]` markers in its replies.
 
 A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallback when the daemon isn't running, so you don't lose pings if you forgot to start it.
 
@@ -67,6 +75,8 @@ Replace `/home/<you>/claude-discord-bridge` with the actual repo path. Validate 
 
 If you already use `~/.claude/hooks/notify-long-task.sh` (or any other Stop hook), keep it on disk as rollback insurance — both hooks can coexist; this one just supersedes it.
 
+These two hooks cover **notification mode**. **Discord-driven mode** (sessions spawned via `/start`) gets a different set of hooks injected via `claude --settings <task-scoped-path>` automatically — you don't add them to your user `settings.json`. The task-scoped settings file is generated per `/start` invocation and cleaned up when the task ends. See the `Discord-driven sessions` section below.
+
 ### 4. Install the `/ask-discord` skill
 
 Claude Code discovers skills under `~/.claude/skills/<name>/SKILL.md`. The bridge ships the source-of-truth markdown in the repo; symlink it into place:
@@ -111,11 +121,11 @@ If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl 
 ```bash
 uv run claude-discord-bridge doctor
 ```
-You should see `[ok]` for each of: secrets file present, secrets file mode `0600`, daemon health, settings.json hooks, skill symlink. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
+You should see `[ok]` for each check: secrets file present + 0600, daemon health, settings.json hooks, `/ask-discord` skill symlink, `zellij` installed, bridge session reachable, task-settings dir writable, hook scripts present, `claude` on PATH. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
 
-## Usage
+## Usage — notification mode
 
-Once the daemon is running, the four surfaces work without further intervention:
+Once the daemon is running, these surfaces work without further intervention:
 
 | Surface | Trigger |
 |---|---|
@@ -130,47 +140,65 @@ Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` alwa
 
 ## Discord-driven sessions
 
-As an alternative to the hooks-based flow, the bridge also supports spawning Claude Code sessions directly from Discord slash commands. This is useful when you want Claude to run autonomously in a known working directory, with all output (typing, tool calls, final turn) automatically relayed back to Discord.
+Spawning Claude Code sessions directly from Discord slash commands. Each task is one zellij tab in a shared session; the bridge injects task-scoped hooks via `claude --settings <path>` so it can mirror everything back to a per-task thread.
 
 ### Slash commands
 
-- `/start cwd:<path>` — Spawn a new Claude session in the given directory, opening a dedicated zellij pane and Discord thread.
-- `/list` — Show all active tasks (running, spawning, or stopped).
-- `/stop <task-id>` — Gracefully stop the Claude session (sends `/stop` to the pane; archives the thread on exit).
-- `/kill <task-id>` — Forcefully close the pane (marks task as crashed; archives the thread immediately).
-- `/restart <task-id>` — Resume a stopped task (spawns a new pane with `claude --resume <session>`).
+| Command | What it does |
+|---|---|
+| `/start cwd:<path> [prompt:<text>]` | Spawn a new Claude session in `cwd`, opens a fresh thread, optionally writes the initial prompt after bind. |
+| `/list` | List active tasks with status, cwd leaf, age, and thread link. |
+| `/stop [thread:<#thread>]` | Graceful stop — writes `/exit` to the pane, archives the thread on session end. |
+| `/kill [thread:<#thread>]` | Force-close the pane — marks the task crashed, archives the thread. |
+| `/restart [thread:<#thread>]` | Resume a stopped task via `claude --resume <session_id>`; reuses the existing pane if alive, otherwise spawns a fresh one. |
+| `/skill <name> [args:<text>]` | Type `/<name> [args]` into the running session. Autocomplete shows installed user + plugin skills. |
+| `/rename [name:<text>]` | Rename the thread; omit `name` to auto-generate via `claude -p` against the transcript. |
+| `/stats [thread:<#thread>]` | Token / cost / context-fill stats for the task, parsed from its transcript. |
+| `/tasks [thread:<#thread>]` | Show the session's `TaskCreate`/`TaskUpdate` mirror as an embed. |
 
-### Task lifecycle
+Commands without an explicit `thread:` argument operate on the task whose thread you're invoking from.
 
-1. `/start` creates a Discord thread and spawns Claude in a zellij pane.
-2. The pane is tagged with a unique `CC_DISCORD_TASK_ID` environment variable.
-3. The bridge hooks fire on every event: `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`.
-4. Output is relayed: typing indicator → Discord message for tool summaries → final turn posted on `Stop`.
-5. On `/stop` or `/kill`, the task is marked stopped/crashed and the thread is archived.
-6. On `/restart`, a new pane resumes the same session ID.
+### What gets mirrored to the thread
+
+- Assistant text and `thinking` blocks at each tool boundary (deduped by entry uuid).
+- Tool use as one-liner summaries, coalesced into bursts; `Edit` / `MultiEdit` / `Write` get a separate fenced-diff block; `TodoWrite` gets a checklist.
+- Subagent activity rolls up into one live-edited embed per agent (yellow while running → green when finished).
+- `AskUserQuestion` posts each question with reaction-based options (single- or multi-select); `ExitPlanMode` posts the plan with ✅/❌. Free-text replies in the thread also work.
+- Voice memos are transcribed (Wispr Flow API if `WISPR_FLOW_API_TOKEN` is set, otherwise local `whisper` CLI) and inlined as `[voice memo] <text>` in the relayed prompt.
+- Discord file attachments are saved under `~/.local/state/claude-discord-bridge/attachments/<task_id>/` and their absolute paths are appended to the prompt, one per line.
+- Token / cost / context-fill summary posts after every `Stop`.
 
 ### One-time setup
 
-Before using slash commands:
-
-1. **Install `zellij`** (terminal multiplexer):
+1. **Install `zellij` ≥ 0.44** (older versions have a teardown-race panic that takes down the whole session):
    ```bash
+   nix-env -iA nixpkgs.zellij   # nix
    brew install zellij           # macOS
-   cargo install zellij          # Linux (Rust toolchain required)
+   cargo install zellij          # build from source
    ```
    Verify: `zellij --version`
 
-2. **Bridge session**
-   The bridge auto-creates a shared `bridge` zellij session on first `/start`. To attach and watch panes:
+2. **Pick a session name** (optional). The bridge defaults to `meow`; override by exporting `BRIDGE_ZELLIJ_SESSION=<name>` before starting the daemon. To attach and watch tabs:
    ```bash
-   zellij attach bridge
+   zellij attach meow
    ```
 
-3. **Settings directory**
-   The bridge writes per-task settings files at `~/.local/state/claude-discord-bridge/task-settings/<task_id>.json` (cleaned up when the task ends). Ensure this directory is writable:
-   ```bash
-   mkdir -p ~/.local/state/claude-discord-bridge/task-settings
-   ```
+3. **State directories** are auto-created under `~/.local/state/claude-discord-bridge/` (task-settings, attachments, the SQLite db). No manual setup needed.
+
+4. **Optional: get `@`-mentioned when claude is stuck**. Export `BRIDGE_NOTIFY_USER_ID=<your-discord-user-id>` so AskUserQuestion / ExitPlanMode / free-text-stall prompts prefix with a mention.
+
+### Configuration env vars
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BRIDGE_URL` | `http://127.0.0.1:8787` | Where hooks POST events. Override only if you run the daemon on a non-default port. |
+| `BRIDGE_ZELLIJ_SESSION` | `meow` | zellij session name the bridge spawns task tabs into. |
+| `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. |
+| `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
+| `BRIDGE_CONTEXT_LIMIT` | _(model default)_ | Override the per-model context window for `/stats` math (e.g. `1000000` for `[1m]`). |
+| `WISPR_FLOW_API_TOKEN` | _(unset)_ | If set, voice memos use Wispr Flow's API; otherwise local `whisper`. |
+| `BRIDGE_WHISPER_BIN` | `whisper` | Override the local-whisper binary path. |
+| `BRIDGE_WHISPER_MODEL` | `base` | Whisper model size. |
 
 ### Verify setup
 
@@ -178,36 +206,46 @@ Before using slash commands:
 uv run claude-discord-bridge doctor
 ```
 
-The new checks (Checks 6-10) verify `zellij` is installed, the `bridge` session reachable, the task-settings directory writable, hook scripts present, and `claude` on PATH.
+Runs ten checks: secrets file present + 0600, daemon health, settings.json hooks (Stop/Notification), `/ask-discord` skill symlink, `zellij` installed, bridge session reachable, task-settings dir writable, all hook scripts present, `claude` on PATH.
 
 ## Architecture
 
-Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one asyncio event loop. Per-session thread mapping lives in SQLite. Reply routing uses a per-thread `asyncio.Lock` (FIFO) plus a sliding 3-second coalescing window so multi-message replies fold into one response.
+Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one asyncio event loop. Per-session thread mapping lives in SQLite (WAL). Reply routing uses a per-thread `asyncio.Lock` (FIFO) plus a sliding 3-second coalescing window so multi-message replies fold into one response.
 
 | File | Role |
 |---|---|
-| `src/bridge/server.py` | aiohttp app, `/v1/notify`, `/v1/ask`, `/v1/health` |
-| `src/bridge/bot.py` | discord.py wrapper, chunked send, on_message dispatch |
+| `src/bridge/server.py` | aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse` |
+| `src/bridge/bot.py` | discord.py wrapper — chunked send, retries on 5xx, `on_message` dispatch, embed edits |
 | `src/bridge/threads.py` | session_id → thread_id with create-on-miss + recreate-on-404 |
 | `src/bridge/listener.py` | Pending-ask state, sliding coalescing window, future lifecycle |
-| `src/bridge/state.py` | aiosqlite, sessions table |
+| `src/bridge/state.py` | aiosqlite — `sessions`, `tasks`, `approval_log` tables |
 | `src/bridge/secrets.py` | 0600 JSON loader/writer |
 | `src/bridge/cli.py` | click CLI: `init`, `serve`, `doctor` |
-| `hooks/notify-stop.py` | Stop hook (long-turn ping) |
-| `hooks/notify-notification.py` | Notification hook (permission/idle ping) |
-| `skills/ask_discord.py` | `/ask-discord` script body |
-| `skills/SKILL.md` | Skill instructions for Claude (symlinked into `~/.claude/skills/ask-discord/`) |
+| `src/bridge/commands.py` | discord.py slash-command tree (`/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`) |
+| `src/bridge/tasks.py` | `TaskRegistry`: Discord-driven task lifecycle, hook-event dispatch, transcript streaming, subagent block management, task-list mirror |
+| `src/bridge/zellij.py` | Async wrapper around the `zellij` CLI (≥ 0.44 recommended) |
+| `src/bridge/tool_summary.py` | One-liner formatter + fenced diff/code/checklist blocks per tool name |
+| `src/bridge/transcript.py` | Bounded utf-8 JSONL reader for claude transcripts |
+| `src/bridge/usage.py` | Token/cost/context-fill computation for `/stats` and Stop footer |
+| `src/bridge/voice.py` | Audio transcription (Wispr Flow API or local `whisper` CLI) |
+| `src/bridge/skills.py` | Enumerate user-level + enabled-plugin skills for `/skill` autocomplete |
+| `src/bridge/approvals.py` | `ApprovalRouter` — PreToolUse and TUI-prompt round-trips via reactions/text |
+| `hooks/notify-stop.py` | Standalone-mode Stop hook (long-turn ping) |
+| `hooks/notify-notification.py` | Standalone-mode Notification hook (permission/idle ping) |
+| `hooks/event.py` | Discord-driven mode multi-event dispatcher (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`, `SessionEnd`, `PreCompact`) |
+| `hooks/pretooluse-approve.py` | Discord-driven mode PreToolUse approval wrapper (fail-closed, used selectively for `AskUserQuestion` / `ExitPlanMode`) |
+| `skills/SKILL.md` | `/ask-discord` skill instructions for Claude (symlinked into `~/.claude/skills/ask-discord/`) |
 
-See `CLAUDE.md` for gotchas and tooling notes; the implementation plan lives in the parent worktree at `docs/implementation-plans/2026-05-07-claude-discord-bridge/`.
+See `CLAUDE.md` for the full set of gotchas and invariants — start there before adding features.
 
 ## Development
 
 ```bash
-uv run pytest -q       # full test suite (163 tests)
+uv run pytest -q --ignore=tests/test_zellij.py    # ~400 tests
 uv run pytest -q tests/test_<module>.py
 ```
 
-Tests use a `FakeBot` and in-memory SQLite, so the suite never hits real Discord. End-to-end smoke against a real bot is documented in `docs/test-plans/`.
+Tests use a `FakeBot` and in-memory SQLite, so the suite never hits real Discord. `tests/test_zellij.py` is excluded by default because the (older) tests in it can crash a live zellij session; run it deliberately in isolation if you need to.
 
 ## License
 
