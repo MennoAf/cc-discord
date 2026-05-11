@@ -55,6 +55,21 @@ _MAX_ATTACHMENTS_PER_POST = 10
 # layout (interpolated as an env(1) arg).
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
+# Supported BRIDGE_MIRROR_MODE values. Anything else (including unset)
+# resolves to "full" — the historical behavior of mirroring everything.
+_MIRROR_MODES = ("full", "compact")
+
+
+def _mirror_mode() -> str:
+    """Return the active `BRIDGE_MIRROR_MODE`, normalized.
+
+    Read on demand (not cached) so toggling the env var via `launchctl
+    setenv` + daemon kickstart takes effect without a full reload, and
+    so tests can monkeypatch the env var without registry re-creation.
+    """
+    raw = (os.environ.get("BRIDGE_MIRROR_MODE") or "").strip().lower()
+    return raw if raw in _MIRROR_MODES else "full"
+
 
 @dataclass
 class SubagentBlock:
@@ -1316,7 +1331,14 @@ class TaskRegistry:
         """Debounce: post the current task list 1s after the last
         TaskCreate/TaskUpdate. Bursts (5 quick TaskCreates → one plan
         message) coalesce into a single post.
+
+        Suppressed when `BRIDGE_MIRROR_MODE != "full"`. Internal task
+        state (`_update_task_list_state`) still runs unconditionally so
+        `/tasks` and any future view-only surfaces continue to work; we
+        skip only the Discord embed rendering here.
         """
+        if _mirror_mode() != "full":
+            return
         existing = task.task_list_post_timer
         if existing is not None and not existing.done():
             existing.cancel()
@@ -1508,7 +1530,13 @@ class TaskRegistry:
 
         Posted separately from the one-liner summary so the aggregator can
         keep coalescing summaries while diffs surface as their own messages.
+
+        Suppressed when `BRIDGE_MIRROR_MODE != "full"`. The tool one-liner
+        in the aggregator still fires, so the reader knows the edit
+        happened without seeing the full content.
         """
+        if _mirror_mode() != "full":
+            return
         block = tool_summary.diff_block(tool_name, tool_input)
         if not block:
             return
@@ -1736,7 +1764,14 @@ class TaskRegistry:
         Idempotent — uses `last_entry_uuid` for change detection so we only
         edit when there's new content. Best-effort: errors are logged and
         skipped so a single bad file doesn't break the loop.
+
+        Suppressed when `BRIDGE_MIRROR_MODE != "full"`. Subagent blocks
+        are the largest single source of mirrored noise (one live-edited
+        embed per agent for the duration of its run); we omit them in
+        compact/prose modes rather than degrade them to a one-liner.
         """
+        if _mirror_mode() != "full":
+            return
         if not task.current_transcript_path:
             return
         main_path = Path(task.current_transcript_path)

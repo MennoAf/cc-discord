@@ -1,13 +1,20 @@
 """Tests for Task and TaskRegistry."""
 
 import asyncio
+import contextlib
 import os
 from dataclasses import dataclass, field
 
 import pytest
 
 from bridge.state import TaskRow, upsert_task
-from bridge.tasks import Task, TaskRegistry, TaskSpawnError, _ToolSummaryAggregator
+from bridge.tasks import (
+    Task,
+    TaskRegistry,
+    TaskSpawnError,
+    _ToolSummaryAggregator,
+    _mirror_mode,
+)
 from bridge.zellij import ZellijError, ZellijManager
 from tests.fakes import FakeBot, FakeZellij
 
@@ -3644,3 +3651,188 @@ class TestTaskSettingsIntegration:
 
         # Verify task was auto-removed from tracking
         assert task.task_id not in registry._tui_handler_tasks
+
+
+class TestMirrorMode:
+    """Tests for BRIDGE_MIRROR_MODE — Discord mirroring density toggle.
+
+    `full` (default) reproduces the historical mirror: assistant prose,
+    tool one-liners, diffs, task-list embeds, and live subagent blocks
+    all flow into the per-task Discord thread. `compact` keeps the prose
+    and tool one-liners but suppresses the high-volume mirrors (diffs,
+    task-list embeds, subagent blocks).
+    """
+
+    def test_mirror_mode_default_is_full(self, monkeypatch) -> None:
+        monkeypatch.delenv("BRIDGE_MIRROR_MODE", raising=False)
+        assert _mirror_mode() == "full"
+
+    def test_mirror_mode_compact_accepted(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "compact")
+        assert _mirror_mode() == "compact"
+
+    def test_mirror_mode_case_insensitive(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "COMPACT")
+        assert _mirror_mode() == "compact"
+
+    def test_mirror_mode_strips_whitespace(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "  compact  ")
+        assert _mirror_mode() == "compact"
+
+    def test_mirror_mode_invalid_falls_back_to_full(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "nonsense")
+        assert _mirror_mode() == "full"
+
+    def test_mirror_mode_empty_string_falls_back_to_full(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "")
+        assert _mirror_mode() == "full"
+
+    @pytest.mark.asyncio
+    async def test_full_mode_posts_edit_diff(self, in_memory_db, monkeypatch) -> None:
+        """Sanity: default (full) behavior still posts the diff block for Edit."""
+        monkeypatch.delenv("BRIDGE_MIRROR_MODE", raising=False)
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-full",
+            5001,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-full",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-full",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/tmp/x.py",
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "tool_response": {},
+        })
+
+        # Diff block lands as a Bot.post call.
+        posts = fake_bot.get_post_calls()
+        assert any("```diff" in p["content"] for p in posts)
+
+    @pytest.mark.asyncio
+    async def test_compact_mode_suppresses_edit_diff(
+        self, in_memory_db, monkeypatch
+    ) -> None:
+        """In compact mode the diff block is dropped, but the tool one-liner
+        still lands in the aggregator so activity is still visible."""
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "compact")
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-compact",
+            5002,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-compact",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-compact",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/tmp/x.py",
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "tool_response": {},
+        })
+
+        posts = fake_bot.get_post_calls()
+        assert not any("```diff" in p["content"] for p in posts), (
+            "diff block must not be posted in compact mode"
+        )
+
+        agg = registry._aggregators.get("task-mm-compact")
+        assert agg is not None
+        assert len(agg._lines) == 1
+        assert "Edit" in agg._lines[0]
+
+    @pytest.mark.asyncio
+    async def test_compact_mode_suppresses_task_list_schedule_but_updates_state(
+        self, in_memory_db, monkeypatch
+    ) -> None:
+        """TaskCreate updates internal state in compact mode (so /tasks
+        still works), but the debounced embed post is not scheduled."""
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "compact")
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-tasklist",
+            5003,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-tasklist",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+        task = registry.get_by_task_id("task-mm-tasklist")
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-tasklist",
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "do thing", "id": "t-1"},
+            "tool_response": {"id": "t-1"},
+        })
+
+        # State must still reflect the create — /tasks reads this.
+        assert "t-1" in task.task_list_state
+        assert task.task_list_state["t-1"]["subject"] == "do thing"
+
+        # No debounced embed timer in compact mode.
+        assert task.task_list_post_timer is None
+
+    @pytest.mark.asyncio
+    async def test_full_mode_schedules_task_list_embed(
+        self, in_memory_db, monkeypatch
+    ) -> None:
+        """Sanity: full mode still schedules the debounced task-list embed."""
+        monkeypatch.delenv("BRIDGE_MIRROR_MODE", raising=False)
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-tasklist-full",
+            5004,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-tasklist-full",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+        task = registry.get_by_task_id("task-mm-tasklist-full")
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-tasklist-full",
+            "tool_name": "TaskCreate",
+            "tool_input": {"subject": "do thing", "id": "t-2"},
+            "tool_response": {"id": "t-2"},
+        })
+
+        assert task.task_list_post_timer is not None
+        # Cancel the scheduled timer so it doesn't fire (and try to post
+        # via the fake bot's missing post_embed) after the test exits.
+        task.task_list_post_timer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task.task_list_post_timer
