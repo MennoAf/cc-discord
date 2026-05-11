@@ -14,6 +14,7 @@ from bridge.tasks import (
     TaskSpawnError,
     _ToolSummaryAggregator,
     _mirror_mode,
+    _mirror_thinking,
 )
 from bridge.zellij import ZellijError, ZellijManager
 from tests.fakes import FakeBot, FakeZellij
@@ -3656,11 +3657,16 @@ class TestTaskSettingsIntegration:
 class TestMirrorMode:
     """Tests for BRIDGE_MIRROR_MODE — Discord mirroring density toggle.
 
-    `full` (default) reproduces the historical mirror: assistant prose,
-    tool one-liners, diffs, task-list embeds, and live subagent blocks
-    all flow into the per-task Discord thread. `compact` keeps the prose
-    and tool one-liners but suppresses the high-volume mirrors (diffs,
-    task-list embeds, subagent blocks).
+    Modes:
+      - `full` (default) — historical mirror: assistant prose, tool
+        one-liners, diffs, task-list embeds, and live subagent blocks.
+      - `compact` — keeps prose and tool one-liners; drops diffs,
+        task-list embeds, and subagent blocks.
+      - `prose_only` — keeps assistant prose and TUI prompts only; drops
+        tool one-liners on top of everything `compact` drops.
+
+    The orthogonal `BRIDGE_MIRROR_THINKING` env var suppresses
+    extended-thinking blocks in all modes when set to a falsey value.
     """
 
     def test_mirror_mode_default_is_full(self, monkeypatch) -> None:
@@ -3836,3 +3842,113 @@ class TestMirrorMode:
         task.task_list_post_timer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task.task_list_post_timer
+
+    def test_mirror_mode_prose_only_accepted(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "prose_only")
+        assert _mirror_mode() == "prose_only"
+
+    @pytest.mark.asyncio
+    async def test_prose_only_mode_suppresses_tool_one_liner(
+        self, in_memory_db, monkeypatch
+    ) -> None:
+        """In prose_only mode the per-tool one-liner doesn't even reach
+        the aggregator — assistant prose is the only mirrored content."""
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "prose_only")
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-prose",
+            5005,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-prose",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-prose",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        # Aggregator stays empty — no one-liner was appended.
+        agg = registry._aggregators.get("task-mm-prose")
+        if agg is not None:
+            assert agg._lines == []
+
+        # And the diff path stays gated too (it carried PR A's full-only
+        # check, which prose_only also fails).
+        posts = fake_bot.get_post_calls()
+        assert not any("```diff" in p["content"] for p in posts)
+
+    @pytest.mark.asyncio
+    async def test_compact_mode_still_keeps_tool_one_liners(
+        self, in_memory_db, monkeypatch
+    ) -> None:
+        """Regression guard for the PR-A behavior: compact must NOT
+        also suppress the tool one-liner — that's prose_only's job."""
+        monkeypatch.setenv("BRIDGE_MIRROR_MODE", "compact")
+        fake_bot = FakeBot()
+        fake_zellij = FakeZellij()
+
+        await upsert_task(
+            in_memory_db,
+            "task-mm-compact-2",
+            5006,
+            "/tmp",
+            "running",
+            current_claude_session_id="sess-mm-compact-2",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        await registry._on_post_tool_use({
+            "session_id": "sess-mm-compact-2",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": {"exit_code": 0},
+        })
+
+        agg = registry._aggregators.get("task-mm-compact-2")
+        assert agg is not None
+        assert len(agg._lines) == 1
+        assert "Bash" in agg._lines[0]
+
+    def test_mirror_thinking_default_is_true(self, monkeypatch) -> None:
+        monkeypatch.delenv("BRIDGE_MIRROR_THINKING", raising=False)
+        assert _mirror_thinking() is True
+
+    def test_mirror_thinking_zero_is_false(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "0")
+        assert _mirror_thinking() is False
+
+    def test_mirror_thinking_false_is_false(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "false")
+        assert _mirror_thinking() is False
+
+    def test_mirror_thinking_off_is_false(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "off")
+        assert _mirror_thinking() is False
+
+    def test_mirror_thinking_no_is_false(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "no")
+        assert _mirror_thinking() is False
+
+    def test_mirror_thinking_case_insensitive(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "FALSE")
+        assert _mirror_thinking() is False
+
+    def test_mirror_thinking_one_is_true(self, monkeypatch) -> None:
+        """Any non-falsey value (including '1' or garbage) keeps thinking on."""
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "1")
+        assert _mirror_thinking() is True
+
+    def test_mirror_thinking_empty_string_is_true(self, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_MIRROR_THINKING", "")
+        assert _mirror_thinking() is True
