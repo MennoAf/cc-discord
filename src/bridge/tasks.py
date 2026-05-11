@@ -1982,10 +1982,13 @@ class TaskRegistry:
         if existing is not None and not existing.done():
             return
 
-        # Otherwise it's a generic stall (free-text input expected). Spawn
-        # the standard free-text-stall handler.
+        # Otherwise it's a generic stall (free-text input expected). The
+        # Notification hook payload may include a `message` field (e.g.
+        # "Claude needs your permission to use Bash" or a custom string
+        # from /v1/notify); forward it to the handler so the Discord post
+        # carries the actual reason instead of a generic yellow banner.
         handler_task = asyncio.create_task(
-            self._handle_free_text_stall(task),
+            self._handle_free_text_stall(task, message=body.get("message")),
             name=f"tui-free_text-{task.task_id[:8]}",
         )
         self._track_tui_handler_task(task.task_id, handler_task)
@@ -2257,16 +2260,33 @@ class TaskRegistry:
         )
         await self._inject_to_pane(task, answer, source)
 
-    async def _handle_free_text_stall(self, task: Task) -> None:
-        """Handle free-text stall: post generic waiting notice."""
+    async def _handle_free_text_stall(
+        self, task: Task, message: str | None = None
+    ) -> None:
+        """Handle free-text stall: post waiting notice with the hook's
+        `message` content when present.
+
+        Claude Code's Notification hook fires with a `message` field that
+        names the reason for the stall (e.g. "Claude needs your permission
+        to use Bash" or a custom string from `/v1/notify`). When the
+        caller forwards that string here, we render it as the body of the
+        Discord post; otherwise we fall back to the generic yellow banner.
+        """
         if not self._approval_router:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         request_id = str(uuid.uuid4())
-        body = (
-            f"{self._notify_mention_prefix()}🟡 Claude is waiting for input. "
-            "Reply in this thread or type in zellij."
-        )
+        msg = (message or "").strip()
+        if msg:
+            body = (
+                f"{self._notify_mention_prefix()}🟡 {msg}\n\n"
+                "Reply in this thread or type in zellij."
+            )
+        else:
+            body = (
+                f"{self._notify_mention_prefix()}🟡 Claude is waiting for input. "
+                "Reply in this thread or type in zellij."
+            )
         answer, source = await self._approval_router.request_tui_answer(
             request_id=request_id,
             task_id=task.task_id,
