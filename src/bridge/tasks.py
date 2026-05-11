@@ -57,7 +57,16 @@ _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9
 
 # Supported BRIDGE_MIRROR_MODE values. Anything else (including unset)
 # resolves to "full" — the historical behavior of mirroring everything.
-_MIRROR_MODES = ("full", "compact")
+#  - full        — historical behavior, mirror everything.
+#  - compact     — drop diffs, task-list embeds, subagent blocks; keep
+#                  assistant prose and tool one-liners.
+#  - prose_only  — strictest. Keep assistant prose and TUI prompts only;
+#                  drop everything compact drops *and* tool one-liners.
+_MIRROR_MODES = ("full", "compact", "prose_only")
+
+# Accepted falsey values for boolean-flag env vars (`BRIDGE_MIRROR_THINKING`,
+# etc). Anything else — including unset — resolves to True.
+_FALSEY_ENV = ("0", "false", "no", "off")
 
 
 def _mirror_mode() -> str:
@@ -69,6 +78,19 @@ def _mirror_mode() -> str:
     """
     raw = (os.environ.get("BRIDGE_MIRROR_MODE") or "").strip().lower()
     return raw if raw in _MIRROR_MODES else "full"
+
+
+def _mirror_thinking() -> bool:
+    """Return whether extended-thinking blocks should be mirrored.
+
+    Defaults to True (historical behavior). Set `BRIDGE_MIRROR_THINKING=0`
+    (or any of `false` / `no` / `off`, case-insensitive) to suppress
+    thinking blocks across all `BRIDGE_MIRROR_MODE` values. Orthogonal
+    to the mode selector — some users want compact mirroring *with*
+    thinking visible, others want full mirroring *without* it.
+    """
+    raw = (os.environ.get("BRIDGE_MIRROR_THINKING") or "").strip().lower()
+    return raw not in _FALSEY_ENV
 
 
 @dataclass
@@ -1243,8 +1265,12 @@ class TaskRegistry:
         # lines — the debounced full-list block already shows their effect,
         # and the inline lines duplicate that.
         if tool_name not in ("TaskCreate", "TaskUpdate", "TaskList"):
-            line = tool_summary.summarize(tool_name, tool_input, tool_response)
-            self._agg_for(task).append(line)
+            # Tool one-liners are suppressed in prose_only mode (assistant
+            # prose only). `_post_tool_diff` carries its own mode gate, so
+            # we don't double-check it here.
+            if _mirror_mode() != "prose_only":
+                line = tool_summary.summarize(tool_name, tool_input, tool_response)
+                self._agg_for(task).append(line)
             await self._post_tool_diff(task, tool_name, tool_input)
         else:
             self._update_task_list_state(task, tool_name, tool_input, tool_response)
@@ -1732,7 +1758,9 @@ class TaskRegistry:
                     elif btype == "thinking":
                         # Extended-thinking blocks are encrypted by default
                         # (`thinking` is empty). Only post when content is
-                        # visible.
+                        # visible and `BRIDGE_MIRROR_THINKING` allows it.
+                        if not _mirror_thinking():
+                            continue
                         thought = block.get("thinking") or ""
                         if isinstance(thought, str) and thought.strip():
                             try:
