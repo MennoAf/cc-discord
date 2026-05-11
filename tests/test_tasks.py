@@ -3048,6 +3048,93 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_on_notification_free_text_stall_forwards_hook_message(
+    in_memory_db, tmp_path
+):
+    """_on_notification forwards body['message'] into the Discord post."""
+    from bridge.approvals import ApprovalRouter
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-msg",
+        3010,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_msg",
+        current_claude_session_id="sess-tui-msg",
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    custom = "Claude needs your permission to use Bash"
+    await registry._on_notification({
+        "session_id": "sess-tui-msg",
+        "message": custom,
+    })
+    await asyncio.sleep(0.05)
+
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    # Hook message is rendered in the body...
+    assert custom in posts[0]["content"]
+    # ...and the generic banner copy is suppressed when a specific
+    # message is available (the hint to reply still appears).
+    assert "Claude is waiting for input." not in posts[0]["content"]
+    assert "Reply in this thread" in posts[0]["content"]
+
+    # Cleanup: resolve so the handler task completes.
+    await approval_router.resolve_tui_by_text(3010, "ack", author_is_bot=False)
+    handler_task = registry._tui_handler_tasks.get("task-tui-msg")
+    if handler_task is not None:
+        await handler_task
+
+
+@pytest.mark.asyncio
+async def test_on_notification_free_text_stall_whitespace_message_falls_back(
+    in_memory_db, tmp_path
+):
+    """A whitespace-only `message` is treated as absent — generic copy is used."""
+    from bridge.approvals import ApprovalRouter
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-ws",
+        3011,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_ws",
+        current_claude_session_id="sess-tui-ws",
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    await registry._on_notification({
+        "session_id": "sess-tui-ws",
+        "message": "   \n\t  ",
+    })
+    await asyncio.sleep(0.05)
+
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    assert "Claude is waiting for input." in posts[0]["content"]
+
+    await approval_router.resolve_tui_by_text(3011, "ack", author_is_bot=False)
+    handler_task = registry._tui_handler_tasks.get("task-tui-ws")
+    if handler_task is not None:
+        await handler_task
+
+
+@pytest.mark.asyncio
 async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
     """_on_user_prompt_submit cancels pending TUI prompts via sentinel."""
     from bridge.approvals import ApprovalRouter
