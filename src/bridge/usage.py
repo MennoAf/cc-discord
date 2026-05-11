@@ -18,20 +18,21 @@ from bridge import transcript
 logger = logging.getLogger(__name__)
 
 
-# Anthropic API list prices in $ / 1M tokens. Snapshot 2026-05-08.
+# Anthropic API list prices in $ / 1M tokens. Snapshot 2026-05-11.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
 # Update when prices change.
 MODEL_PRICES: dict[str, dict[str, float]] = {
     "claude-opus-4-7": {
-        "input": 15.0,
-        "output": 75.0,
-        "cache_creation": 18.75,
-        "cache_read": 1.50,
+        "input": 5.0,
+        "output": 25.0,
+        "cache_creation": 6.25,
+        "cache_read": 0.50,
     },
     "claude-opus-4-6": {
-        "input": 15.0,
-        "output": 75.0,
-        "cache_creation": 18.75,
-        "cache_read": 1.50,
+        "input": 5.0,
+        "output": 25.0,
+        "cache_creation": 6.25,
+        "cache_read": 0.50,
     },
     "claude-sonnet-4-6": {
         "input": 3.0,
