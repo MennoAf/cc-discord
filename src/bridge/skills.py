@@ -1,8 +1,13 @@
 """Skill enumeration for the `/skill` Discord slash command.
 
-Walks the user-level skills directory plus enabled-plugin skill directories
-listed in `~/.claude/plugins/installed_plugins.json`, scoped by the enabled
-flag in `~/.claude/settings.json`. Reads each `SKILL.md` for the description.
+Walks three sources, sorted by name, deduped (skills win over commands on collision):
+  1. User-level skills at `~/.claude/skills/<name>/SKILL.md`
+  2. Legacy slash commands at `~/.claude/commands/<name>.md`
+  3. Enabled-plugin skills listed in `~/.claude/plugins/installed_plugins.json`,
+     scoped by the enabled flag in `~/.claude/settings.json`.
+
+Reads each file's YAML frontmatter for the description; supports inline
+(`description: text`) and block scalar (`description: >` / `|`) forms.
 
 Resolution is best-effort and forgiving: missing files / unparseable
 frontmatter just produce a skill with `description=None`.
@@ -26,41 +31,48 @@ class Skill:
 
 
 def list_skills() -> list[Skill]:
-    """Enumerate user-level skills + skills from enabled plugins. Sorted by name."""
-    out: list[Skill] = []
+    """Enumerate user skills + legacy commands + enabled-plugin skills. Sorted by name."""
     home = Path.home()
+    by_name: dict[str, Skill] = {}
 
-    # User-level skills.
+    # 1. Legacy slash commands at ~/.claude/commands/<name>.md. Added first so
+    #    user-level skills below can overwrite on name collision (skill wins).
+    commands_dir = home / ".claude" / "commands"
+    if commands_dir.is_dir():
+        for f in sorted(commands_dir.iterdir()):
+            if not f.is_file() or f.suffix != ".md" or f.name.startswith("."):
+                continue
+            name = f.stem
+            desc = _read_description(f)
+            by_name[name] = Skill(name=name, description=desc, source="command")
+
+    # 2. User-level skills at ~/.claude/skills/<name>/SKILL.md.
     user_skills_dir = home / ".claude" / "skills"
     if user_skills_dir.is_dir():
         for d in sorted(user_skills_dir.iterdir()):
             if not d.is_dir():
                 continue
             desc = _read_description(d / "SKILL.md")
-            out.append(Skill(name=d.name, description=desc, source="user"))
+            by_name[d.name] = Skill(name=d.name, description=desc, source="user")
 
-    # Plugin skills.
+    # 3. Plugin skills (namespaced as <plugin>:<skill>, never collide with the above).
     for plugin_id, install_path in _enabled_plugin_paths().items():
         skills_root = install_path / "skills"
         if not skills_root.is_dir():
             continue
-        # plugin_id is "<plugin>@<marketplace>"; the displayed prefix is just
-        # the plugin part (matches Claude Code's own naming).
         prefix = plugin_id.split("@", 1)[0]
         for d in sorted(skills_root.iterdir()):
             if not d.is_dir():
                 continue
             desc = _read_description(d / "SKILL.md")
-            out.append(
-                Skill(
-                    name=f"{prefix}:{d.name}",
-                    description=desc,
-                    source=f"plugin:{plugin_id}",
-                )
+            qualified = f"{prefix}:{d.name}"
+            by_name[qualified] = Skill(
+                name=qualified,
+                description=desc,
+                source=f"plugin:{plugin_id}",
             )
 
-    out.sort(key=lambda s: s.name)
-    return out
+    return sorted(by_name.values(), key=lambda s: s.name)
 
 
 def _enabled_plugin_paths() -> dict[str, Path]:
@@ -106,7 +118,17 @@ def _enabled_plugin_paths() -> dict[str, Path]:
 
 
 def _read_description(skill_md: Path) -> str | None:
-    """Pull the `description:` value out of a SKILL.md YAML frontmatter."""
+    """Pull the `description:` value out of a YAML frontmatter.
+
+    Handles three forms:
+      description: inline text
+      description: >          (folded, joined with spaces)
+        line one
+        line two
+      description: |          (literal, joined with newlines)
+        line one
+        line two
+    """
     try:
         text = skill_md.read_text()
     except OSError:
@@ -116,12 +138,32 @@ def _read_description(skill_md: Path) -> str | None:
     end = text.find("\n---", 3)
     if end == -1:
         return None
-    for line in text[3:end].splitlines():
-        s = line.strip()
-        if s.startswith("description:"):
-            value = s[len("description:") :].strip()
-            # Strip surrounding quotes if present.
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            return value or None
+
+    fm_lines = text[3:end].splitlines()
+    for i, line in enumerate(fm_lines):
+        stripped = line.strip()
+        if not stripped.startswith("description:"):
+            continue
+        value = stripped[len("description:") :].strip()
+
+        # Block scalar: > (folded) or | (literal).
+        if value in (">", "|"):
+            joiner = " " if value == ">" else "\n"
+            collected: list[str] = []
+            for follow in fm_lines[i + 1 :]:
+                if follow.strip() == "":
+                    collected.append("")
+                    continue
+                # Block scalar continues while the line is indented (any whitespace).
+                if follow.startswith((" ", "\t")):
+                    collected.append(follow.strip())
+                else:
+                    break
+            joined = joiner.join(s for s in collected if s).strip()
+            return joined or None
+
+        # Inline form. Strip surrounding quotes if present.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value or None
     return None
