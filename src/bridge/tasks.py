@@ -522,6 +522,29 @@ class TaskRegistry:
             return ""
         return f"<@{user_id}> "
 
+    @staticmethod
+    def format_stall_body(message: str | None) -> str:
+        """Frame a stall notification body: optional mention prefix + 🟡 +
+        the hook message + a 'reply here or in zellij' footer.
+
+        Shared between the task-bound free-text stall path
+        (`_handle_free_text_stall`) and the standalone `/v1/notify`
+        endpoint, so a Claude session that posts its idle Notification
+        via the hook script renders the same way as one bound through
+        `cc-spawn`. Falls back to a generic line when message is empty.
+        """
+        mention = TaskRegistry._notify_mention_prefix()
+        msg = (message or "").strip()
+        if msg:
+            return (
+                f"{mention}🟡 {msg}\n\n"
+                "Reply in this thread or type in zellij."
+            )
+        return (
+            f"{mention}🟡 Claude is waiting for input. "
+            "Reply in this thread or type in zellij."
+        )
+
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.
 
@@ -2339,17 +2362,7 @@ class TaskRegistry:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
             return
         request_id = str(uuid.uuid4())
-        msg = (message or "").strip()
-        if msg:
-            body = (
-                f"{self._notify_mention_prefix()}🟡 {msg}\n\n"
-                "Reply in this thread or type in zellij."
-            )
-        else:
-            body = (
-                f"{self._notify_mention_prefix()}🟡 Claude is waiting for input. "
-                "Reply in this thread or type in zellij."
-            )
+        body = self.format_stall_body(message)
         answer, source = await self._approval_router.request_tui_answer(
             request_id=request_id,
             task_id=task.task_id,

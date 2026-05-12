@@ -357,6 +357,53 @@ async def test_notify_with_optional_fields(client, fake_bot):
 
 
 @pytest.mark.asyncio
+async def test_notify_warn_level_wraps_body(client, fake_bot):
+    """level='warn' is the stall convention — body should be wrapped
+    with the 🟡 prefix and 'reply in this thread or zellij' footer so the
+    standalone Notification-hook path renders the same as the task-bound
+    free-text stall."""
+    fake_bot.set_ready(True)
+    resp = await client.post(
+        "/v1/notify",
+        json={
+            "session_id": "test-session",
+            "cwd": "/tmp",
+            "message": "Claude is waiting for your input",
+            "level": "warn",
+        },
+    )
+    assert resp.status == 200
+    calls = fake_bot.get_post_calls()
+    assert len(calls) == 1
+    posted = calls[0]["message"]
+    assert "🟡" in posted
+    assert "Claude is waiting for your input" in posted
+    assert "Reply in this thread or type in zellij." in posted
+
+
+@pytest.mark.asyncio
+async def test_notify_info_level_stays_verbatim(client, fake_bot):
+    """level='info' (e.g. long-turn completion) should NOT be wrapped —
+    the 🟡 + reply-in-thread footer makes no sense for a completion
+    notice."""
+    fake_bot.set_ready(True)
+    msg = "Claude finished a long turn — 5m 30s in `/tmp` (session abc12345)"
+    resp = await client.post(
+        "/v1/notify",
+        json={
+            "session_id": "test-session",
+            "cwd": "/tmp",
+            "message": msg,
+            "level": "info",
+        },
+    )
+    assert resp.status == 200
+    calls = fake_bot.get_post_calls()
+    assert len(calls) == 1
+    assert calls[0]["message"] == msg
+
+
+@pytest.mark.asyncio
 async def test_notify_distinct_sessions_distinct_threads(client, fake_bot):
     """AC2.1: Two POST /v1/notify calls with different session_ids create distinct threads."""
     fake_bot.set_ready(True)

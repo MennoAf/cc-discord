@@ -118,6 +118,13 @@ async def _handle_notify(request: web.Request) -> web.Response:
     bot: Bot = request.app[BOT_KEY]
     registry: ThreadRegistry = request.app[THREADS_KEY]
     message = body["message"]
+    # `level == "warn"` is the Notification-hook convention for "Claude is
+    # blocked waiting for user input" — wrap it in the same 🟡 + reply
+    # footer the task-bound free-text-stall path uses, so standalone
+    # sessions don't render the message naked. Other levels (info for
+    # long-turn completion, error, unset) stay verbatim.
+    if (body.get("level") or "").lower() == "warn":
+        message = TaskRegistry.format_stall_body(message)
 
     # Check if bot is ready before routing to thread
     if not bot.is_ready:
