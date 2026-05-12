@@ -4,6 +4,7 @@ Registered guild-scoped (instant sync). Bot must finish on_ready before sync run
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,30 @@ from bridge.bot import Bot
 from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
 
 logger = logging.getLogger(__name__)
+
+PROJECTS_PATH = Path.home() / ".config" / "claude-discord-bridge" / "projects.json"
+
+
+def _load_projects() -> dict[str, str]:
+    """Load project name -> absolute path map from PROJECTS_PATH.
+
+    Keys are lowercased. Underscore-prefixed keys (e.g. `_comment`) are skipped.
+    Returns {} on missing file or invalid JSON.
+    """
+    try:
+        data = json.loads(PROJECTS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        k.lower(): v
+        for k, v in data.items()
+        if not k.startswith("_") and isinstance(v, str)
+    }
+
+
+def _resolve_project(name: str) -> str | None:
+    """Look up a project name in projects.json. Case-insensitive."""
+    return _load_projects().get(name.lower())
 
 
 class _NotInTaskThread(Exception):
@@ -281,6 +306,62 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
             return
         embed = registry._render_task_list_embed(task)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _project_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        cur = current.lower()
+        out: list[app_commands.Choice[str]] = []
+        for name, path in _load_projects().items():
+            if cur and cur not in name:
+                continue
+            label = f"{name} — {path}"[:100]
+            out.append(app_commands.Choice(name=label, value=name[:100]))
+            if len(out) >= 25:
+                break
+        return out
+
+    @tree.command(
+        name="auto",
+        description="Start a Claude session in a known project and run /autopilot",
+    )
+    @app_commands.describe(
+        project="Project name (looked up in ~/.config/claude-discord-bridge/projects.json)",
+        prompt="Override the default '/autopilot' prompt",
+    )
+    @app_commands.autocomplete(project=_project_autocomplete)
+    async def auto(
+        interaction: discord.Interaction,
+        project: str,
+        prompt: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        cwd = _resolve_project(project)
+        if cwd is None:
+            known = ", ".join(sorted(_load_projects().keys()))
+            await interaction.followup.send(
+                f"❌ Unknown project `{project}`. Known: {known[:1500]}",
+                ephemeral=True,
+            )
+            return
+        try:
+            task = await registry.spawn_task(cwd=cwd, prompt=None)
+        except TaskSpawnError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
+        effective_prompt = prompt if prompt is not None else "/autopilot"
+        try:
+            await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
+            await registry.write_initial_prompt(task.task_id, effective_prompt)
+        except asyncio.TimeoutError:
+            logger.warning("task %s did not bind within 10s", task.task_id)
+
+        thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
+        await interaction.followup.send(
+            f"🚀 `{project}` → <#{task.thread_id}> ({thread_url}) — sent `{effective_prompt}`",
+            ephemeral=True,
+        )
 
     return tree
 
