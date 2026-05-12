@@ -3143,6 +3143,417 @@ async def test_on_notification_free_text_stall_whitespace_message_falls_back(
 
 
 @pytest.mark.asyncio
+async def test_on_notification_permission_stall_bash(in_memory_db, tmp_path):
+    """_on_notification posts a rich Bash permission prompt when the transcript has a pending tool_use."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_perm_1",
+                        "name": "Bash",
+                        "input": {
+                            "command": "git push origin main",
+                            "description": "Push to remote",
+                        },
+                    },
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        },
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-perm",
+        3030,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_perm",
+        current_claude_session_id="sess-tui-perm",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    await registry._on_notification({
+        "session_id": "sess-tui-perm",
+        "transcript_path": str(transcript_path),
+    })
+
+    await asyncio.sleep(0.05)
+
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    content = posts[0]["content"]
+    assert "Bash" in content
+    assert "git push origin main" in content
+    assert "Push to remote" in content
+    # Make sure we didn't fall through to the generic stall
+    assert "waiting for input" not in content
+
+    # Resolve by text reply (simulates user typing "1" in Discord to approve)
+    resolved = await approval_router.resolve_tui_by_text(3030, "1", author_is_bot=False)
+    assert resolved is True
+
+    handler_task = registry._tui_handler_tasks.get("task-tui-perm")
+    assert handler_task is not None
+    await handler_task
+
+    assert len(fake_zellij._write_calls) == 1
+    assert fake_zellij._write_calls[0]["pane_id"] == "pane_perm"
+    assert fake_zellij._write_calls[0]["text"] == "1\n"
+
+
+@pytest.mark.asyncio
+async def test_on_notification_permission_stall_edit(in_memory_db, tmp_path):
+    """_on_notification renders an Edit permission prompt as a diff block."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_perm_2",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/tmp/example.py",
+                            "old_string": "foo",
+                            "new_string": "bar",
+                        },
+                    },
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        },
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-perm2",
+        3031,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_perm2",
+        current_claude_session_id="sess-tui-perm2",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    await registry._on_notification({
+        "session_id": "sess-tui-perm2",
+        "transcript_path": str(transcript_path),
+    })
+
+    await asyncio.sleep(0.05)
+
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    content = posts[0]["content"]
+    assert "Edit" in content
+    assert "/tmp/example.py" in content
+    assert "- foo" in content
+    assert "+ bar" in content
+    assert "```diff" in content
+    assert "waiting for input" not in content
+
+    # Drain the handler so it doesn't leak into other tests
+    await approval_router.resolve_tui_by_text(3031, "skip", author_is_bot=False)
+    handler_task = registry._tui_handler_tasks.get("task-tui-perm2")
+    if handler_task is not None:
+        await handler_task
+
+
+class TestFormatPermissionPrompt:
+    """Unit tests for TaskRegistry._format_permission_prompt — one per tool type."""
+
+    def _registry(self, in_memory_db) -> TaskRegistry:
+        return TaskRegistry(in_memory_db, FakeBot(), FakeZellij(), None)
+
+    @pytest.mark.asyncio
+    async def test_bash_specialization(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "Bash", {"command": "git push origin main", "description": "Push to remote"}
+        )
+        assert "Claude wants to run `Bash`" in out
+        assert "Push to remote" in out
+        assert "```bash" in out
+        assert "git push origin main" in out
+
+    @pytest.mark.asyncio
+    async def test_edit_diff_format(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "Edit",
+            {
+                "file_path": "/foo/bar.py",
+                "old_string": "x = 1\ny = 2",
+                "new_string": "x = 10\ny = 20",
+            },
+        )
+        assert "`Edit`" in out
+        assert "📄 `/foo/bar.py`" in out
+        assert "```diff" in out
+        assert "- x = 1" in out
+        assert "- y = 2" in out
+        assert "+ x = 10" in out
+        assert "+ y = 20" in out
+
+    @pytest.mark.asyncio
+    async def test_edit_replace_all_flag(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "Edit",
+            {"file_path": "/foo.py", "old_string": "a", "new_string": "b", "replace_all": True},
+        )
+        assert "replace_all" in out
+
+    @pytest.mark.asyncio
+    async def test_write_with_lang_detection(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "Write",
+            {"file_path": "/scripts/run.py", "content": "print('hello')\n"},
+        )
+        assert "`Write`" in out
+        assert "📄 `/scripts/run.py`" in out
+        assert "```python" in out
+        assert "print('hello')" in out
+
+    @pytest.mark.asyncio
+    async def test_write_truncates_long_content(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        long_content = "\n".join(f"line {i}" for i in range(100))
+        out = r._format_permission_prompt(
+            "Write", {"file_path": "/big.txt", "content": long_content}
+        )
+        assert "70 more lines" in out  # 100 - 30 shown
+        assert "line 0" in out
+        assert "line 29" in out
+        assert "line 99" not in out
+
+    @pytest.mark.asyncio
+    async def test_write_empty_file(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt("Write", {"file_path": "/empty.txt", "content": ""})
+        assert "*(empty file)*" in out
+        assert "```" not in out  # no code block when empty
+
+    @pytest.mark.asyncio
+    async def test_notebook_edit(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "NotebookEdit",
+            {
+                "notebook_path": "/notebooks/analysis.ipynb",
+                "cell_id": "cell-42",
+                "cell_type": "code",
+                "edit_mode": "insert",
+                "new_source": "import pandas as pd",
+            },
+        )
+        assert "`NotebookEdit`" in out
+        assert "📓 `/notebooks/analysis.ipynb`" in out
+        assert "mode: insert" in out
+        assert "cell: code" in out
+        assert "id: cell-42" in out
+        assert "```python" in out
+        assert "import pandas as pd" in out
+
+    @pytest.mark.asyncio
+    async def test_web_fetch(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "WebFetch",
+            {"url": "https://example.com/api/v1", "prompt": "extract the pricing table"},
+        )
+        assert "`WebFetch`" in out
+        assert "🔗 https://example.com/api/v1" in out
+        assert "> extract the pricing table" in out
+
+    @pytest.mark.asyncio
+    async def test_web_search(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "WebSearch",
+            {
+                "query": "claude code hook payload schema",
+                "allowed_domains": ["docs.anthropic.com", "claude.com"],
+                "blocked_domains": ["spam.example"],
+            },
+        )
+        assert "`WebSearch`" in out
+        assert "🔍 `claude code hook payload schema`" in out
+        assert "allowed: docs.anthropic.com, claude.com" in out
+        assert "blocked: spam.example" in out
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_split_name(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "mcp__loom__loom_create",
+            {"goal": "ship the thing", "project_id": "abc"},
+        )
+        assert "`loom`" in out
+        assert "`loom_create`" in out
+        assert "ship the thing" in out
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_malformed_name(self, in_memory_db):
+        """If the mcp__ prefix doesn't have 3 segments, fall back to the full name."""
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt("mcp__weird", {"x": 1})
+        assert "`mcp__weird`" in out
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_falls_back_to_json(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt(
+            "SomeFutureTool", {"arbitrary": ["payload", 1, 2]}
+        )
+        assert "`SomeFutureTool`" in out
+        assert "```json" in out
+        assert "arbitrary" in out
+
+    @pytest.mark.asyncio
+    async def test_empty_tool_input(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        out = r._format_permission_prompt("SomeFutureTool", {})
+        assert "`SomeFutureTool`" in out
+        assert "```" not in out  # no code block when no input
+
+    @pytest.mark.asyncio
+    async def test_hint_present_in_every_format(self, in_memory_db):
+        r = self._registry(in_memory_db)
+        for tool, inp in [
+            ("Bash", {"command": "ls"}),
+            ("Edit", {"file_path": "/x", "old_string": "a", "new_string": "b"}),
+            ("Write", {"file_path": "/x", "content": "c"}),
+            ("WebFetch", {"url": "https://x"}),
+            ("WebSearch", {"query": "q"}),
+            ("mcp__s__t", {"k": "v"}),
+            ("Other", {"k": "v"}),
+        ]:
+            out = r._format_permission_prompt(tool, inp)
+            assert "Reply in this thread" in out, f"hint missing for {tool}"
+
+
+@pytest.mark.asyncio
+async def test_on_notification_resolved_tool_use_falls_back_to_free_text(in_memory_db, tmp_path):
+    """If the latest tool_use has a matching tool_result, fall back to the generic stall."""
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_done_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    },
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_done_1",
+                        "content": "file1\nfile2",
+                    },
+                ],
+            },
+            "isSidechain": False,
+            "isMeta": False,
+        },
+    ]
+    with open(transcript_path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-fb",
+        3032,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_fb",
+        current_claude_session_id="sess-tui-fb",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    await registry.load_from_db()
+
+    await registry._on_notification({
+        "session_id": "sess-tui-fb",
+        "transcript_path": str(transcript_path),
+    })
+
+    await asyncio.sleep(0.05)
+
+    posts = fake_bot.get_post_calls()
+    assert len(posts) > 0
+    # No pending tool_use → generic stall message
+    assert "waiting for input" in posts[0]["content"]
+    assert "Claude wants to" not in posts[0]["content"]
+
+    # Drain
+    await approval_router.resolve_tui_by_text(3032, "drain", author_is_bot=False)
+    handler_task = registry._tui_handler_tasks.get("task-tui-fb")
+    if handler_task is not None:
+        await handler_task
+
+
+@pytest.mark.asyncio
 async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
     """_on_user_prompt_submit cancels pending TUI prompts via sentinel."""
     from bridge.approvals import ApprovalRouter

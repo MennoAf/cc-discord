@@ -2045,15 +2045,38 @@ class TaskRegistry:
         if existing is not None and not existing.done():
             return
 
-        # Otherwise it's a generic stall (free-text input expected). The
-        # Notification hook payload may include a `message` field (e.g.
-        # "Claude needs your permission to use Bash" or a custom string
-        # from /v1/notify); forward it to the handler so the Discord post
-        # carries the actual reason instead of a generic yellow banner.
-        handler_task = asyncio.create_task(
-            self._handle_free_text_stall(task, message=body.get("message")),
-            name=f"tui-free_text-{task.task_id[:8]}",
-        )
+        # Otherwise it's either a tool-permission prompt or a generic
+        # stall. Claude Code fires the Notification hook with only a bare
+        # "needs your attention" string for permission requests (no
+        # tool_name / tool_input), so we reconstruct context from the
+        # transcript: if the latest assistant tool_use has no matching
+        # tool_result yet, it's the one being prompted on. Post the rich
+        # permission-style message in that case. Otherwise fall back to
+        # the generic free-text stall, forwarding the hook's `message`
+        # field (if any) into the body of the post so the user sees the
+        # actual reason instead of a hardcoded yellow banner.
+        pending_tool: dict | None = None
+        if task.current_transcript_path:
+            try:
+                pending_tool = transcript.find_latest_unresolved_tool_use(
+                    Path(task.current_transcript_path)
+                )
+            except Exception:
+                logger.exception(
+                    "failed to read transcript for pending tool_use; task=%s",
+                    task.task_id,
+                )
+
+        if pending_tool is not None:
+            handler_task = asyncio.create_task(
+                self._handle_permission_stall(task, pending_tool),
+                name=f"tui-permission-{task.task_id[:8]}",
+            )
+        else:
+            handler_task = asyncio.create_task(
+                self._handle_free_text_stall(task, message=body.get("message")),
+                name=f"tui-free_text-{task.task_id[:8]}",
+            )
         self._track_tui_handler_task(task.task_id, handler_task)
 
 
@@ -2359,6 +2382,190 @@ class TaskRegistry:
             prompt_body=body,
         )
         await self._inject_to_pane(task, answer, source)
+
+    async def _handle_permission_stall(self, task: Task, tool_info: dict) -> None:
+        """Tool-permission stall: post the tool name + input, await reply.
+
+        Same wire as _handle_free_text_stall — Claude is blocked in its TUI
+        permission prompt. The bridge can't approve on Claude's behalf
+        (Notification is informational, not a gate), so we relay the
+        details and let the user respond either in zellij or via Discord
+        text reply (which gets injected to the pane).
+        """
+        if not self._approval_router:
+            logger.warning(
+                "approval_router not configured; cannot dispatch TUI prompt for task %s",
+                task.task_id,
+            )
+            return
+        tool_name = tool_info.get("name") or "?"
+        tool_input = tool_info.get("input") or {}
+        body = self._format_permission_prompt(tool_name, tool_input)
+        request_id = str(uuid.uuid4())
+        answer, source = await self._approval_router.request_tui_answer(
+            request_id=request_id,
+            task_id=task.task_id,
+            thread_id=task.thread_id,
+            pane_id=task.zellij_pane_id or "",
+            kind="free_text",
+            prompt_body=body,
+        )
+        await self._inject_to_pane(task, answer, source)
+
+    def _format_permission_prompt(self, tool_name: str, tool_input: dict) -> str:
+        """Render the permission-prompt body. Specialized formatters for
+        common tools (Bash, Edit, Write, NotebookEdit, WebFetch,
+        WebSearch, MCP); JSON dump fallback for anything else.
+
+        Discord's hard message limit is 2000 chars; Bot.post chunks
+        above that, but a single-message rendering is friendlier — so
+        per-section truncation is tighter than 1500."""
+        prefix = self._notify_mention_prefix()
+        hint = "Reply in this thread (e.g. `1` to approve) or answer in zellij."
+
+        if tool_name == "Bash":
+            return self._fmt_bash(prefix, tool_input, hint)
+        if tool_name == "Edit":
+            return self._fmt_edit(prefix, tool_input, hint)
+        if tool_name == "Write":
+            return self._fmt_write(prefix, tool_input, hint)
+        if tool_name == "NotebookEdit":
+            return self._fmt_notebook_edit(prefix, tool_input, hint)
+        if tool_name == "WebFetch":
+            return self._fmt_web_fetch(prefix, tool_input, hint)
+        if tool_name == "WebSearch":
+            return self._fmt_web_search(prefix, tool_input, hint)
+        if tool_name.startswith("mcp__"):
+            return self._fmt_mcp(prefix, tool_name, tool_input, hint)
+
+        header = f"{prefix}🛡 Claude wants to use `{tool_name}`"
+        if not tool_input:
+            return f"{header}\n{hint}"
+        s = json.dumps(tool_input, indent=2, default=str)
+        if len(s) > 1500:
+            s = s[:1500] + "\n...(truncated)..."
+        return f"{header}\n```json\n{s}\n```\n{hint}"
+
+    @staticmethod
+    def _truncate(s: str, limit: int) -> str:
+        if len(s) <= limit:
+            return s
+        return s[:limit] + "\n...(truncated)..."
+
+    @staticmethod
+    def _lang_for_path(path: str) -> str:
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        return {
+            "py": "python", "js": "javascript", "ts": "typescript",
+            "tsx": "tsx", "jsx": "jsx", "rs": "rust", "go": "go",
+            "rb": "ruby", "java": "java", "c": "c", "cpp": "cpp",
+            "h": "c", "hpp": "cpp", "cs": "csharp", "swift": "swift",
+            "kt": "kotlin", "sh": "bash", "zsh": "bash", "bash": "bash",
+            "fish": "fish", "json": "json", "yaml": "yaml", "yml": "yaml",
+            "toml": "toml", "xml": "xml", "html": "html", "css": "css",
+            "scss": "scss", "md": "markdown", "sql": "sql", "lua": "lua",
+            "r": "r", "php": "php", "pl": "perl", "vim": "vim",
+            "dockerfile": "dockerfile", "tf": "hcl", "hcl": "hcl",
+        }.get(ext, "")
+
+    def _fmt_bash(self, prefix: str, tool_input: dict, hint: str) -> str:
+        cmd = tool_input.get("command") or ""
+        desc = tool_input.get("description") or ""
+        header = f"{prefix}🛡 Claude wants to run `Bash`"
+        if desc:
+            header += f" — {desc}"
+        if cmd:
+            return f"{header}\n```bash\n{self._truncate(cmd, 1500)}\n```\n{hint}"
+        return f"{header}\n{hint}"
+
+    def _fmt_edit(self, prefix: str, tool_input: dict, hint: str) -> str:
+        path = tool_input.get("file_path") or "(no path)"
+        old = tool_input.get("old_string") or ""
+        new = tool_input.get("new_string") or ""
+        replace_all = tool_input.get("replace_all")
+        header = f"{prefix}🛡 Claude wants to use `Edit`"
+        if replace_all:
+            header += " *(replace_all)*"
+        # Split budget between old/new; cap each at ~700 chars so the
+        # combined diff stays under Discord's 2k single-message ceiling.
+        old_display = self._truncate(old, 700)
+        new_display = self._truncate(new, 700)
+        old_lines = "\n".join(f"- {line}" for line in old_display.split("\n"))
+        new_lines = "\n".join(f"+ {line}" for line in new_display.split("\n"))
+        body = (
+            f"{header}\n📄 `{path}`\n"
+            f"```diff\n{old_lines}\n{new_lines}\n```\n{hint}"
+        )
+        return body
+
+    def _fmt_write(self, prefix: str, tool_input: dict, hint: str) -> str:
+        path = tool_input.get("file_path") or "(no path)"
+        content = tool_input.get("content") or ""
+        header = f"{prefix}🛡 Claude wants to use `Write`"
+        lang = self._lang_for_path(path)
+        # 30 lines max OR 1400 chars max, whichever hits first.
+        lines = content.split("\n")
+        if len(lines) > 30:
+            content_display = "\n".join(lines[:30]) + f"\n...({len(lines) - 30} more lines)..."
+        else:
+            content_display = content
+        content_display = self._truncate(content_display, 1400)
+        if not content_display:
+            return f"{header}\n📄 `{path}` *(empty file)*\n{hint}"
+        return f"{header}\n📄 `{path}`\n```{lang}\n{content_display}\n```\n{hint}"
+
+    def _fmt_notebook_edit(self, prefix: str, tool_input: dict, hint: str) -> str:
+        path = tool_input.get("notebook_path") or "(no path)"
+        cell_id = tool_input.get("cell_id") or ""
+        cell_type = tool_input.get("cell_type") or "code"
+        edit_mode = tool_input.get("edit_mode") or "replace"
+        new_source = tool_input.get("new_source") or ""
+        header = f"{prefix}🛡 Claude wants to use `NotebookEdit`"
+        meta_bits = [f"mode: {edit_mode}", f"cell: {cell_type}"]
+        if cell_id:
+            meta_bits.append(f"id: {cell_id}")
+        meta = " · ".join(meta_bits)
+        lang = "python" if cell_type == "code" else "markdown"
+        source_display = self._truncate(new_source, 1400)
+        if not source_display:
+            return f"{header}\n📓 `{path}` ({meta}) *(empty source)*\n{hint}"
+        return f"{header}\n📓 `{path}` ({meta})\n```{lang}\n{source_display}\n```\n{hint}"
+
+    def _fmt_web_fetch(self, prefix: str, tool_input: dict, hint: str) -> str:
+        url = tool_input.get("url") or "(no url)"
+        wf_prompt = tool_input.get("prompt") or ""
+        header = f"{prefix}🛡 Claude wants to use `WebFetch`"
+        body = f"{header}\n🔗 {url}"
+        if wf_prompt:
+            body += f"\n> {self._truncate(wf_prompt, 500)}"
+        return f"{body}\n{hint}"
+
+    def _fmt_web_search(self, prefix: str, tool_input: dict, hint: str) -> str:
+        query = tool_input.get("query") or "(no query)"
+        allowed = tool_input.get("allowed_domains") or []
+        blocked = tool_input.get("blocked_domains") or []
+        header = f"{prefix}🛡 Claude wants to use `WebSearch`"
+        body = f"{header}\n🔍 `{self._truncate(query, 500)}`"
+        if allowed:
+            body += f"\nallowed: {', '.join(allowed[:10])}"
+        if blocked:
+            body += f"\nblocked: {', '.join(blocked[:10])}"
+        return f"{body}\n{hint}"
+
+    def _fmt_mcp(self, prefix: str, tool_name: str, tool_input: dict, hint: str) -> str:
+        # mcp__<server>__<tool> — split for readability. Some tool names
+        # also contain double-underscores inside their tool portion, so
+        # only split the first two segments.
+        parts = tool_name.split("__", 2)
+        if len(parts) == 3:
+            _, server, tool = parts
+            header = f"{prefix}🛡 Claude wants to use `{server}` → `{tool}`"
+        else:
+            header = f"{prefix}🛡 Claude wants to use `{tool_name}`"
+        if not tool_input:
+            return f"{header}\n{hint}"
+        s = json.dumps(tool_input, indent=2, default=str)
+        return f"{header}\n```json\n{self._truncate(s, 1400)}\n```\n{hint}"
 
     async def _inject_to_pane(self, task: Task, answer: str, source: str) -> None:
         """Inject the answer to the pane. Short-circuit if cancelled/timed out/post failed."""
