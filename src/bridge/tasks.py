@@ -35,8 +35,14 @@ TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" /
 # Per-task attachment directory for files relayed from Discord.
 ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
 
-# Hook scripts directory — resolved at import time for test monkeypatch support
-HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
+# Hook scripts directory — resolved at import time for test monkeypatch support.
+# BRIDGE_HOOKS_DIR overrides the package-relative path; required when installed
+# via uv tool / pipx (the wheel does not ship the hooks/ tree).
+HOOKS_DIR = (
+    Path(os.environ["BRIDGE_HOOKS_DIR"])
+    if os.environ.get("BRIDGE_HOOKS_DIR")
+    else Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
+)
 
 # Cap on how many recent subagent actions we render in a block.
 _SUBAGENT_BLOCK_MAX_ACTIONS = 5
