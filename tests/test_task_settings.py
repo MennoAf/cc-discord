@@ -3,7 +3,15 @@
 import json
 from pathlib import Path
 
-from bridge.tasks import _cleanup_task_settings, _write_task_settings
+import pytest
+
+from bridge.tasks import (
+    TaskRegistry,
+    _cleanup_task_settings,
+    _read_user_mcp_servers,
+    _write_task_settings,
+)
+from tests.fakes import FakeBot, FakeZellij
 
 
 class TestWriteTaskSettings:
@@ -154,3 +162,147 @@ class TestCleanupTaskSettings:
 
         # Should not raise an exception
         _cleanup_task_settings("missing", settings_dir=settings_dir)
+
+
+class TestReadUserMcpServers:
+    """Tests for _read_user_mcp_servers helper."""
+
+    def test_returns_servers_from_user_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When ~/.claude/settings.json exists with mcpServers, return them."""
+        fake_home = tmp_path / "home"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text(json.dumps({
+            "mcpServers": {
+                "loom": {"command": "uv", "args": ["run", "python", "-m", "loom.mcp"]},
+                "weft": {"type": "http", "url": "https://weft.example/mcp"},
+            }
+        }))
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        servers = _read_user_mcp_servers()
+
+        assert set(servers.keys()) == {"loom", "weft"}
+        assert servers["loom"]["command"] == "uv"
+
+    def test_missing_file_returns_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing ~/.claude/settings.json returns empty dict, doesn't raise."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        assert _read_user_mcp_servers() == {}
+
+    def test_no_mcp_servers_key_returns_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Settings file without mcpServers key returns empty dict."""
+        fake_home = tmp_path / "home"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": []}})
+        )
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        assert _read_user_mcp_servers() == {}
+
+    def test_malformed_json_returns_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed JSON returns empty dict, doesn't raise (logs warning)."""
+        fake_home = tmp_path / "home"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text("{not valid json")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        assert _read_user_mcp_servers() == {}
+
+
+class TestWriteTaskSettingsInjectsMcpServers:
+    """_write_task_settings copies user mcpServers into the task settings."""
+
+    def test_user_servers_injected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """User-scope mcpServers land in the generated task settings file."""
+        fake_home = tmp_path / "home"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text(json.dumps({
+            "mcpServers": {
+                "loom": {"command": "uv", "args": ["run", "python", "-m", "loom.mcp"]},
+            }
+        }))
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        settings_dir = tmp_path / "settings"
+        hooks_dir = tmp_path / "hooks"
+        hooks_dir.mkdir()
+        (hooks_dir / "event.py").write_text("# event hook")
+
+        out_path = _write_task_settings(
+            "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
+        )
+
+        written = json.loads(out_path.read_text())
+        assert "mcpServers" in written
+        assert written["mcpServers"]["loom"]["command"] == "uv"
+        # Hooks remain alongside MCP servers.
+        assert "hooks" in written
+
+    def test_no_user_servers_means_no_mcp_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When user has no mcpServers, the task settings file omits the key
+        entirely (not an empty dict) so Claude Code's existing behavior is
+        unchanged for users who don't use MCP."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        settings_dir = tmp_path / "settings"
+        hooks_dir = tmp_path / "hooks"
+        hooks_dir.mkdir()
+        (hooks_dir / "event.py").write_text("# event hook")
+
+        out_path = _write_task_settings(
+            "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
+        )
+
+        written = json.loads(out_path.read_text())
+        assert "mcpServers" not in written
+        assert "hooks" in written
+
+
+class TestBuildSpawnEnvForwardsPath:
+    """_build_spawn_env forwards the daemon's current PATH so spawned tabs
+    don't inherit the (frozen-at-session-create) zellij-server PATH."""
+
+    @pytest.mark.asyncio
+    async def test_path_present_in_spawn_env(
+        self, in_memory_db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The spawn env dict carries PATH copied from os.environ."""
+        monkeypatch.setenv("PATH", "/test/bin:/usr/local/bin:/usr/bin")
+        registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
+
+        env = registry._build_spawn_env("task-xyz")
+
+        assert env["PATH"] == "/test/bin:/usr/local/bin:/usr/bin"
+        # Bridge-owned keys still set.
+        assert env["CC_DISCORD_TASK_ID"] == "task-xyz"
+        assert "BRIDGE_URL" in env
+
+    @pytest.mark.asyncio
+    async def test_path_empty_when_unset(
+        self, in_memory_db, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing PATH in env yields empty string, doesn't raise."""
+        monkeypatch.delenv("PATH", raising=False)
+        registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
+
+        env = registry._build_spawn_env("task-xyz")
+
+        assert env["PATH"] == ""
