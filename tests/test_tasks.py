@@ -2888,10 +2888,13 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     assert handler_task is not None
     await handler_task
 
-    # Verify write_to_pane was called with "1\n"
-    assert len(fake_zellij._write_calls) == 1
-    assert fake_zellij._write_calls[0]["pane_id"] == "pane_1"
-    assert fake_zellij._write_calls[0]["text"] == "1\n"
+    # Single-select dispatch: digit + Tab (advance), then final Enter to
+    # submit. write_to_pane is NOT used for reaction-sourced answers.
+    assert fake_zellij._write_calls == []
+    assert len(fake_zellij._send_keys_calls) == 2
+    assert fake_zellij._send_keys_calls[0]["pane_id"] == "pane_1"
+    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1"), 9]
+    assert fake_zellij._send_keys_calls[1]["bytes"] == [13]
 
 
 @pytest.mark.asyncio
@@ -3644,3 +3647,178 @@ class TestTaskSettingsIntegration:
 
         # Verify task was auto-removed from tracking
         assert task.task_id not in registry._tui_handler_tasks
+
+
+@pytest.mark.asyncio
+async def test_on_notification_ask_user_question_three_questions(in_memory_db, tmp_path):
+    """Regression for the 'third question always picks the wrong number' bug.
+
+    Each single-select answer must dispatch `digit + Tab` (advance) rather
+    than `digit + Enter`, then one final Enter to submit the whole form.
+    With Enter-to-advance, the trailing per-question Enter raced the
+    final-submit Enter and captured the wrong selection for the last Q.
+    """
+    from bridge.approvals import ApprovalRouter
+    import json
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
+
+    # Multi-question AskUserQuestion: three single-select questions in one call.
+    transcript_path = tmp_path / "transcript.jsonl"
+    questions = [
+        {
+            "question": f"Q{i}?",
+            "options": [{"label": f"opt{j}", "description": ""} for j in range(1, 4)],
+        }
+        for i in range(1, 4)
+    ]
+    entry = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_ask_three",
+                    "name": "AskUserQuestion",
+                    "input": {"questions": questions},
+                }
+            ],
+        },
+        "isSidechain": False,
+        "isMeta": False,
+    }
+    with open(transcript_path, "w") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    await upsert_task(
+        in_memory_db,
+        "task-tui-3q",
+        3777,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_3q",
+        current_claude_session_id="sess-3q",
+        current_transcript_path=str(transcript_path),
+    )
+
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
+    registry._PRE_PROMPT_FLUSH_SECS = 0.0
+    await registry.load_from_db()
+
+    await registry._on_notification({
+        "session_id": "sess-3q",
+        "transcript_path": str(transcript_path),
+    })
+
+    handler_task = registry._tui_handler_tasks.get("task-tui-3q")
+    assert handler_task is not None
+
+    # Answer each question in sequence. The handler dispatches one question
+    # at a time, so we poll for the next pending entry, resolve it, and
+    # repeat. The FakeBot returns message_id 1001 for every post — but the
+    # router pops the entry on cleanup before posting the next, so the
+    # collision is harmless under sequential resolution.
+    answers = ["1️⃣", "2️⃣", "3️⃣"]
+    for emoji in answers:
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            pending = approval_router._tui_by_message_id
+            if pending:
+                msg_id = next(iter(pending.keys()))
+                break
+        else:
+            pytest.fail(f"no pending TUI message arrived for emoji={emoji}")
+        resolved = await approval_router.resolve_tui_by_reaction(msg_id, emoji, user_is_bot=False)
+        assert resolved is True, f"failed to resolve reaction {emoji}"
+
+    await handler_task
+
+    # write_to_pane should be untouched for reaction-sourced answers.
+    assert fake_zellij._write_calls == []
+
+    # Expected sequence:
+    #   Q1: ord("1"), 9  (digit + Tab)
+    #   Q2: ord("2"), 9
+    #   Q3: ord("3"), 9
+    #   final: 13       (Enter submits the whole form)
+    assert len(fake_zellij._send_keys_calls) == 4
+    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1"), 9]
+    assert fake_zellij._send_keys_calls[1]["bytes"] == [ord("2"), 9]
+    assert fake_zellij._send_keys_calls[2]["bytes"] == [ord("3"), 9]
+    assert fake_zellij._send_keys_calls[3]["bytes"] == [13]
+
+
+@pytest.mark.asyncio
+async def test_extract_task_id_parses_string_response():
+    """Bug 2 regression: TaskCreate's response is a STRING ('Task #N created
+    successfully: <subject>'), not a dict — so the bridge must parse the
+    numeric id out of it. Otherwise TaskUpdate(taskId='N') later creates
+    a phantom entry instead of updating the original."""
+
+    extract = TaskRegistry._extract_task_id
+
+    # Real shape from Claude Code's TaskCreate response.
+    assert extract("Task #1 created successfully: Branch setup", {"subject": "Branch setup"}) == "1"
+    assert extract("Task #42 created successfully: x", {"subject": "x"}) == "42"
+
+    # TaskUpdate-style response strings should also yield the id.
+    assert extract("Updated task #3 status", {}) == "3"
+
+    # Case-insensitive on the "task" word.
+    assert extract("TASK #7 created", {"subject": "y"}) == "7"
+
+    # Empty / unrelated string falls back to synth-from-subject.
+    assert extract("", {"subject": "fallback"}) == "~fallback"
+    assert extract("nothing useful here", {"subject": "fb2"}) == "~fb2"
+
+    # Dict response with explicit id wins over string parsing.
+    assert extract({"id": "abc"}, {"subject": "z"}) == "abc"
+    assert extract({"taskId": 9}, {"subject": "z"}) == "9"
+
+    # Nothing at all → None.
+    assert extract("", {}) is None
+
+
+@pytest.mark.asyncio
+async def test_update_task_list_state_merges_taskcreate_and_taskupdate(in_memory_db, tmp_path):
+    """End-to-end check: a TaskCreate whose response carries 'Task #1 ...'
+    followed by TaskUpdate(taskId='1', status='completed') should yield a
+    SINGLE entry keyed by '1', not a synth-id orphan + a phantom '1' entry."""
+
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+    await registry.load_from_db()
+
+    await upsert_task(
+        in_memory_db,
+        "task-tlstate",
+        4321,
+        "/tmp",
+        "running",
+        zellij_pane_id="pane_x",
+        current_claude_session_id="sess-tlstate",
+    )
+    await registry.load_from_db()
+    task = registry.get_by_task_id("task-tlstate")
+    assert task is not None
+
+    registry._update_task_list_state(
+        task,
+        "TaskCreate",
+        {"subject": "Phase 1: Context Gathering"},
+        "Task #1 created successfully: Phase 1: Context Gathering",
+    )
+    registry._update_task_list_state(
+        task,
+        "TaskUpdate",
+        {"taskId": "1", "status": "completed"},
+        "Updated task #1 status",
+    )
+
+    assert list(task.task_list_state.keys()) == ["1"]
+    assert task.task_list_state["1"]["status"] == "completed"
+    assert task.task_list_state["1"]["subject"] == "Phase 1: Context Gathering"

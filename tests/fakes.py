@@ -127,6 +127,7 @@ class FakeZellij:
     _spawn_calls: list[dict] = field(default_factory=list)
     _write_calls: list[dict] = field(default_factory=list)
     _close_calls: list[dict] = field(default_factory=list)
+    _send_keys_calls: list[dict] = field(default_factory=list)
 
     async def spawn_task(
         self, cwd: str, pane_name: str, layout_path: str
@@ -142,6 +143,10 @@ class FakeZellij:
     async def write_to_pane(self, pane_id: str, text: str) -> None:
         """Fake write_to_pane."""
         self._write_calls.append({"pane_id": pane_id, "text": text})
+
+    async def send_keys(self, pane_id: str, *byte_vals: int) -> None:
+        """Fake send_keys."""
+        self._send_keys_calls.append({"pane_id": pane_id, "bytes": list(byte_vals)})
 
     async def close_pane(self, pane_id: str) -> None:
         """Fake close_pane."""

@@ -1467,11 +1467,20 @@ class TaskRegistry:
             task.task_list_state = new_state
 
     @staticmethod
-    def _extract_task_id(tool_response: dict, tool_input: dict) -> str | None:
-        """Pull a task id out of a TaskCreate response. Falls back to a
-        synthesized id derived from the subject if nothing's in the
-        response (rendering still works; subsequent TaskUpdate by real id
-        won't merge but that's a minor display glitch)."""
+    def _extract_task_id(tool_response, tool_input: dict) -> str | None:
+        """Pull a task id out of a TaskCreate response.
+
+        Real Claude Code returns the response as a plain string like
+        `"Task #1 created successfully: Branch setup"`, so the dict lookup
+        falls through and we parse `#N` out of that. Without this, every
+        TaskCreate gets a synthesized `~<subject>` id that doesn't match
+        the numeric id Claude uses in later TaskUpdate calls — those then
+        create phantom entries instead of merging.
+
+        Falls back to a synthesized id derived from the subject if nothing
+        else works (rendering still works; subsequent TaskUpdate by real
+        id won't merge but that's a minor display glitch).
+        """
         for src in (tool_response, tool_input):
             if not isinstance(src, dict):
                 continue
@@ -1479,6 +1488,16 @@ class TaskRegistry:
                 val = src.get(key)
                 if val is not None:
                     return str(val)
+
+        # String response: parse "Task #N created" / "Updated task #N" /
+        # similar shapes. Match the FIRST `#<digits>` after a word like
+        # "task" so we don't capture random `#NNN` substrings from a
+        # subject like "fix issue #42".
+        if isinstance(tool_response, str):
+            m = re.search(r"\btask\s*#(\d+)\b", tool_response, re.IGNORECASE)
+            if m:
+                return m.group(1)
+
         # No id found — synthesize from subject so it at least renders.
         subject = tool_input.get("subject") if isinstance(tool_input, dict) else None
         if isinstance(subject, str) and subject.strip():
@@ -2385,9 +2404,35 @@ class TaskRegistry:
                         "failed to type multi-select keys for task %s", task.task_id
                     )
             else:
-                # Single-select: existing flow types `answer + "\n"` which
-                # selects + advances.
-                await self._inject_to_pane(task, answer, source)
+                # Single-select: digit selects the option, Tab advances to
+                # the next question (or the Submit button on the last one).
+                # We do NOT use Enter to advance — Enter submits the whole
+                # form, which by the last question races the final-submit
+                # Enter and captured the wrong selection.
+                #
+                # Reaction-sourced answers are always single-digit "1"-"4"
+                # (from `_NUMERIC_REACTIONS`); free-text replies could be a
+                # number or a free-form string, both of which we still want
+                # to inject literally and let claude's TUI parse — so for
+                # non-reaction sources we fall through to the legacy
+                # digit + Enter path.
+                if (
+                    source == "reaction"
+                    and isinstance(answer, str)
+                    and len(answer) == 1
+                    and answer.isdigit()
+                ):
+                    try:
+                        await self._zellij.send_keys(
+                            task.zellij_pane_id, ord(answer), 9
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to type single-select keys for task %s",
+                            task.task_id,
+                        )
+                else:
+                    await self._inject_to_pane(task, answer, source)
 
             any_answered = True
             # Brief pause so claude's TUI has time to advance before we post
@@ -2570,6 +2615,20 @@ class TaskRegistry:
             text += f" {args}"
         text += "\n"
         await self._zellij.write_to_pane(task.zellij_pane_id, text)
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
+    async def set_effort(self, task_id: str, level: str) -> None:
+        """Send `/effort <level>` to the task's pane so the claude TUI
+        adjusts the session effort level. Raises TaskNotFound if the task
+        isn't tracked or TaskSpawnError if the pane isn't ready yet.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(f"task {task_id[:8]} not found")
+        if task.zellij_pane_id is None:
+            raise TaskSpawnError(f"task {task_id[:8]} has no pane yet")
+        await self._zellij.write_to_pane(task.zellij_pane_id, f"/effort {level}\n")
         task.last_activity = int(time.time())
         await self._persist(task)
 
