@@ -46,6 +46,21 @@ class ApprovalLogRow:
     decided_at: int
 
 
+@dataclass(frozen=True)
+class PinRow:
+    """A pinned channel row from the database.
+
+    A pin binds a Discord channel to a cwd. When a message arrives in a pinned
+    channel and no live task is bound, the bridge auto-spawns a task in `cwd`
+    and binds it to `channel_id`.
+    """
+
+    channel_id: int
+    cwd: str
+    created_at: int
+    last_used_at: int
+
+
 async def init_schema(conn: aiosqlite.Connection) -> None:
     """Create the schema (idempotent — uses CREATE TABLE IF NOT EXISTS).
     Public so tests/conftest.py can reuse it without duplicating SQL."""
@@ -93,6 +108,14 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_approval_log_task_id ON approval_log(task_id)"
     )
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pins (
+            channel_id INTEGER PRIMARY KEY,
+            cwd TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL
+        )
+    """)
     await conn.commit()
 
 
@@ -326,5 +349,68 @@ async def list_approvals_for_task(conn: aiosqlite.Connection, task_id: str) -> l
             decision_reason=row[5],
             decided_at=row[6],
         )
+        for row in rows
+    ]
+
+
+async def get_pin(conn: aiosqlite.Connection, channel_id: int) -> PinRow | None:
+    """Retrieve a pin by channel_id. Returns None if not pinned."""
+    cursor = await conn.execute(
+        "SELECT channel_id, cwd, created_at, last_used_at FROM pins WHERE channel_id = ?",
+        (channel_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return PinRow(channel_id=row[0], cwd=row[1], created_at=row[2], last_used_at=row[3])
+
+
+async def upsert_pin(
+    conn: aiosqlite.Connection,
+    channel_id: int,
+    cwd: str,
+    *,
+    now: int | None = None,
+) -> None:
+    """Insert or update a pin. Bumps last_used_at; preserves created_at on conflict."""
+    now_val = now or int(time.time())
+    await conn.execute(
+        """
+        INSERT INTO pins (channel_id, cwd, created_at, last_used_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            cwd=excluded.cwd,
+            last_used_at=excluded.last_used_at
+        """,
+        (channel_id, cwd, now_val, now_val),
+    )
+    await conn.commit()
+
+
+async def touch_pin(conn: aiosqlite.Connection, channel_id: int, *, now: int | None = None) -> None:
+    """Bump last_used_at without changing cwd. No-op if the pin doesn't exist."""
+    now_val = now or int(time.time())
+    await conn.execute(
+        "UPDATE pins SET last_used_at = ? WHERE channel_id = ?",
+        (now_val, channel_id),
+    )
+    await conn.commit()
+
+
+async def delete_pin(conn: aiosqlite.Connection, channel_id: int) -> bool:
+    """Delete a pin. Returns True if a row was deleted, False if no pin existed."""
+    cursor = await conn.execute("DELETE FROM pins WHERE channel_id = ?", (channel_id,))
+    await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def list_pins(conn: aiosqlite.Connection) -> list[PinRow]:
+    """List all pins, ordered by last_used_at DESC."""
+    cursor = await conn.execute(
+        "SELECT channel_id, cwd, created_at, last_used_at FROM pins ORDER BY last_used_at DESC"
+    )
+    rows = await cursor.fetchall()
+    return [
+        PinRow(channel_id=row[0], cwd=row[1], created_at=row[2], last_used_at=row[3])
         for row in rows
     ]

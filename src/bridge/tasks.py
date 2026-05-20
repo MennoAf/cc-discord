@@ -21,7 +21,17 @@ import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
 from bridge.bot import BotNotReady
 from bridge.listener import MessageLike
-from bridge.state import TaskRow, list_active_tasks, upsert_task
+from bridge.state import (
+    PinRow,
+    TaskRow,
+    delete_pin,
+    get_pin,
+    list_active_tasks,
+    list_pins,
+    touch_pin,
+    upsert_pin,
+    upsert_task,
+)
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
@@ -519,6 +529,11 @@ class TaskRegistry:
         # Discord-side reconciliation notices staged by load_from_db. Flushed by
         # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
+        # Per-channel locks for auto-spawn on pinned channels. Two messages
+        # arriving in the same tick must not race into two spawns; whichever
+        # acquires first spawns, the second re-checks under the lock and
+        # routes to the now-bound task.
+        self._pin_spawn_locks: dict[int, asyncio.Lock] = {}
 
     def bind_bot(self, bot: "Bot") -> None:
         """Attach the Bot instance after construction. Called once by
@@ -783,12 +798,20 @@ class TaskRegistry:
             self._aggregators[task.task_id] = agg
         return agg
 
-    async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
+    async def spawn_task(
+        self,
+        cwd: str,
+        *,
+        prompt: str | None = None,
+        channel_id: int | None = None,
+    ) -> Task:
         """Spawn a new claude session in a Discord-bound task.
 
         1. Validates cwd is a directory.
         2. Generates a task_id UUID.
-        3. Creates a Discord thread.
+        3. Either creates a new Discord thread (default) OR binds to the
+           caller-provided `channel_id` (used by /pin auto-spawn so a pinned
+           channel acts as its own session destination).
         4. Persists a row with status='spawning'.
         5. Builds env with CC_DISCORD_TASK_ID and BRIDGE_URL.
         6. Spawns claude in zellij via ZellijManager.
@@ -810,9 +833,15 @@ class TaskRegistry:
         # Generate task_id
         task_id = str(uuid.uuid4())
 
-        # Create Discord thread
-        thread_name = f"cc · {Path(cwd).name} · {task_id[:8]}"
-        thread_id = await self._bot.create_thread(name=thread_name)
+        # Destination: an existing pinned channel, or a fresh thread.
+        # The `thread_id` column on `tasks` is "the Discord destination id"
+        # — for legacy thread-bound tasks it's a thread id, for pinned
+        # channels it's a channel id. Routing keys off it either way.
+        if channel_id is not None:
+            thread_id = channel_id
+        else:
+            thread_name = f"cc · {Path(cwd).name} · {task_id[:8]}"
+            thread_id = await self._bot.create_thread(name=thread_name)
 
         # Persist row with status='spawning'
         now = int(time.time())
@@ -877,10 +906,14 @@ class TaskRegistry:
                 )
             except Exception:
                 logger.exception("failed to post spawn-failure notice for task %s", task_id)
-            try:
-                await self._archive_thread(thread_id)
-            except Exception:
-                logger.exception("failed to archive thread for failed spawn %s", task_id)
+            # Only archive freshly-created threads on failure. A pinned
+            # channel pre-existed before this spawn, so archiving it would
+            # destroy state we don't own.
+            if channel_id is None:
+                try:
+                    await self._archive_thread(thread_id)
+                except Exception:
+                    logger.exception("failed to archive thread for failed spawn %s", task_id)
             raise
 
         # Update row with zellij_pane_id (bump last_activity)
@@ -923,6 +956,15 @@ class TaskRegistry:
         """
         thread_id = msg.channel.id
         task = self.get_by_thread_id(thread_id)
+
+        # Pinned-channel auto-spawn: if the destination is a pinned channel and
+        # no live task is bound, spawn one so the user's message lands in a
+        # fresh session. Preserves existing semantics for non-pinned channels.
+        if task is None or task.status not in ("running", "spawning"):
+            spawned = await self._maybe_spawn_for_pinned(thread_id)
+            if spawned is not None:
+                task = spawned
+
         if task is None:
             return False
         if task.zellij_pane_id is None:
@@ -985,6 +1027,80 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
         return True
+
+    async def _maybe_spawn_for_pinned(self, channel_id: int) -> Task | None:
+        """If `channel_id` is pinned and has no live task, spawn one and return it.
+
+        Returns None if the channel isn't pinned or spawn fails. Returns the
+        existing live task if another caller spawned first (race-safe via the
+        per-channel lock). Waits up to 10s for SessionStart binding so the
+        caller's next write lands in a ready pane.
+        """
+        pin = await get_pin(self._conn, channel_id)
+        if pin is None:
+            return None
+
+        lock = self._pin_spawn_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            # Re-check under the lock — another concurrent message may have
+            # already spawned. Existing live tasks short-circuit.
+            existing = self.get_by_thread_id(channel_id)
+            if existing is not None and existing.status in ("running", "spawning"):
+                return existing
+
+            logger.info(
+                "pinned auto-spawn: channel=%s cwd=%s", channel_id, pin.cwd
+            )
+            try:
+                task = await self.spawn_task(cwd=pin.cwd, channel_id=channel_id)
+            except TaskSpawnError as e:
+                logger.error(
+                    "pinned auto-spawn failed for channel %s (cwd=%s): %s",
+                    channel_id,
+                    pin.cwd,
+                    e,
+                )
+                return None
+
+            await touch_pin(self._conn, channel_id)
+
+            # Wait for claude SessionStart so the immediately-following relay
+            # writes don't race the pane initialization. Bounded timeout —
+            # if claude is slow, fall through and let the message attempt land
+            # anyway (worst case: user resends). Configurable via
+            # BRIDGE_SPAWN_BIND_TIMEOUT_SECS (default 60s).
+            deadline = asyncio.get_running_loop().time() + SPAWN_BIND_TIMEOUT_SECS
+            while asyncio.get_running_loop().time() < deadline:
+                refreshed = self.get_by_task_id(task.task_id)
+                if (
+                    refreshed is not None
+                    and refreshed.current_claude_session_id is not None
+                ):
+                    return refreshed
+                await asyncio.sleep(0.1)
+            logger.warning(
+                "pinned spawn %s did not bind within %.0fs; relaying anyway",
+                task.task_id[:8], SPAWN_BIND_TIMEOUT_SECS,
+            )
+            return self.get_by_task_id(task.task_id) or task
+
+    async def pin_channel(self, channel_id: int, cwd: str) -> None:
+        """Bind a Discord channel to a cwd for auto-spawn on next message."""
+        if not Path(cwd).is_dir():
+            raise ValueError(f"cwd does not exist: {cwd}")
+        await upsert_pin(self._conn, channel_id, cwd)
+
+    async def unpin_channel(self, channel_id: int) -> bool:
+        """Remove a pin. Returns True if a pin was removed, False if no pin existed."""
+        return await delete_pin(self._conn, channel_id)
+
+    async def get_pin_for(self, channel_id: int) -> PinRow | None:
+        """Retrieve the pin for a channel."""
+        return await get_pin(self._conn, channel_id)
+
+    async def list_all_pins(self) -> list[PinRow]:
+        """List all pinned channels."""
+        return await list_pins(self._conn)
 
     async def _write_with_retry(self, task: Task, payload: str) -> bool:
         """Type `payload` into the task's pane, retrying once on ZellijError.

@@ -122,6 +122,7 @@ def init() -> None:
     click.echo("   - View Channel")
     click.echo("   - Send Messages")
     click.echo("   - Create Public Threads")
+    click.echo("   - Manage Channels  (required for /pin; safe to omit if you won't use it)")
     click.echo()
 
     # Write secrets

@@ -12,7 +12,7 @@ Runs as a small Python daemon (`aiohttp` + `discord.py`) on `127.0.0.1:8787`. Tw
 - **`/ask-discord` skill** — Claude calls this when blocked; the question lands in the thread, the daemon waits up to 15 min for your reply, and Claude continues.
 
 **Discord-driven mode** (`/start` from Discord spawns Claude in a zellij tab):
-- Slash commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`.
+- Slash commands manage the lifecycle: `/start`, `/spawn`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`, `/pin`, `/unpin`.
 - The bridge mirrors assistant text, tool use (with fenced diffs for Edit/Write), subagent activity (live-updated embed per agent), and the session's task list back to its thread.
 - Discord replies in the thread relay into the pane; attachments are saved and their paths get inlined into the prompt so Claude reads them with the `Read` tool. Voice memos are auto-transcribed (Wispr Flow API or local `whisper`).
 - `AskUserQuestion` and `ExitPlanMode` round-trip through Discord reactions / text replies — no need to attach to the pane to answer.
@@ -32,7 +32,7 @@ A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallba
 
 1. https://discord.com/developers/applications → **New Application** → **Bot** tab → **Reset Token**, copy it.
 2. **Privileged Gateway Intents** → enable **Message Content Intent**. Save.
-3. **OAuth2 → URL Generator** → scopes: `bot` → bot permissions: `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Read Message History` → open the generated URL → invite the bot to your server.
+3. **OAuth2 → URL Generator** → scopes: `bot` → bot permissions: `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Read Message History` (+ `Manage Channels` if you'll use `/pin`) → open the generated URL → invite the bot to your server.
 4. In the Discord client: User Settings → Advanced → enable **Developer Mode** → right-click the target channel → **Copy Channel ID**.
 
 ### 2. Bridge daemon
@@ -189,6 +189,7 @@ Spawning Claude Code sessions directly from Discord slash commands. Each task is
 | Command | What it does |
 |---|---|
 | `/start cwd:<path> [prompt:<text>]` | Spawn a new Claude session in `cwd`, opens a fresh thread, optionally writes the initial prompt after bind. |
+| `/spawn project:<picker> [prompt:<text>]` | Same as `/start` but the `project` arg is an autocompleted picker over immediate subfolders of `BRIDGE_PROJECT_ROOTS` — no typing paths. |
 | `/list` | List active tasks with status, cwd leaf, age, and thread link. |
 | `/stop [thread:<#thread>]` | Graceful stop — writes `/exit` to the pane, archives the thread on session end. |
 | `/kill [thread:<#thread>]` | Force-close the pane — marks the task crashed, archives the thread. |
@@ -197,6 +198,8 @@ Spawning Claude Code sessions directly from Discord slash commands. Each task is
 | `/rename [name:<text>]` | Rename the thread; omit `name` to auto-generate via `claude -p` against the transcript. |
 | `/stats [thread:<#thread>]` | Token / cost / context-fill stats for the task, parsed from its transcript. |
 | `/tasks [thread:<#thread>]` | Show the session's `TaskCreate`/`TaskUpdate` mirror as an embed. |
+| `/pin [name:<text>] [project:<picker>]` | Create a Discord channel bound to a cwd. Inside a task thread, inherits that thread's cwd; outside, the `project:` autocomplete picks one from `BRIDGE_PROJECT_ROOTS`. Subsequent messages in the new channel auto-spawn a Claude session if none is live. Requires `Manage Channels` permission. |
+| `/unpin` | Remove the pin binding from the current channel (the channel itself is not deleted). Future messages won't auto-spawn. |
 
 Commands without an explicit `thread:` argument operate on the task whose thread you're invoking from.
 
