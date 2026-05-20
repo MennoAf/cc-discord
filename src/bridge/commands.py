@@ -13,7 +13,14 @@ from discord import app_commands
 
 from bridge import skills, usage
 from bridge.bot import Bot
-from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
+from bridge.tasks import (
+    SPAWN_BIND_TIMEOUT_SECS,
+    Task,
+    TaskNotFound,
+    TaskRegistry,
+    TaskRestartError,
+    TaskSpawnError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +55,15 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
         # If a prompt was provided, wait for SessionStart to bind, then write it.
         if prompt:
             try:
-                await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
+                await _wait_for_session_bind(
+                    registry, task.task_id, timeout=SPAWN_BIND_TIMEOUT_SECS
+                )
                 await registry.write_initial_prompt(task.task_id, prompt)
             except asyncio.TimeoutError:
-                logger.warning("task %s did not bind within 10s", task.task_id)
+                logger.warning(
+                    "task %s did not bind within %.0fs",
+                    task.task_id, SPAWN_BIND_TIMEOUT_SECS,
+                )
 
         thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
         await interaction.followup.send(
