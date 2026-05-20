@@ -498,8 +498,10 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
 
     # Build and sync the slash command tree
     from bridge.commands import build_tree
+    from bridge.projects import load_projects_from_env
 
-    tree = build_tree(bot, task_registry)
+    projects = load_projects_from_env()
+    tree = build_tree(bot, task_registry, projects)
     # Wait for bot to be ready before syncing commands
     while not bot.is_ready:
         await asyncio.sleep(0.1)

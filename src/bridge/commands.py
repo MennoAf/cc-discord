@@ -13,6 +13,7 @@ from discord import app_commands
 
 from bridge import skills, usage
 from bridge.bot import Bot
+from bridge.projects import Project
 from bridge.tasks import (
     SPAWN_BIND_TIMEOUT_SECS,
     Task,
@@ -31,9 +32,25 @@ class _NotInTaskThread(Exception):
     pass
 
 
-def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
-    """Construct and return the CommandTree (not yet synced; caller decides when)."""
+def build_tree(
+    bot: Bot,
+    registry: TaskRegistry,
+    projects: list[Project] | None = None,
+) -> app_commands.CommandTree:
+    """Construct and return the CommandTree (not yet synced; caller decides when).
+
+    `projects` is the cached list of spawnable projects enumerated from
+    BRIDGE_PROJECT_ROOTS at startup. When None or empty, /spawn still
+    registers but reports that no roots are configured.
+    """
     tree = app_commands.CommandTree(bot.client)
+    projects_list: list[Project] = list(projects or [])
+    # Key used as the slash command choice value: `{root_label}/{name}`.
+    # Bounded well under Discord's 100-char value limit and unique enough
+    # to disambiguate same-named folders across roots.
+    projects_by_key: dict[str, Project] = {
+        f"{p.root_label}/{p.name}": p for p in projects_list
+    }
 
     @tree.command(name="start", description="Start a new Claude task in a fresh thread")
     @app_commands.describe(
@@ -68,6 +85,71 @@ def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
         thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
         await interaction.followup.send(
             f"✅ Started task `{task.task_id[:8]}` → <#{task.thread_id}> ({thread_url})",
+            ephemeral=True,
+        )
+
+    async def _project_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        cur = current.lower()
+        out: list[app_commands.Choice[str]] = []
+        for key, proj in projects_by_key.items():
+            if cur and cur not in proj.name.lower() and cur not in proj.root_label.lower():
+                continue
+            label = f"{proj.name} — {proj.root_label}"
+            out.append(
+                app_commands.Choice(name=label[:100], value=key[:100])
+            )
+            if len(out) >= 25:
+                break
+        return out
+
+    @tree.command(
+        name="spawn",
+        description="Spawn a Claude task in a configured project folder (see BRIDGE_PROJECT_ROOTS)",
+    )
+    @app_commands.describe(
+        project="Project folder (autocomplete shows immediate subfolders of BRIDGE_PROJECT_ROOTS)",
+        prompt="Optional first message to send after the task is bound",
+    )
+    @app_commands.autocomplete(project=_project_autocomplete)
+    async def spawn(
+        interaction: discord.Interaction,
+        project: str,
+        prompt: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not projects_by_key:
+            await interaction.followup.send(
+                "❌ No project roots configured. Set `BRIDGE_PROJECT_ROOTS` "
+                "(colon-separated parent paths) and restart the daemon.",
+                ephemeral=True,
+            )
+            return
+        proj = projects_by_key.get(project)
+        if proj is None:
+            await interaction.followup.send(
+                f"❌ Unknown project `{project}`. Pick one from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+        try:
+            task = await registry.spawn_task(cwd=str(proj.path), prompt=None)
+        except TaskSpawnError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
+        if prompt:
+            try:
+                await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
+                await registry.write_initial_prompt(task.task_id, prompt)
+            except asyncio.TimeoutError:
+                logger.warning("task %s did not bind within 10s", task.task_id)
+
+        thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
+        await interaction.followup.send(
+            f"✅ Started task `{task.task_id[:8]}` in `{proj.name}` "
+            f"({proj.root_label}) → <#{task.thread_id}> ({thread_url})",
             ephemeral=True,
         )
 

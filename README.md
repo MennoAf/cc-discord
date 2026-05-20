@@ -238,6 +238,7 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 | `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
 | `BRIDGE_CONTEXT_LIMIT` | _(model default)_ | Override the per-model context window for `/stats` math (e.g. `1000000` for `[1m]`). |
+| `BRIDGE_PROJECT_ROOTS` | _(unset)_ | Colon-separated parent paths whose immediate subfolders are spawnable from `/spawn`'s autocomplete picker. Example: `/Users/me/code/Work:/Users/me/code/Personal`. |
 | `BRIDGE_SPAWN_BIND_TIMEOUT_SECS` | `60` | How long to wait for claude's `SessionStart` hook before giving up and relaying the user's message anyway. Cold-start with multiple MCP servers + plugin sync regularly takes 15–40s; bump higher on slow hardware. |
 | `WISPR_FLOW_API_TOKEN` | _(unset)_ | If set, voice memos use Wispr Flow's API; otherwise local `whisper`. |
 | `BRIDGE_WHISPER_BIN` | `whisper` | Override the local-whisper binary path. |
