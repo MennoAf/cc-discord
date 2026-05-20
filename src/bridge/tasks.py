@@ -44,6 +44,13 @@ HOOKS_DIR = (
     else Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
 )
 
+# How long to wait for claude's SessionStart hook to fire before we give up
+# and relay the user's message anyway. Cold-start with multiple MCP servers
+# attaching + plugin sync is regularly 15-40s on modest hardware, so a small
+# fixed value like 10s drops messages on busy setups. Configurable via
+# BRIDGE_SPAWN_BIND_TIMEOUT_SECS; default 60s leaves ample headroom.
+SPAWN_BIND_TIMEOUT_SECS = float(os.environ.get("BRIDGE_SPAWN_BIND_TIMEOUT_SECS", "60"))
+
 # Cap on how many recent subagent actions we render in a block.
 _SUBAGENT_BLOCK_MAX_ACTIONS = 5
 # Don't edit a block's Discord message more often than this; coalesces
@@ -93,6 +100,37 @@ def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
     return cleaned, paths[:_MAX_ATTACHMENTS_PER_POST]
 
 
+def _read_user_mcp_servers() -> dict:
+    """Read user-scope mcpServers from `~/.claude/settings.json`.
+
+    Passing `--settings <task.json>` to `claude` prevents it from inheriting
+    user-scope mcpServers entries — without this, Discord-spawned tasks see
+    none of the user's MCP tools (loom, weft, etc.). Copy them into the
+    per-task settings so each spawned session has the same toolset the user
+    would get from a normal interactive `claude` invocation.
+
+    Returns an empty dict if the file is missing or unparseable; logs but
+    does not raise, so a malformed user settings file never blocks spawn.
+    """
+    user_settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        with open(user_settings_path) as f:
+            data = json.load(f)
+        servers = data.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            logger.warning(
+                "user mcpServers in %s is not a dict (got %s); ignoring",
+                user_settings_path, type(servers).__name__,
+            )
+            return {}
+        return servers
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("failed to read user mcpServers from %s: %s", user_settings_path, e)
+        return {}
+
+
 def _write_task_settings(
     task_id: str, *, settings_dir: Path = TASK_SETTINGS_DIR, hooks_dir: Path = HOOKS_DIR
 ) -> Path:
@@ -106,6 +144,10 @@ def _write_task_settings(
     PreToolUse traffic is left unhooked so the user's permission mode
     (typically `defaultMode: "auto"`) drives approvals via Claude Code's
     own classifier.
+
+    Also copies user-scope `mcpServers` from `~/.claude/settings.json` into
+    the per-task settings — `claude --settings <file>` doesn't inherit them
+    otherwise, so Discord-spawned sessions would lose loom/weft/etc.
     """
     settings_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings_dir / f"{task_id}.json"
@@ -146,6 +188,10 @@ def _write_task_settings(
             ],
         }
     }
+
+    user_mcp_servers = _read_user_mcp_servers()
+    if user_mcp_servers:
+        settings["mcpServers"] = user_mcp_servers
 
     out_path.write_text(json.dumps(settings, indent=2))
     return out_path
@@ -640,13 +686,18 @@ class TaskRegistry:
     def _build_spawn_env(self, task_id: str) -> dict[str, str]:
         """Bridge-specific env vars to inject into a spawned claude.
 
-        Only the bridge-owned keys: zellij injects these at exec time via
-        `env(1)`, on top of whatever env the zellij server was started with
-        (which already carries PATH, HOME, etc).
+        PATH is explicitly forwarded from the daemon's current env so
+        MCP server launchers (uv, npx, etc.) can be found regardless of
+        what the zellij server was started with. zellij's server env is
+        frozen at session-create time, so without explicit PATH the
+        spawned tab inherits whatever was on PATH when zellij started —
+        which won't reflect any later launchd-plist PATH updates until
+        the zellij session is recreated (destructive: kills all tabs).
         """
         return {
             "CC_DISCORD_TASK_ID": task_id,
             "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
+            "PATH": os.environ.get("PATH", ""),
         }
 
     async def _is_pane_alive(self, pane_id: str) -> bool:
