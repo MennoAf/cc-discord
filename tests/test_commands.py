@@ -405,3 +405,86 @@ class TestCommands:
         assert len(interaction.followup._sends) >= 1
         reply = interaction.followup._sends[0]
         assert "🔄 Restarted" in reply["content"]
+
+
+@pytest.mark.asyncio
+class TestToneCommand:
+    """Slash-command behavior for /tone."""
+
+    async def test_no_arg_reports_current_default(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        from bridge.commands import build_tree
+        from discord import app_commands  # noqa: F401  (kept for parity)
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        tree = build_tree(fake_bot, registry)
+        tone_cmd = tree.get_command("tone")
+        assert tone_cmd is not None
+
+        interaction = FakeInteraction(channel_id=4242, guild_id=1)
+        await tone_cmd.callback(interaction, mode=None)
+
+        assert interaction.response._deferred
+        assert len(interaction.followup._sends) == 1
+        reply = interaction.followup._sends[0]
+        assert "🎚️" in reply["content"]
+        assert "full" in reply["content"]  # default
+        assert reply["ephemeral"]
+
+    async def test_setting_mode_persists(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        from bridge.commands import build_tree
+        from discord import app_commands
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        tree = build_tree(fake_bot, registry)
+        tone_cmd = tree.get_command("tone")
+
+        interaction = FakeInteraction(channel_id=4242, guild_id=1)
+        choice = app_commands.Choice(name="light — prose + rolling tool indicator", value="light")
+        await tone_cmd.callback(interaction, mode=choice)
+
+        assert "light" in interaction.followup._sends[0]["content"]
+        # Re-query via the registry to confirm DB was actually written.
+        assert await registry.get_verbosity(4242) == "light"
+
+    async def test_no_channel_id_rejects(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        from bridge.commands import build_tree
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        tree = build_tree(fake_bot, registry)
+        tone_cmd = tree.get_command("tone")
+
+        # channel_id=0 simulates a DM or other context with no channel.
+        interaction = FakeInteraction(channel_id=0, guild_id=1)
+        await tone_cmd.callback(interaction, mode=None)
+
+        reply = interaction.followup._sends[0]
+        assert "❌" in reply["content"]
+        assert "channel or thread" in reply["content"]
+
+    async def test_unknown_choice_value_rejects(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        # Defense-in-depth: even if a tampered interaction smuggles in a
+        # bogus choice value, the handler rejects before hitting state.
+        from bridge.commands import build_tree
+        from discord import app_commands
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        tree = build_tree(fake_bot, registry)
+        tone_cmd = tree.get_command("tone")
+
+        interaction = FakeInteraction(channel_id=4242, guild_id=1)
+        choice = app_commands.Choice(name="hacked", value="shouty")
+        await tone_cmd.callback(interaction, mode=choice)
+
+        reply = interaction.followup._sends[0]
+        assert "❌" in reply["content"]
+        assert "shouty" in reply["content"]
+        # Nothing should have been persisted.
+        assert await registry.get_verbosity(4242) == "full"

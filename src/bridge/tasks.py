@@ -26,12 +26,15 @@ from bridge.state import (
     TaskRow,
     delete_pin,
     get_pin,
+    get_verbosity_mode,
     list_active_tasks,
     list_pins,
     touch_pin,
     upsert_pin,
     upsert_task,
+    upsert_verbosity,
 )
+from bridge.verbosity import VerbosityPolicy, policy_for
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
@@ -77,6 +80,17 @@ _MAX_ATTACHMENTS_PER_POST = 10
 # malformed value can't reach argv (claude --resume <id>) or the KDL
 # layout (interpolated as an env(1) arg).
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Used by /tone tldr to surface successful `git commit` calls as milestones.
+# Matches a literal `git commit` token preceded only by env-var assignments
+# or whitespace — i.e. an actual invocation, not an echo or substring.
+_GIT_COMMIT_RE = re.compile(r"(?:^|;|&&|\|\|)\s*(?:[A-Z_][A-Z0-9_]*=\S*\s+)*git\s+commit\b")
+# Captures `[branch hash]` from `git commit` stdout. Branch can contain
+# letters, digits, `_`, `-`, `/`, `.`; hash is 7+ hex chars. Anchored to
+# the line start so partial matches inside file paths can't fool it.
+_GIT_COMMIT_HASH_RE = re.compile(
+    r"^\[([\w./-]+)(?:\s+\(root-commit\))?\s+([0-9a-f]{7,40})\]",
+    re.MULTILINE,
+)
 
 
 @dataclass
@@ -427,6 +441,126 @@ class _ToolSummaryAggregator:
                 logger.exception("failed to flush final tool summary chunk")
 
 
+class _RollingToolIndicator:
+    """Edits a single Discord message in place to show the latest tool burst.
+
+    Used in /tone light mode as a replacement for `_ToolSummaryAggregator`'s
+    per-tool line output. A "burst" is a contiguous run of tool calls
+    uninterrupted by assistant prose; bursts produce one Discord message
+    edited as more tools fire. When prose arrives (or the session ends),
+    `mark_burst_end()` clears the current message id so the next tool burst
+    starts a fresh Discord message rather than resurrecting the prior one.
+
+    Edit semantics: if the previously-saved message goes missing (deleted,
+    or never landed), the next flush falls back to posting a new message —
+    a stale id can't permanently silence the indicator.
+    """
+
+    FLUSH_WINDOW = 1.0
+    SLOW_FLUSH_WINDOW = 5.0
+    # Cap on how many distinct tool names we list inline; beyond this we
+    # render an ellipsis + count so the line stays scannable.
+    MAX_INLINE_TOOLS = 5
+
+    def __init__(self, bot: Bot, thread_id: int) -> None:
+        self._bot = bot
+        self._thread_id = thread_id
+        self._current_msg_id: int | None = None
+        # Distinct tool names within the current burst, in arrival order.
+        # We collapse repeats so "Read · Read · Read" renders as one entry.
+        self._pending_tools: list[str] = []
+        self._flush_task: asyncio.Task | None = None
+        self._slow_mode = False
+
+    def _flush_window(self) -> float:
+        return self.SLOW_FLUSH_WINDOW if self._slow_mode else self.FLUSH_WINDOW
+
+    def append(self, tool_name: str) -> None:
+        if not tool_name:
+            return
+        if not self._pending_tools or self._pending_tools[-1] != tool_name:
+            self._pending_tools.append(tool_name)
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_after_window())
+
+    def _format_body(self) -> str:
+        tools = self._pending_tools
+        if not tools:
+            return "🔧 Working…"
+        if len(tools) <= self.MAX_INLINE_TOOLS:
+            inline = " · ".join(tools)
+            return f"🔧 Working: {inline}"
+        head = " · ".join(tools[: self.MAX_INLINE_TOOLS])
+        extra = len(tools) - self.MAX_INLINE_TOOLS
+        return f"🔧 Working: {head} (+{extra} more)"
+
+    async def _flush_after_window(self) -> None:
+        try:
+            await asyncio.sleep(self._flush_window())
+        except asyncio.CancelledError:
+            return
+        if not self._pending_tools:
+            return
+        await self._post_or_edit(self._format_body())
+
+    async def _post_or_edit(self, body: str) -> None:
+        """Edit the current message if present, else post a new one and save its id."""
+        if self._current_msg_id is not None:
+            try:
+                await self._bot.edit_message(
+                    self._thread_id, self._current_msg_id, content=body
+                )
+                return
+            except discord.NotFound:
+                # Message was deleted out from under us; fall through to post a new one.
+                self._current_msg_id = None
+            except Exception as e:
+                if getattr(e, "status", None) == 429:
+                    logger.warning("rolling indicator edit hit 429; switching to slow mode")
+                    self._slow_mode = True
+                    return
+                logger.exception("failed to edit rolling tool indicator")
+                # Don't swap to post-new on a transient error — better to skip
+                # this update than to spam a duplicate message.
+                return
+        try:
+            ids = await self._bot.post(body, thread_id=self._thread_id)
+        except Exception as e:
+            if getattr(e, "status", None) == 429:
+                logger.warning("rolling indicator post hit 429; switching to slow mode")
+                self._slow_mode = True
+                return
+            logger.exception("failed to post rolling tool indicator")
+            return
+        if ids:
+            self._current_msg_id = ids[-1]
+
+    def mark_burst_end(self) -> None:
+        """Close the current message so the next tool burst starts a fresh post.
+
+        Called when assistant prose arrives between tool bursts — the existing
+        indicator stays in the channel as a historical breadcrumb, and the
+        next tool starts a clean message rather than retroactively editing
+        the now-stale one.
+        """
+        self._current_msg_id = None
+        self._pending_tools.clear()
+
+    async def close(self) -> None:
+        """Flush pending tools and clear all state. Called on session teardown."""
+        if self._flush_task is not None and not self._flush_task.done():
+            self._flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._flush_task
+        if self._pending_tools:
+            try:
+                await self._post_or_edit(self._format_body())
+            except Exception:
+                logger.exception("failed to flush rolling indicator on close")
+        self._current_msg_id = None
+        self._pending_tools.clear()
+
+
 @dataclass
 class Task:
     """An in-memory task representation."""
@@ -520,6 +654,9 @@ class TaskRegistry:
         self._stop_futures: dict[str, asyncio.Future] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._aggregators: dict[str, _ToolSummaryAggregator] = {}
+        # Per-task rolling tool indicator used in /tone light mode. Edits a
+        # single Discord message in place instead of posting per-tool lines.
+        self._rolling_indicators: dict[str, _RollingToolIndicator] = {}
         self._tui_handler_tasks: dict[str, asyncio.Task] = {}
         # Per-task locks serializing _stream_assistant_progress so a Stop
         # event can't race a still-in-flight PostToolUse streamer (which
@@ -742,6 +879,9 @@ class TaskRegistry:
         agg = self._aggregators.pop(task.task_id, None)
         if agg is not None:
             await agg.flush_now()
+        ri = self._rolling_indicators.pop(task.task_id, None)
+        if ri is not None:
+            await ri.close()
         handler_task = self._tui_handler_tasks.pop(task.task_id, None)
         if handler_task is not None and not handler_task.done():
             handler_task.cancel()
@@ -797,6 +937,23 @@ class TaskRegistry:
             agg = _ToolSummaryAggregator(self._bot, task.thread_id)
             self._aggregators[task.task_id] = agg
         return agg
+
+    def _rolling_for(self, task: Task) -> _RollingToolIndicator:
+        ri = self._rolling_indicators.get(task.task_id)
+        if ri is None:
+            ri = _RollingToolIndicator(self._bot, task.thread_id)
+            self._rolling_indicators[task.task_id] = ri
+        return ri
+
+    async def _policy_for(self, task: Task) -> VerbosityPolicy:
+        """Look up the current /tone policy for a task's destination thread.
+
+        Re-reads the DB per call so /tone changes apply immediately to
+        in-flight sessions. The lookup is a single-row SQLite query
+        against a small indexed table — sub-millisecond.
+        """
+        mode = await get_verbosity_mode(self._conn, task.thread_id)
+        return policy_for(mode)
 
     async def spawn_task(
         self,
@@ -1102,6 +1259,17 @@ class TaskRegistry:
         """List all pinned channels."""
         return await list_pins(self._conn)
 
+    async def set_verbosity(self, channel_id: int, mode: str) -> None:
+        """Set the /tone verbosity mode for a channel or thread.
+
+        Raises ValueError when `mode` is not in VALID_VERBOSITY_MODES.
+        """
+        await upsert_verbosity(self._conn, channel_id, mode)
+
+    async def get_verbosity(self, channel_id: int) -> str:
+        """Return the current /tone mode for `channel_id` (default-on-miss)."""
+        return await get_verbosity_mode(self._conn, channel_id)
+
     async def _write_with_retry(self, task: Task, payload: str) -> bool:
         """Type `payload` into the task's pane, retrying once on ZellijError.
 
@@ -1397,16 +1565,28 @@ class TaskRegistry:
         tool_input = body.get("tool_input", {}) or {}
         tool_response = body.get("tool_response", {}) or {}
 
+        policy = await self._policy_for(task)
+
+        # tldr surfaces one tool event: a successful `git commit`. The
+        # commit hash is the user-actionable milestone signal in an
+        # otherwise silent mode. All other tool activity is dropped.
+        if policy.show_commit_milestones and tool_name == "Bash":
+            await self._maybe_post_commit_milestone(task, tool_input, tool_response)
+
         # TaskCreate / TaskUpdate / TaskList don't get inline aggregator
         # lines — the debounced full-list block already shows their effect,
         # and the inline lines duplicate that.
         if tool_name not in ("TaskCreate", "TaskUpdate", "TaskList"):
-            line = tool_summary.summarize(tool_name, tool_input, tool_response)
-            self._agg_for(task).append(line)
-            await self._post_tool_diff(task, tool_name, tool_input)
+            if policy.show_tool_lines:
+                line = tool_summary.summarize(tool_name, tool_input, tool_response)
+                self._agg_for(task).append(line)
+            elif policy.show_rolling_indicator:
+                self._rolling_for(task).append(tool_name)
+            if policy.show_tool_diffs:
+                await self._post_tool_diff(task, tool_name, tool_input)
         else:
             self._update_task_list_state(task, tool_name, tool_input, tool_response)
-            if tool_name in ("TaskCreate", "TaskUpdate"):
+            if policy.show_task_list and tool_name in ("TaskCreate", "TaskUpdate"):
                 self._schedule_task_list_post(task)
 
     def _update_task_list_state(
@@ -1693,6 +1873,48 @@ class TaskRegistry:
         )
         self._agg_for(task).append(line)
 
+    async def _maybe_post_commit_milestone(
+        self, task: Task, tool_input: dict, tool_response: dict
+    ) -> None:
+        """In /tone tldr mode, surface a one-line "✅ Committed `abc1234`"
+        when a `git commit` succeeds. The hash is the milestone signal the
+        user asked for in an otherwise-silent mode.
+
+        Only fires on Bash with `git commit` (allowing trailing flags), exit
+        code 0 or absent, and `[branch hash]` parsed from any common output
+        field name. Non-matches are silent no-ops.
+        """
+        cmd = (tool_input.get("command") or "").strip()
+        # Match `git commit` and `git commit -m ...` etc. Tolerates a leading
+        # subshell or env-var prefix like `GIT_AUTHOR=... git commit` because
+        # that's a common pattern; refuses anything that doesn't actually
+        # invoke `git commit` (e.g. `echo 'git commit'`).
+        if not _GIT_COMMIT_RE.search(cmd):
+            return
+        # Don't celebrate a failed commit.
+        if tool_summary.is_failure(tool_response, "Bash"):
+            return
+        # Bash captures stdout under various keys depending on hook version;
+        # try the documented and historical names. Fall back to a stringified
+        # tool_response so the regex still has a chance.
+        haystack = ""
+        for key in ("stdout", "output", "stdoutText", "content"):
+            val = tool_response.get(key) if isinstance(tool_response, dict) else None
+            if isinstance(val, str) and val:
+                haystack = val
+                break
+        if not haystack and isinstance(tool_response, dict):
+            haystack = str(tool_response)
+        match = _GIT_COMMIT_HASH_RE.search(haystack)
+        if not match:
+            return
+        branch, short_hash = match.group(1), match.group(2)
+        body = f"✅ Committed `{short_hash}` on `{branch}`"
+        try:
+            await self._bot.post(body, thread_id=task.thread_id)
+        except Exception:
+            logger.exception("failed to post commit milestone for task %s", task.task_id)
+
     async def _post_tool_diff(
         self, task: Task, tool_name: str, tool_input: dict
     ) -> None:
@@ -1828,6 +2050,17 @@ class TaskRegistry:
         if not path.is_file():
             return
 
+        policy = await self._policy_for(task)
+        # Rolling indicator (light mode) treats the next prose post as the
+        # end of the current tool burst — null the stored message id so the
+        # next tool burst starts a fresh indicator rather than editing the
+        # now-stale one. Done before the lock so we don't gate the policy
+        # lookup on the streamer mutex.
+        if policy.show_rolling_indicator:
+            ri = self._rolling_indicators.get(task.task_id)
+            if ri is not None:
+                ri.mark_burst_end()
+
         lock = self._streamer_locks.setdefault(task.task_id, asyncio.Lock())
         async with lock:
             entries = list(transcript.read_entries(path))
@@ -1877,6 +2110,13 @@ class TaskRegistry:
                         if isinstance(text, str) and text.strip():
                             cleaned, attach_paths = _parse_attach_markers(text)
                             body = (prefix + cleaned) if cleaned else None
+                            # /tone tldr suppresses prose. Attachments tag
+                            # along with prose semantically — without the
+                            # text body they're context-free, so drop them
+                            # together. The uid is still marked posted
+                            # below so we don't re-consider on refresh.
+                            if not policy.show_prose:
+                                continue
                             try:
                                 if attach_paths:
                                     await self._bot.post_with_attachments(
@@ -1897,6 +2137,8 @@ class TaskRegistry:
                         # Extended-thinking blocks are encrypted by default
                         # (`thinking` is empty). Only post when content is
                         # visible.
+                        if not policy.show_thinking:
+                            continue
                         thought = block.get("thinking") or ""
                         if isinstance(thought, str) and thought.strip():
                             try:
@@ -2723,6 +2965,7 @@ class TaskRegistry:
         # Clean up typing task (cancel without waiting for graceful stop), aggregator, and TUI handler task
         await self._stop_typing(task.task_id)
         self._aggregators.pop(task.task_id, None)
+        self._rolling_indicators.pop(task.task_id, None)
         handler_task = self._tui_handler_tasks.pop(task.task_id, None)
         if handler_task is not None and not handler_task.done():
             handler_task.cancel()

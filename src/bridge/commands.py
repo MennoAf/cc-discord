@@ -23,6 +23,7 @@ from bridge.tasks import (
     TaskRestartError,
     TaskSpawnError,
 )
+from bridge.verbosity import VALID_MODES as _VALID_VERBOSITY_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,58 @@ def build_tree(
         await interaction.followup.send(
             f"📌 Pinned <#{channel_id}> → `{cwd}` ({source}). "
             "Send a message in that channel to wake a Claude session.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="tone",
+        description="Set how much process detail this channel/thread shows (full/light/tldr)",
+    )
+    @app_commands.describe(
+        mode="Pick a verbosity mode. Omit to see the current setting.",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="full — everything (default)", value="full"),
+            app_commands.Choice(name="light — prose + rolling tool indicator", value="light"),
+            app_commands.Choice(name="tldr — questions and milestones only", value="tldr"),
+        ]
+    )
+    async def tone_cmd(
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel_id = interaction.channel_id or 0
+        if channel_id == 0:
+            await interaction.followup.send(
+                "❌ /tone must be invoked in a channel or thread.", ephemeral=True
+            )
+            return
+        if mode is None:
+            current = await registry.get_verbosity(channel_id)
+            await interaction.followup.send(
+                f"🎚️ Current tone for <#{channel_id}>: **{current}**. "
+                "Run `/tone mode:<full|light|tldr>` to change.",
+                ephemeral=True,
+            )
+            return
+        new_mode = mode.value
+        # Choice values are constrained client-side, but Discord doesn't
+        # guarantee they reach the bot intact — re-validate so a tampered
+        # interaction can't insert an unknown mode string.
+        if new_mode not in _VALID_VERBOSITY_MODES:
+            await interaction.followup.send(
+                f"❌ Unknown mode `{new_mode}`.", ephemeral=True
+            )
+            return
+        try:
+            await registry.set_verbosity(channel_id, new_mode)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"🎚️ Tone for <#{channel_id}> set to **{new_mode}**.",
             ephemeral=True,
         )
 

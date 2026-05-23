@@ -61,6 +61,28 @@ class PinRow:
     last_used_at: int
 
 
+# Valid /tone modes. Stored as TEXT in the verbosity table; values that
+# don't match are treated as unset and fall back to DEFAULT_VERBOSITY.
+VALID_VERBOSITY_MODES: tuple[str, ...] = ("full", "light", "tldr")
+DEFAULT_VERBOSITY: str = "full"
+
+
+@dataclass(frozen=True)
+class VerbosityRow:
+    """A per-channel verbosity row from the database.
+
+    Binds a Discord channel or thread ID to a /tone mode that controls how
+    much of Claude's process narration reaches that destination. Absence of
+    a row is equivalent to `DEFAULT_VERBOSITY` ("full") — the existing
+    unfiltered behavior.
+    """
+
+    channel_id: int
+    mode: str
+    created_at: int
+    updated_at: int
+
+
 async def init_schema(conn: aiosqlite.Connection) -> None:
     """Create the schema (idempotent — uses CREATE TABLE IF NOT EXISTS).
     Public so tests/conftest.py can reuse it without duplicating SQL."""
@@ -114,6 +136,14 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
             cwd TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             last_used_at INTEGER NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS channel_verbosity (
+            channel_id INTEGER PRIMARY KEY,
+            mode TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         )
     """)
     await conn.commit()
@@ -412,5 +442,81 @@ async def list_pins(conn: aiosqlite.Connection) -> list[PinRow]:
     rows = await cursor.fetchall()
     return [
         PinRow(channel_id=row[0], cwd=row[1], created_at=row[2], last_used_at=row[3])
+        for row in rows
+    ]
+
+
+async def get_verbosity_row(
+    conn: aiosqlite.Connection, channel_id: int
+) -> VerbosityRow | None:
+    """Retrieve a verbosity row by channel_id. Returns None if unset."""
+    cursor = await conn.execute(
+        "SELECT channel_id, mode, created_at, updated_at FROM channel_verbosity WHERE channel_id = ?",
+        (channel_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return VerbosityRow(channel_id=row[0], mode=row[1], created_at=row[2], updated_at=row[3])
+
+
+async def get_verbosity_mode(
+    conn: aiosqlite.Connection, channel_id: int
+) -> str:
+    """Return the effective verbosity mode for a channel.
+
+    Falls back to DEFAULT_VERBOSITY when no row exists or when a stored
+    value is not in VALID_VERBOSITY_MODES (defense against legacy values
+    if the table ever gains modes the caller doesn't know about).
+    """
+    row = await get_verbosity_row(conn, channel_id)
+    if row is None or row.mode not in VALID_VERBOSITY_MODES:
+        return DEFAULT_VERBOSITY
+    return row.mode
+
+
+async def upsert_verbosity(
+    conn: aiosqlite.Connection,
+    channel_id: int,
+    mode: str,
+    *,
+    now: int | None = None,
+) -> None:
+    """Insert or update a verbosity row. Bumps updated_at; preserves created_at on conflict."""
+    if mode not in VALID_VERBOSITY_MODES:
+        raise ValueError(
+            f"invalid verbosity mode {mode!r}; must be one of {VALID_VERBOSITY_MODES}"
+        )
+    now_val = now or int(time.time())
+    await conn.execute(
+        """
+        INSERT INTO channel_verbosity (channel_id, mode, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            mode=excluded.mode,
+            updated_at=excluded.updated_at
+        """,
+        (channel_id, mode, now_val, now_val),
+    )
+    await conn.commit()
+
+
+async def delete_verbosity(conn: aiosqlite.Connection, channel_id: int) -> bool:
+    """Delete a verbosity row. Returns True if a row was deleted, False if unset."""
+    cursor = await conn.execute(
+        "DELETE FROM channel_verbosity WHERE channel_id = ?", (channel_id,)
+    )
+    await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def list_verbosity(conn: aiosqlite.Connection) -> list[VerbosityRow]:
+    """List all verbosity rows, ordered by updated_at DESC."""
+    cursor = await conn.execute(
+        "SELECT channel_id, mode, created_at, updated_at FROM channel_verbosity ORDER BY updated_at DESC"
+    )
+    rows = await cursor.fetchall()
+    return [
+        VerbosityRow(channel_id=row[0], mode=row[1], created_at=row[2], updated_at=row[3])
         for row in rows
     ]
