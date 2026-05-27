@@ -7,6 +7,7 @@ import pytest
 
 from bridge.tasks import (
     TaskRegistry,
+    _BRIDGE_SYSTEM_PROMPT,
     _cleanup_task_settings,
     _read_user_mcp_servers,
     _write_task_settings,
@@ -132,6 +133,64 @@ class TestWriteTaskSettings:
             else:
                 assert len(matchers) == 1, f"Event {event} should have exactly 1 matcher"
                 assert matchers[0]["matcher"] == "*"
+
+
+class TestBashResilienceEnv:
+    """Per-task settings inject Bash-tool env defaults so long-running
+    commands (pytest, builds) don't get killed by the harness's stock
+    120s timeout / 30KB output cap when relayed through the bridge."""
+
+    def test_env_block_present_with_bash_resilience_keys(self, tmp_path: Path) -> None:
+        settings_dir = tmp_path / "settings"
+        hooks_dir = tmp_path / "hooks"
+        hooks_dir.mkdir()
+        (hooks_dir / "event.py").write_text("# event hook")
+
+        out_path = _write_task_settings(
+            "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
+        )
+        data = json.loads(out_path.read_text())
+
+        assert "env" in data, "settings must include an env block"
+        env = data["env"]
+        assert env["BASH_DEFAULT_TIMEOUT_MS"] == "600000"
+        assert env["BASH_MAX_TIMEOUT_MS"] == "1800000"
+        assert env["BASH_MAX_OUTPUT_LENGTH"] == "200000"
+
+    def test_env_values_are_strings(self, tmp_path: Path) -> None:
+        """Claude Code's settings.json env block requires string values —
+        ints would be silently ignored, which would re-introduce the
+        choke without any obvious symptom."""
+        settings_dir = tmp_path / "settings"
+        hooks_dir = tmp_path / "hooks"
+        hooks_dir.mkdir()
+        (hooks_dir / "event.py").write_text("# event hook")
+
+        out_path = _write_task_settings(
+            "abc123", settings_dir=settings_dir, hooks_dir=hooks_dir
+        )
+        data = json.loads(out_path.read_text())
+
+        for key, val in data["env"].items():
+            assert isinstance(val, str), f"env[{key}] must be a string, got {type(val).__name__}"
+
+
+class TestBridgeSystemPrompt:
+    """Smoke checks on the system-prompt overlay the bridge appends to
+    every spawned claude session — see `_BRIDGE_SYSTEM_PROMPT` in tasks.py."""
+
+    def test_prompt_mentions_redirect_pattern(self) -> None:
+        # The whole point of the overlay is to teach the agent the
+        # redirect-to-file pattern, so a regression that drops it should
+        # fail loudly.
+        assert "/tmp/" in _BRIDGE_SYSTEM_PROMPT
+        assert "tail" in _BRIDGE_SYSTEM_PROMPT
+
+    def test_prompt_is_single_line(self) -> None:
+        # The prompt flows through KDL → env(1) → claude argv. Embedded
+        # newlines survive KDL escaping but would split the agent's view
+        # of the directive across paragraphs. Keep it single-line.
+        assert "\n" not in _BRIDGE_SYSTEM_PROMPT
 
 
 class TestCleanupTaskSettings:

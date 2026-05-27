@@ -64,6 +64,29 @@ HOOKS_DIR = (
 # BRIDGE_SPAWN_BIND_TIMEOUT_SECS; default 60s leaves ample headroom.
 SPAWN_BIND_TIMEOUT_SECS = float(os.environ.get("BRIDGE_SPAWN_BIND_TIMEOUT_SECS", "60"))
 
+# Bash-tool resilience for bridged sessions. The harness's stock defaults
+# (120s tool timeout, ~30 KB output cap) regularly kill long-running commands
+# like full pytest suites, builds, or deploys — the user sees `(exit ?)` and
+# the truncated tail. We raise all three knobs and tell the agent how to
+# behave when a command still risks overflowing them. Claude Code re-exports
+# `env` entries from the per-task settings file into the spawned process, so
+# these reach the Bash tool natively.
+_BASH_DEFAULT_TIMEOUT_MS = "600000"      # 10 min — covers a typical pytest / build run.
+_BASH_MAX_TIMEOUT_MS = "1800000"          # 30 min — ceiling the agent can request via `timeout=` arg.
+_BASH_MAX_OUTPUT_LENGTH = "200000"        # ~200 KB — fits a verbose pytest stdout.
+
+# Appended to the spawned claude's system prompt via --append-system-prompt.
+# Brief on purpose: the env vars above do the load-bearing work; the prompt
+# just teaches the agent the redirect pattern for cases where output volume
+# itself is the problem.
+_BRIDGE_SYSTEM_PROMPT = (
+    "Discord-bridge session: Bash tool defaults are 10 min timeout (30 min max) "
+    "and ~200 KB output cap. For commands likely to exceed those — full test suites, "
+    "long builds, heavy greps — redirect output to a file and tail the result: "
+    "`cmd > /tmp/out.log 2>&1; tail -80 /tmp/out.log`. Pass `timeout=600000` or higher "
+    "explicitly on the Bash call when you know a command will take that long."
+)
+
 # Cap on how many recent subagent actions we render in a block.
 _SUBAGENT_BLOCK_MAX_ACTIONS = 5
 # Don't edit a block's Discord message more often than this; coalesces
@@ -178,6 +201,11 @@ def _write_task_settings(
     event_script = str(hooks_dir / "event.py")
 
     settings = {
+        "env": {
+            "BASH_DEFAULT_TIMEOUT_MS": _BASH_DEFAULT_TIMEOUT_MS,
+            "BASH_MAX_TIMEOUT_MS": _BASH_MAX_TIMEOUT_MS,
+            "BASH_MAX_OUTPUT_LENGTH": _BASH_MAX_OUTPUT_LENGTH,
+        },
         "hooks": {
             "PreToolUse": [
                 {
@@ -1028,7 +1056,10 @@ class TaskRegistry:
         layout_path = _write_task_layout(
             task_id,
             env=env,
-            claude_argv=["--settings", str(settings_path)],
+            claude_argv=[
+                "--settings", str(settings_path),
+                "--append-system-prompt", _BRIDGE_SYSTEM_PROMPT,
+            ],
             tab_name=tab_name,
         )
 
@@ -3013,6 +3044,7 @@ class TaskRegistry:
             env=env,
             claude_argv=[
                 "--settings", str(settings_path),
+                "--append-system-prompt", _BRIDGE_SYSTEM_PROMPT,
                 "--resume", task.current_claude_session_id,
             ],
             tab_name=tab_name,
