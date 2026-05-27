@@ -13,7 +13,7 @@ The matrix:
     show_tool_lines        ✓
     show_tool_diffs        ✓
     show_task_list         ✓      ✓
-    show_rolling_indicator        ✓
+    show_rolling_indicator        ✓       ✓
     show_commit_milestones                ✓
 
 Events not listed above are unconditional: AskUserQuestion, approval
@@ -72,7 +72,10 @@ _TLDR = VerbosityPolicy(
     show_tool_lines=False,
     show_tool_diffs=False,
     show_task_list=False,
-    show_rolling_indicator=False,
+    # Rolling indicator on: a faint "🔧 Working…" heartbeat so a near-silent
+    # session never looks dead. Prose/tools/diffs stay suppressed; this is the
+    # only proof-of-life between commit milestones and user-actionable prompts.
+    show_rolling_indicator=True,
     show_commit_milestones=True,
 )
 

@@ -469,7 +469,7 @@ def build_tree(
         mode=[
             app_commands.Choice(name="full — everything (default)", value="full"),
             app_commands.Choice(name="light — prose + rolling tool indicator", value="light"),
-            app_commands.Choice(name="tldr — questions and milestones only", value="tldr"),
+            app_commands.Choice(name="tldr — milestones + prompts, plus a working pulse", value="tldr"),
         ]
     )
     async def tone_cmd(

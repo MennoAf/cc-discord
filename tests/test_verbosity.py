@@ -144,7 +144,9 @@ class TestVerbosityPolicy:
         assert p.show_tool_lines is False
         assert p.show_tool_diffs is False
         assert p.show_task_list is False
-        assert p.show_rolling_indicator is False
+        # Heartbeat: tldr keeps the rolling indicator on as proof-of-life,
+        # even though prose/tools/diffs are all suppressed.
+        assert p.show_rolling_indicator is True
         assert p.show_commit_milestones is True
 
     def test_policy_for_none_returns_default(self) -> None:
@@ -291,9 +293,12 @@ class TestOnPostToolUseGating:
         assert ri is not None
         assert ri._pending_tools == ["Edit"]
 
-    async def test_tldr_mode_drops_non_commit_tool_use(
+    async def test_tldr_mode_feeds_rolling_indicator_no_line_no_diff(
         self, in_memory_db
     ) -> None:
+        # Heartbeat: a non-commit tool no longer vanishes in tldr — it feeds
+        # the rolling "🔧 Working…" indicator (same path as light), but with
+        # no aggregator line, no diff, and no prose post.
         registry, bot = await self._setup(in_memory_db, "tldr")
         await registry._on_post_tool_use({
             "session_id": "sess-x",
@@ -305,9 +310,14 @@ class TestOnPostToolUseGating:
             },
             "tool_response": {},
         })
+        # No inline tool line, no diff post (flush is debounced, so nothing
+        # has reached the bot synchronously yet).
         assert "task-x" not in registry._aggregators
-        assert "task-x" not in registry._rolling_indicators
-        assert bot.get_post_calls() == []
+        assert not any("```" in c["content"] for c in bot.get_post_calls())
+        # The rolling indicator engaged with the tool pending.
+        ri = registry._rolling_indicators.get("task-x")
+        assert ri is not None
+        assert ri._pending_tools == ["Edit"]
 
     async def test_tldr_mode_emits_commit_milestone(self, in_memory_db) -> None:
         registry, bot = await self._setup(in_memory_db, "tldr")
