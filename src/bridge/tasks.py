@@ -2392,30 +2392,49 @@ class TaskRegistry:
                 # answer is list[int] of 0-based selected indices.
                 if not isinstance(answer, list):
                     return
-                # Type each toggle digit (TUI hot-keys), then Tab to advance.
-                key_bytes: list[int] = []
+                # The multi-question AskUserQuestion TUI is a tabbed form
+                # (←  ☐ Q1  ☐ Q2  ✔ Submit  →). On a multi-select tab the
+                # checkboxes are NOT toggled by number keys alone, and a batched
+                # run of digits registered nothing (the whole question was then
+                # dropped from the answers). Instead: jump the cursor to each
+                # option with its digit, then press Space (32) to toggle it,
+                # each as a discrete write so the TUI processes them one at a
+                # time. A single Tab then advances to the next tab — multi-select
+                # does NOT auto-advance the way single-select does.
                 for sel in answer:
-                    key_bytes.append(ord(str(sel + 1)))
-                key_bytes.append(9)  # Tab
+                    try:
+                        await self._zellij.send_keys(
+                            task.zellij_pane_id, ord(str(sel + 1))
+                        )
+                        await asyncio.sleep(0.2)
+                        await self._zellij.send_keys(task.zellij_pane_id, 32)  # Space
+                        await asyncio.sleep(0.2)
+                    except Exception:
+                        logger.exception(
+                            "failed to type multi-select keys for task %s", task.task_id
+                        )
                 try:
-                    await self._zellij.send_keys(task.zellij_pane_id, *key_bytes)
+                    await self._zellij.send_keys(task.zellij_pane_id, 9)  # Tab
                 except Exception:
                     logger.exception(
-                        "failed to type multi-select keys for task %s", task.task_id
+                        "failed to Tab-advance multi-select for task %s", task.task_id
                     )
             else:
-                # Single-select: digit selects the option, Tab advances to
-                # the next question (or the Submit button on the last one).
-                # We do NOT use Enter to advance — Enter submits the whole
-                # form, which by the last question races the final-submit
-                # Enter and captured the wrong selection.
+                # Single-select: send the option digit ONLY, no Tab.
+                #
+                # In the tabbed AskUserQuestion TUI, choosing an option on a
+                # single-select tab BOTH selects it AND auto-advances to the next
+                # tab. Sending an extra Tab here advanced a second time, silently
+                # skipping the following question (a 3-question prompt then
+                # returned only 2 answers, the middle one dropped). Letting the
+                # auto-advance do the navigation keeps this per-question loop in
+                # lock-step with the TUI's tabs.
                 #
                 # Reaction-sourced answers are always single-digit "1"-"4"
                 # (from `_NUMERIC_REACTIONS`); free-text replies could be a
                 # number or a free-form string, both of which we still want
                 # to inject literally and let claude's TUI parse — so for
-                # non-reaction sources we fall through to the legacy
-                # digit + Enter path.
+                # non-reaction sources we fall through to the legacy inject path.
                 if (
                     source == "reaction"
                     and isinstance(answer, str)
@@ -2424,7 +2443,7 @@ class TaskRegistry:
                 ):
                     try:
                         await self._zellij.send_keys(
-                            task.zellij_pane_id, ord(answer), 9
+                            task.zellij_pane_id, ord(answer)
                         )
                     except Exception:
                         logger.exception(
