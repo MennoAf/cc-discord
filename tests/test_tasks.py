@@ -2888,12 +2888,13 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     assert handler_task is not None
     await handler_task
 
-    # Single-select dispatch: digit + Tab (advance), then final Enter to
-    # submit. write_to_pane is NOT used for reaction-sourced answers.
+    # Single-select dispatch: digit ONLY (the TUI auto-advances on select),
+    # then final Enter to submit. write_to_pane is NOT used for reaction-sourced
+    # answers.
     assert fake_zellij._write_calls == []
     assert len(fake_zellij._send_keys_calls) == 2
     assert fake_zellij._send_keys_calls[0]["pane_id"] == "pane_1"
-    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1"), 9]
+    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1")]
     assert fake_zellij._send_keys_calls[1]["bytes"] == [13]
 
 
@@ -3651,12 +3652,12 @@ class TestTaskSettingsIntegration:
 
 @pytest.mark.asyncio
 async def test_on_notification_ask_user_question_three_questions(in_memory_db, tmp_path):
-    """Regression for the 'third question always picks the wrong number' bug.
+    """Regression for the multi-question 'dropped answer' bug.
 
-    Each single-select answer must dispatch `digit + Tab` (advance) rather
-    than `digit + Enter`, then one final Enter to submit the whole form.
-    With Enter-to-advance, the trailing per-question Enter raced the
-    final-submit Enter and captured the wrong selection for the last Q.
+    The tabbed AskUserQuestion TUI auto-advances to the next question when a
+    single-select option is chosen, so each single-select answer must dispatch
+    the option digit ONLY (no Tab) — an extra Tab advances a second time and
+    silently skips the following question. One final Enter submits the form.
     """
     from bridge.approvals import ApprovalRouter
     import json
@@ -3739,16 +3740,70 @@ async def test_on_notification_ask_user_question_three_questions(in_memory_db, t
     # write_to_pane should be untouched for reaction-sourced answers.
     assert fake_zellij._write_calls == []
 
-    # Expected sequence:
-    #   Q1: ord("1"), 9  (digit + Tab)
-    #   Q2: ord("2"), 9
-    #   Q3: ord("3"), 9
+    # Expected sequence (single-select = digit only; the TUI auto-advances):
+    #   Q1: ord("1")
+    #   Q2: ord("2")
+    #   Q3: ord("3")
     #   final: 13       (Enter submits the whole form)
     assert len(fake_zellij._send_keys_calls) == 4
-    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1"), 9]
-    assert fake_zellij._send_keys_calls[1]["bytes"] == [ord("2"), 9]
-    assert fake_zellij._send_keys_calls[2]["bytes"] == [ord("3"), 9]
+    assert fake_zellij._send_keys_calls[0]["bytes"] == [ord("1")]
+    assert fake_zellij._send_keys_calls[1]["bytes"] == [ord("2")]
+    assert fake_zellij._send_keys_calls[2]["bytes"] == [ord("3")]
     assert fake_zellij._send_keys_calls[3]["bytes"] == [13]
+
+
+@pytest.mark.asyncio
+async def test_askq_keystroke_choreography_single_and_multi(in_memory_db):
+    """Deterministic check of the AskUserQuestion keystroke choreography for a
+    tabbed multi-question form, driven through a stub approval router (so it
+    doesn't depend on the reaction-resolution path).
+
+    Expected, given Q1=single, Q2=multiSelect, Q3=single:
+      - single-select  → option digit ONLY (the TUI auto-advances to next tab)
+      - multi-select   → per option [digit, Space-to-toggle], then ONE Tab to
+                         advance (multi-select does not auto-advance)
+      - final          → one Enter to submit the form
+    """
+    fake_bot = FakeBot()
+    fake_zellij = FakeZellij()
+
+    class StubRouter:
+        """Hands back canned (answer, source) tuples in call order."""
+        def __init__(self, answers):
+            self._answers = list(answers)
+
+        async def request_tui_answer(self, **kwargs):
+            return self._answers.pop(0)
+
+    # Q1 single → option "2"; Q2 multi → indices [0, 2]; Q3 single → option "1".
+    router = StubRouter([("2", "reaction"), ([0, 2], "reaction"), ("1", "reaction")])
+
+    questions = [
+        {"question": "Q1?", "options": [{"label": f"a{j}", "description": ""} for j in range(3)]},
+        {"question": "Q2?", "multiSelect": True,
+         "options": [{"label": f"b{j}", "description": ""} for j in range(4)]},
+        {"question": "Q3?", "options": [{"label": f"c{j}", "description": ""} for j in range(3)]},
+    ]
+
+    await upsert_task(
+        in_memory_db, "task-keys", 4242, "/tmp", "running",
+        zellij_pane_id="pane_keys", current_claude_session_id="sess-keys",
+    )
+    registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, router)
+    registry._PRE_PROMPT_FLUSH_SECS = 0.0
+    await registry.load_from_db()
+    task = registry.get_by_task_id("task-keys")
+    assert task is not None
+
+    await registry._handle_ask_user_question(task, {"input": {"questions": questions}})
+
+    seqs = [c["bytes"] for c in fake_zellij._send_keys_calls]
+    assert seqs == [
+        [ord("2")],                              # Q1 single-select: digit only
+        [ord("1")], [32], [ord("3")], [32], [9], # Q2 multi: (digit,Space)x2 + Tab
+        [ord("1")],                              # Q3 single-select: digit only
+        [13],                                    # final submit Enter
+    ]
 
 
 @pytest.mark.asyncio
