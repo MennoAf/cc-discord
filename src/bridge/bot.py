@@ -111,6 +111,12 @@ class BotNotReady(RuntimeError):
     pass
 
 
+class BotMissingPermission(RuntimeError):
+    """Raised when Discord rejects an operation due to missing bot permissions."""
+
+    pass
+
+
 class Bot:
     """Wraps a discord.py Client with the operations the bridge needs.
 
@@ -286,6 +292,28 @@ class Bot:
             auto_archive_duration=10080,  # 7 days — max for non-boosted servers
         )
         return thread.id
+
+    async def create_channel(self, name: str) -> int:
+        """Create a public text channel in the configured channel's guild.
+
+        Returns the new channel's ID. Requires the bot to hold the
+        Manage Channels permission on the guild.
+
+        Raises BotNotReady if the bot isn't connected.
+        Raises BotMissingPermission if Discord rejects with 403 Forbidden.
+        Discord normalizes channel names (lowercases, replaces invalid chars
+        with `-`). Caller should sanitize length (1–100 chars).
+        """
+        if not self.is_ready or self._channel is None:
+            raise BotNotReady("bot not connected to Discord")
+        try:
+            channel = await self._channel.guild.create_text_channel(name=name)
+        except discord.Forbidden as e:
+            raise BotMissingPermission(
+                "Bot lacks Manage Channels permission on this guild. "
+                "Grant it in the Discord server settings, then retry."
+            ) from e
+        return channel.id
 
     async def thread_alive(self, thread_id: int) -> bool:
         """Probe whether a thread still exists (returns False on 404)."""

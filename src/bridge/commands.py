@@ -5,6 +5,7 @@ Registered guild-scoped (instant sync). Bot must finish on_ready before sync run
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import discord
 from discord import app_commands
 
 from bridge import skills, usage
-from bridge.bot import Bot
+from bridge.bot import Bot, BotMissingPermission
 from bridge.projects import Project
 from bridge.tasks import (
     SPAWN_BIND_TIMEOUT_SECS,
@@ -141,10 +142,15 @@ def build_tree(
 
         if prompt:
             try:
-                await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
+                await _wait_for_session_bind(
+                    registry, task.task_id, timeout=SPAWN_BIND_TIMEOUT_SECS
+                )
                 await registry.write_initial_prompt(task.task_id, prompt)
             except asyncio.TimeoutError:
-                logger.warning("task %s did not bind within 10s", task.task_id)
+                logger.warning(
+                    "task %s did not bind within %.0fs",
+                    task.task_id, SPAWN_BIND_TIMEOUT_SECS,
+                )
 
         thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
         await interaction.followup.send(
@@ -376,6 +382,99 @@ def build_tree(
         embed = registry._render_task_list_embed(task)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @tree.command(
+        name="pin",
+        description="Create a Discord channel bound to a project; messages auto-spawn a Claude session",
+    )
+    @app_commands.describe(
+        name="Optional channel name (default: cwd basename, normalized)",
+        project=(
+            "Project to bind (autocomplete) — required when /pin runs outside "
+            "a task thread; ignored if inside one (the thread's cwd is inherited)"
+        ),
+    )
+    @app_commands.autocomplete(project=_project_autocomplete)
+    async def pin_cmd(
+        interaction: discord.Interaction,
+        name: str | None = None,
+        project: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        # cwd source: inherit from task thread if invoked inside one; otherwise
+        # require an explicit project pick.
+        existing_task = registry.get_by_thread_id(interaction.channel_id or 0)
+        if existing_task is not None:
+            cwd = existing_task.cwd
+            source = f"inherited from thread <#{existing_task.thread_id}>"
+        else:
+            if not projects_by_key:
+                await interaction.followup.send(
+                    "❌ Not inside a task thread, and no project roots configured. "
+                    "Set `BRIDGE_PROJECT_ROOTS` and restart, or run `/pin` inside an "
+                    "existing task thread.",
+                    ephemeral=True,
+                )
+                return
+            if not project:
+                await interaction.followup.send(
+                    "❌ Outside a task thread — pass `project:` (autocomplete shows "
+                    "subfolders of BRIDGE_PROJECT_ROOTS).",
+                    ephemeral=True,
+                )
+                return
+            proj = projects_by_key.get(project)
+            if proj is None:
+                await interaction.followup.send(
+                    f"❌ Unknown project `{project}`. Pick one from the autocomplete list.",
+                    ephemeral=True,
+                )
+                return
+            cwd = str(proj.path)
+            source = f"project `{proj.name}` ({proj.root_label})"
+
+        channel_name = _sanitize_channel_name(name or Path(cwd).name)
+        try:
+            channel_id = await bot.create_channel(channel_name)
+        except BotMissingPermission as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Channel creation failed: {e}", ephemeral=True
+            )
+            return
+
+        try:
+            await registry.pin_channel(channel_id, cwd)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"📌 Pinned <#{channel_id}> → `{cwd}` ({source}). "
+            "Send a message in that channel to wake a Claude session.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="unpin",
+        description="Remove the pin binding from the current channel (channel itself is not deleted)",
+    )
+    async def unpin_cmd(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel_id = interaction.channel_id or 0
+        removed = await registry.unpin_channel(channel_id)
+        if removed:
+            await interaction.followup.send(
+                f"📍 Unpinned <#{channel_id}>. Future messages here won't auto-spawn.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "ℹ This channel isn't pinned.", ephemeral=True
+            )
+
     return tree
 
 
@@ -393,6 +492,24 @@ def _resolve_task(
             "This command must run in a task thread (or pass `thread:` arg)."
         )
     return task
+
+
+_CHANNEL_NAME_INVALID = re.compile(r"[^a-z0-9_-]+")
+_CHANNEL_NAME_COLLAPSE = re.compile(r"-+")
+
+
+def _sanitize_channel_name(name: str) -> str:
+    """Coerce a string into a Discord text-channel-name-safe form.
+
+    Discord text channels are 1–100 chars, lowercase letters/digits/`-`/`_`.
+    Discord auto-normalizes on create, but doing it client-side surfaces a
+    helpful error earlier and keeps the visible channel name stable.
+    Returns a non-empty string; falls back to `cc-pin` if normalization
+    collapses to empty.
+    """
+    cleaned = _CHANNEL_NAME_INVALID.sub("-", name.lower())
+    cleaned = _CHANNEL_NAME_COLLAPSE.sub("-", cleaned).strip("-")
+    return cleaned[:100] or "cc-pin"
 
 
 def _humanize_age(epoch: int) -> str:

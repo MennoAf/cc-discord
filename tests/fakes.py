@@ -62,6 +62,7 @@ class FakeBot:
     _client: Any = field(default_factory=lambda: FakeClient())
     _post_calls: list[dict] = field(default_factory=list)
     _thread_calls: list[dict] = field(default_factory=list)
+    _channel_calls: list[dict] = field(default_factory=list)
     _archive_calls: list[dict] = field(default_factory=list)
     _reaction_calls: list[dict] = field(default_factory=list)
     _fake_channels: dict[int, FakeBotChannel] = field(default_factory=dict)
@@ -85,6 +86,12 @@ class FakeBot:
         thread_id = 2000 + len(self._thread_calls)
         self._thread_calls.append({"name": name})
         return thread_id
+
+    async def create_channel(self, name: str) -> int:
+        """Fake create_channel: record the call, return a fake channel ID."""
+        channel_id = 3000 + len(self._channel_calls)
+        self._channel_calls.append({"name": name})
+        return channel_id
 
     async def archive_thread(self, thread_id: int) -> None:
         """Fake archive_thread: record the call."""
